@@ -291,6 +291,10 @@ local str = tostring(42)       -- 数字转字符串
 > - 字符串是饥荒的"万能标识符"——prefab、tag、动画、事件都靠它
 > - 始终使用 `local` 声明变量，避免全局污染
 
+
+
+
+
 ## 1.2 Table——Lua 的万能数据结构
 
 Table（表）是 Lua 中**唯一**的复合数据结构。数组、字典、列表、集合、对象……在 Lua 里全部用 table 实现。可以毫不夸张地说，**如果你理解了 table，你就理解了半个饥荒**。
@@ -587,9 +591,265 @@ print(player.hp)  -- 100
 > - Table 是引用类型，赋值只是复制引用，需要独立副本时要用 `shallowcopy`
 > - 饥荒扩展了 `table.contains`、`shallowcopy` 等实用工具函数
 
+
+
 ## 1.3 函数与闭包
 
-（待编写）
+函数是 Lua 中的"一等公民"——它可以像数字、字符串一样被赋值给变量、存进 table、作为参数传递。在饥荒中，函数是连接各个系统的"胶水"：回调函数、事件监听、定时任务……到处都是函数。
+
+### 1.3.1 函数的基本定义
+
+Lua 中定义函数有两种等价的写法：
+
+```lua
+-- 写法一：常规写法
+local function onhammered(inst, worker)
+    inst:Remove()
+end
+
+-- 写法二：把匿名函数赋给变量
+local onhammered = function(inst, worker)
+    inst:Remove()
+end
+```
+
+两种写法几乎等价，但有个微妙的区别：写法一的函数可以在函数体内递归调用自己，写法二的不行（因为赋值还没完成时函数体已经在执行了）。在饥荒代码中，两种写法都很常见。
+
+### 1.3.2 参数与返回值
+
+Lua 函数的参数和返回值都非常灵活：
+
+```lua
+-- 多参数
+local function damage(target, amount, attacker)
+    target.components.health:DoDelta(-amount)
+end
+
+-- 多返回值
+local function get_position(inst)
+    return inst.Transform:GetWorldPosition()  -- 返回 x, y, z 三个值
+end
+
+local x, y, z = get_position(some_entity)
+```
+
+**参数个数不匹配时**不会报错——多余的参数被丢弃，缺少的参数变成 `nil`：
+
+```lua
+local function greet(name, title)
+    print(title, name)
+end
+
+greet("Wilson")              -- nil  Wilson（title 没传，是 nil）
+greet("Wilson", "Dr.", "!")  -- Dr.  Wilson（"!" 被丢弃）
+```
+
+这个特性在饥荒中被广泛利用来做**可选参数**：
+
+```lua
+-- 来自 campfire.lua —— delay 参数是可选的
+local function RepeatHallucination(hallucination, delay)
+    hallucination.task = inst:DoTaskInTime(
+        delay or (hallucination.params.interval + hallucination.params.variance * math.random()),
+        hallucination.params.spawnfn,
+        hallucination
+    )
+end
+```
+
+`delay or (...)` 的意思是：如果传了 `delay` 就用它，没传（`nil`）就用后面计算出来的默认值。
+
+### 1.3.3 函数作为参数——回调模式
+
+在饥荒中，最核心的编程模式之一就是**把函数作为参数传递给另一个函数**（回调）。来看营火（`campfire.lua`）的代码：
+
+```lua
+-- 定义回调函数
+local function ontakefuel(inst)
+    inst.SoundEmitter:PlaySound("dontstarve/common/fireAddFuel")
+end
+
+local function onupdatefueled(inst)
+    if inst.components.burnable ~= nil and inst.components.fueled ~= nil then
+        updatefuelrate(inst)
+        inst.components.burnable:SetFXLevel(
+            inst.components.fueled:GetCurrentSection(),
+            inst.components.fueled:GetSectionPercent()
+        )
+    end
+end
+
+local function onfuelchange(newsection, oldsection, inst)
+    if newsection <= 0 then
+        inst.components.burnable:Extinguish()
+        -- ...
+    end
+end
+
+-- 把回调函数注册到燃料组件
+inst.components.fueled:SetTakeFuelFn(ontakefuel)       -- 添加燃料时调用
+inst.components.fueled:SetUpdateFn(onupdatefueled)     -- 每帧更新时调用
+inst.components.fueled:SetSectionCallback(onfuelchange) -- 燃料档位变化时调用
+```
+
+这就是**事件驱动编程**的核心思路：你不直接调用这些函数，而是把它们"注册"到系统里，当特定事情发生时，系统会替你调用它们。开发者之所以这么设计，是因为营火的逻辑（加燃料、燃烧更新、熄灭）不需要每帧主动检查，只需要在对应事件发生时做出反应就够了。
+
+### 1.3.4 匿名函数——一次性的回调
+
+当回调函数很短、只用一次时，可以直接写匿名函数，不用单独取名：
+
+```lua
+-- 来自 hatchable.lua —— 延迟一段时间后重置状态
+self.inst:DoTaskInTime(time, function()
+    self.delay = false
+end)
+```
+
+`DoTaskInTime` 接收两个参数：延迟时间和一个函数。这里的 `function() self.delay = false end` 就是匿名函数，它在 `time` 秒后被调用。
+
+饥荒中匿名函数的典型使用场景：
+
+```lua
+-- 事件监听
+inst:ListenForEvent("onextinguish", function(inst)
+    if inst.components.fueled ~= nil then
+        inst.components.fueled:InitializeFuelLevel(0)
+    end
+end)
+
+-- 排序
+table.sort(entities, function(a, b)
+    return a.components.health:GetPercent() < b.components.health:GetPercent()
+end)
+
+-- 食谱的测试函数
+test = function(cooker, names, tags)
+    return names.froglegs and tags.veggie and tags.veggie >= 0.5
+end,
+```
+
+### 1.3.5 闭包——函数"记住"了外部变量
+
+闭包是 Lua 中一个强大的概念。简单说：**当一个函数引用了它外部的局部变量时，这个函数就是一个闭包，它会"记住"那些变量**。
+
+先看一个简单的例子：
+
+```lua
+local function make_counter()
+    local count = 0     -- 外部的局部变量
+    return function()   -- 返回一个内部函数
+        count = count + 1
+        return count
+    end
+end
+
+local counter = make_counter()
+print(counter())  -- 1
+print(counter())  -- 2
+print(counter())  -- 3
+```
+
+`counter` 函数"记住"了 `count` 变量，每次调用都会在上一次的基础上加 1。即使 `make_counter` 已经执行完毕，`count` 也不会被销毁，因为闭包还在引用它。
+
+### 1.3.6 闭包在饥荒中的实际应用
+
+饥荒大量使用闭包。来看礼物接收器组件（`giftreceiver.lua`）中的例子：
+
+```lua
+local GiftReceiver = Class(function(self, inst)
+    self.inst = inst
+    self.giftcount = 0
+    self.giftmachine = nil
+
+    -- 这里创建了一个闭包，它"记住"了 self
+    self.onclosepopup = function(doer, data)
+        if data.popup == POPUPS.GIFTITEM then
+            self:OnStopOpenGift(data.args[1])
+        end
+    end
+    inst:ListenForEvent("ms_closepopup", self.onclosepopup)
+end)
+```
+
+这里的匿名函数引用了外部的 `self`，形成了闭包。为什么要这么做？因为事件回调函数的签名是固定的（`doer, data`），没有传 `self` 的参数位。通过闭包，函数就能"记住"创建时的 `self`，从而访问到组件实例。
+
+再来看青蛙雨组件（`frograin.lua`）中更典型的闭包用法：
+
+```lua
+return Class(function(self, inst)
+    -- 这些 local 变量被下面的函数共享
+    local _activeplayers = {}
+    local _frogs = {}
+    local _frogcap = 0
+    local _updating = false
+
+    -- 这个函数引用了上面的 local 变量，形成闭包
+    local function GetSpawnPoint(pt)
+        local function TestSpawnPoint(offset)
+            local spawnpoint = pt + offset
+            return _map:IsAboveGroundAtPoint(spawnpoint:Get())
+            -- _map 也是上面定义的闭包变量
+        end
+        -- ...
+    end
+end)
+```
+
+整个组件的私有变量都是通过闭包实现的——`_activeplayers`、`_frogs` 等变量对外部不可见，只有同一个闭包作用域内的函数才能访问。这是 Lua 实现**私有成员**的标准手法。
+
+### 1.3.7 可变参数
+
+Lua 用 `...` 表示可变参数：
+
+```lua
+local function myprint(...)
+    local args = {...}  -- 把可变参数收集到一个 table 里
+    for i, v in ipairs(args) do
+        print(v)
+    end
+end
+
+myprint("a", "b", "c")  -- 打印 a、b、c
+```
+
+在饥荒中，`SpawnPrefab` 生成实体后经常需要链式设置，可变参数在这类工具函数中很有用。
+
+### 1.3.8 函数存在 table 里——方法的实现
+
+在 Lua 中，把函数放进 table 就可以模拟"对象方法"：
+
+```lua
+local dog = {}
+dog.name = "Woby"
+
+dog.bark = function(self)
+    print(self.name .. " says: Woof!")
+end
+
+dog.bark(dog)   -- Woby says: Woof!
+dog:bark()      -- 等价写法，用冒号自动把 dog 作为第一个参数 self 传入
+```
+
+**冒号语法 `:` 是 Lua 的语法糖**：
+- `dog:bark()` 等价于 `dog.bark(dog)`
+- 定义时 `function dog:bark()` 等价于 `function dog.bark(self)`
+
+饥荒中到处都在用冒号语法：
+
+```lua
+-- 这两行是等价的
+inst.components.health:DoDelta(-10)
+inst.components.health.DoDelta(inst.components.health, -10)
+```
+
+---
+
+> **本节小结**
+> - 函数是 Lua 的一等公民，可以赋值、传参、存入 table
+> - 回调模式是饥荒编程的核心——把函数注册到系统中，由事件触发调用
+> - 匿名函数适合短小的一次性回调
+> - 闭包让函数"记住"外部变量，饥荒用它实现私有成员和事件监听
+> - 冒号语法 `:` 是方法调用的语法糖，自动传递 `self`
 
 ## 1.4 元表与面向对象（Class 系统的基础）
 
