@@ -44,7 +44,7 @@ if inst.components.health ~= nil then
 end
 ```
 
-为什么要这样检查？因为饥荒里不是所有实体都有相同的组件——一块石头没有 `health` 组件（不可攻击），但一棵树有。如果你不检查就直接访问，游戏就会报错崩溃。
+为什么要这样检查？因为饥荒里不是所有实体都有相同的组件——一块石头没有 `health` 组件（不可攻击），但猪人有。如果你不检查就直接访问，游戏就会报错崩溃。
 
 还有一个常见用法——**把变量设为 `nil` 来"删除"它**：
 
@@ -62,8 +62,8 @@ end
 ```lua
 if 0 then print("0 是真的！") end           -- 会打印，因为 0 在 Lua 中是真
 if "" then print("空字符串也是真的！") end    -- 会打印
-if nil then print("不会打印") end            -- 不会打印
-if false then print("不会打印") end          -- 不会打印
+if nil then print("假") end            -- 不会打印
+if false then print("假") end          -- 不会打印
 ```
 
 ### 1.1.3 boolean——开关与条件
