@@ -293,7 +293,299 @@ local str = tostring(42)       -- 数字转字符串
 
 ## 1.2 Table——Lua 的万能数据结构
 
-（待编写）
+Table（表）是 Lua 中**唯一**的复合数据结构。数组、字典、列表、集合、对象……在 Lua 里全部用 table 实现。可以毫不夸张地说，**如果你理解了 table，你就理解了半个饥荒**。
+
+### 1.2.1 创建 table
+
+用花括号 `{}` 即可创建一个 table：
+
+```lua
+local empty = {}               -- 空表
+local list = {1, 2, 3}        -- 像数组的表
+local dict = {name = "axe", damage = 27}  -- 像字典的表
+```
+
+### 1.2.2 table 当数组用
+
+当 table 的键是**连续的整数**（从 1 开始）时，它就像数组一样：
+
+```lua
+-- 来自 prefabs/axe.lua —— 一个典型的资源列表
+local assets = {
+    Asset("ANIM", "anim/axe.zip"),
+    Asset("ANIM", "anim/swap_axe.zip"),
+}
+```
+
+这里 `assets[1]` 是第一个 Asset，`assets[2]` 是第二个。注意 **Lua 的数组下标从 1 开始**，不是 0！
+
+**常用操作**：
+
+```lua
+local items = {"log", "rocks", "cutgrass"}
+
+-- 获取长度
+print(#items)                  -- 3
+
+-- 访问元素
+print(items[1])                -- "log"
+print(items[3])                -- "cutgrass"
+
+-- 添加元素到末尾
+table.insert(items, "twigs")   -- items 现在有 4 个元素
+
+-- 删除指定位置的元素
+table.remove(items, 2)         -- 删除 "rocks"，后面的元素自动前移
+
+-- 遍历数组——用 ipairs
+for i, item in ipairs(items) do
+    print(i, item)
+end
+```
+
+来看一个饥荒中用数组存储食谱卡牌素材的例子：
+
+```lua
+-- 来自 preparedfoods.lua
+card_def = {
+    ingredients = {{"butterflywings", 1}, {"carrot", 2}, {"berries", 1}}
+},
+```
+
+这是一个"数组套数组"的嵌套结构——外层数组的每个元素是一个内层数组 `{材料名, 数量}`。
+
+### 1.2.3 table 当字典（键值对）用
+
+当 table 的键是字符串时，它就像字典/哈希表：
+
+```lua
+-- 来自 preparedfoods.lua —— 蝴蝶松饼的食谱
+butterflymuffin = {
+    foodtype = FOODTYPE.VEGGIE,       -- 食物类型：蔬菜
+    health = TUNING.HEALING_MED,      -- 回血量
+    hunger = TUNING.CALORIES_LARGE,   -- 回饱食度
+    perishtime = TUNING.PERISH_SLOW,  -- 保质期
+    sanity = TUNING.SANITY_TINY,      -- 回理智
+    cooktime = 2,                      -- 烹饪时间
+    priority = 1,                      -- 优先级
+}
+```
+
+这就是饥荒食谱系统的核心结构——每道菜就是一个 table，里面用键值对描述所有属性。
+
+**两种访问方式**：
+
+```lua
+local food = {name = "meatballs", hunger = 62.5}
+
+-- 方式一：点号访问（键是合法标识符时用）
+print(food.name)          -- "meatballs"
+print(food.hunger)        -- 62.5
+
+-- 方式二：方括号访问（更通用，键可以是任意值）
+print(food["name"])       -- "meatballs"
+
+-- 方括号的好处：键可以是变量
+local key = "hunger"
+print(food[key])          -- 62.5
+```
+
+**遍历字典——用 `pairs`**：
+
+```lua
+-- 来自 spicedfoods.lua
+local SPICES = {
+    SPICE_GARLIC = { oneatenfn = oneaten_garlic },
+    SPICE_SUGAR  = { oneatenfn = oneaten_sugar },
+    SPICE_CHILI  = { oneatenfn = oneaten_chili },
+    SPICE_SALT   = {},
+}
+
+-- pairs 遍历所有键值对（顺序不确定）
+for spicename, spicedata in pairs(SPICES) do
+    print(spicename)  -- "SPICE_GARLIC", "SPICE_SUGAR" 等
+end
+```
+
+> **ipairs vs pairs**：`ipairs` 只遍历连续整数键（数组部分），遇到 `nil` 就停；`pairs` 遍历所有键值对。选错了会漏掉数据。
+
+### 1.2.4 table 当集合（Set）用
+
+在饥荒中，经常需要判断某个值是否在一个集合里。比如"这把斧头对哪些类型的敌人有加成？"Lua 没有内置 Set，但可以用 table 的键来模拟：
+
+```lua
+-- 来自 prefabs/axe.lua —— 月光石斧对这些 tag 的敌人有额外磨损
+target:HasAnyTag("shadow", "shadowminion", "shadowchesspiece", "stalker", "stalkerminion", "shadowthrall")
+```
+
+如果你自己要做集合判断，最高效的方式是：
+
+```lua
+-- 把值作为键，值设为 true
+local SHADOW_TAGS = {
+    shadow = true,
+    shadowminion = true,
+    shadowchesspiece = true,
+    stalker = true,
+}
+
+-- 查找是 O(1) 的，非常快
+if SHADOW_TAGS[target_tag] then
+    print("这是暗影生物！")
+end
+```
+
+对比"把值放在数组里然后遍历查找"的方式（O(n)），这种写法在性能上好得多。饥荒源码中到处都在用这种模式：
+
+```lua
+-- 来自 recipe.lua —— 把 CHARACTER_INGREDIENT 的所有值变成集合
+local is_character_ingredient = {}
+for k, v in pairs(CHARACTER_INGREDIENT) do
+    is_character_ingredient[v] = true
+end
+
+-- 之后就可以 O(1) 查找了
+return is_character_ingredient[ingredienttype] == true
+```
+
+### 1.2.5 混合使用——数组 + 字典
+
+table 可以同时拥有数组部分和字典部分，饥荒里经常这么做：
+
+```lua
+-- 浮水效果参数：前面是数组部分，后面是字典部分
+local swap_data = {sym_build = "swap_glassaxe", bank = "glassaxe"}
+-- 有些场景下可以把位置参数和命名参数混用
+local floater = {"small", 0.05, {1.2, 0.75, 1.2}}
+```
+
+再看一个更典型的例子——漂浮参数：
+
+```lua
+-- 来自 preparedfoods.lua
+floater = {"med", nil, 0.55},
+-- floater[1] = "med"（大小）
+-- floater[2] = nil（偏移，使用默认值）
+-- floater[3] = 0.55（缩放）
+```
+
+### 1.2.6 嵌套 table——饥荒的数据骨架
+
+饥荒的复杂配置几乎都靠嵌套 table 来组织。来看一个幻觉系统的配置（来自 `hallucinations.lua`）：
+
+```lua
+local HALLUCINATION_TYPES = {
+    creepyeyes = {
+        interval = 5,         -- 每 5 秒触发一次
+        variance = 2.5,       -- 随机浮动 ±2.5 秒
+        initial_variance = 20, -- 首次触发的随机延迟
+        nightonly = true,      -- 只在夜晚出现
+    },
+    shadowwatcher = {
+        interval = 30,
+        variance = 15,
+        initial_variance = 10,
+        nightonly = true,
+    },
+    shadowskittish = {
+        interval = 10,
+        variance = 5,
+        initial_variance = 20,
+        nightonly = false,     -- 白天也会出现
+    },
+}
+```
+
+这是一个"字典套字典"的结构：外层键是幻觉类型名，内层键是各种参数。通过 `HALLUCINATION_TYPES.creepyeyes.interval` 就能拿到对应的数值。
+
+### 1.2.7 常用的 table 操作函数
+
+```lua
+local t = {3, 1, 4, 1, 5, 9}
+
+-- 插入
+table.insert(t, 2)           -- 末尾追加 2
+table.insert(t, 1, 0)        -- 在位置 1 插入 0
+
+-- 删除
+table.remove(t, 1)           -- 删除位置 1 的元素并返回它
+table.remove(t)              -- 删除并返回最后一个元素
+
+-- 排序
+table.sort(t)                -- 升序排列
+table.sort(t, function(a, b) return a > b end)  -- 降序
+
+-- 拼接成字符串
+local s = table.concat({"a", "b", "c"}, ", ")  -- "a, b, c"
+```
+
+饥荒还扩展了一些好用的 table 函数：
+
+```lua
+-- 检查值是否在数组中
+table.contains(self.items, itemname)
+
+-- 浅拷贝
+local newdata = shallowcopy(olddata)
+```
+
+### 1.2.8 table 是引用类型
+
+这一点非常重要，很多初学者会在这里踩坑：
+
+```lua
+local a = {hp = 100}
+local b = a          -- b 和 a 指向同一个 table！
+
+b.hp = 50
+print(a.hp)          -- 50！a 也被改了！
+```
+
+`a` 和 `b` 并不是两份独立的数据，而是两个指向**同一个 table** 的引用。修改 `b` 就等于修改 `a`。
+
+如果你需要一份独立的拷贝，要用 `shallowcopy`（饥荒提供的工具函数）：
+
+```lua
+local a = {hp = 100}
+local b = shallowcopy(a)  -- b 是一份新的独立拷贝
+b.hp = 50
+print(a.hp)                -- 100，a 没有被影响
+```
+
+这也是为什么饥荒在生成调味食谱时会先拷贝一份原始数据：
+
+```lua
+-- 来自 spicedfoods.lua
+local newdata = shallowcopy(fooddata)  -- 拷贝一份再修改，不影响原始食谱
+newdata.cooktime = .12
+newdata.spice = spicenameupper
+```
+
+### 1.2.9 table 作为函数参数
+
+因为 table 是引用类型，传给函数时传的是引用，函数内部可以直接修改原始 table：
+
+```lua
+local function heal(entity_data, amount)
+    entity_data.hp = entity_data.hp + amount  -- 直接修改了传入的 table
+end
+
+local player = {hp = 80, max_hp = 150}
+heal(player, 20)
+print(player.hp)  -- 100
+```
+
+这在饥荒的组件系统中随处可见——组件方法通过 `self`（也是一个 table）直接修改自身的数据。
+
+---
+
+> **本节小结**
+> - Table 是 Lua 唯一的复合数据结构，身兼数组、字典、集合、对象等多重身份
+> - 数组下标从 1 开始；遍历数组用 `ipairs`，遍历字典用 `pairs`
+> - 用 `table[key] = true` 模式可以高效地模拟集合
+> - 嵌套 table 是饥荒存储配置数据的标准方式（食谱、幻觉类型、漂浮物等）
+> - Table 是引用类型，赋值只是复制引用，需要独立副本时要用 `shallowcopy`
+> - 饥荒扩展了 `table.contains`、`shallowcopy` 等实用工具函数
 
 ## 1.3 函数与闭包
 
