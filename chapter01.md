@@ -2850,4 +2850,311 @@ end
 
 ## 1.8 弱引用表（Weak Table）——避免内存泄漏的利器
 
-（待编写）
+Lua 有自动垃圾回收机制——当一个对象不再被任何变量引用时，垃圾回收器（GC）会自动释放它占用的内存。但有些时候，你需要在一个 table 中记录某些对象（比如缓存、追踪列表），而又**不想因为这个记录本身阻止对象被回收**。这就是**弱引用表（weak table）**解决的问题。
+
+弱引用表在日常 Mod 开发中不常用，但在理解饥荒引擎代码和排查内存泄漏时至关重要。即使你现在用不到，了解这个概念也能让你写出更健壮的代码。
+
+### 1.8.1 问题：强引用导致的内存泄漏
+
+先看一个常见的问题场景。假设你要追踪所有创建过的怪物实体：
+
+```lua
+local all_monsters = {}
+
+local function on_monster_created(inst)
+    all_monsters[inst] = true   -- 记录这个怪物
+end
+
+local function on_monster_removed(inst)
+    all_monsters[inst] = nil    -- 手动清除记录
+end
+```
+
+如果一切正常运作（创建时记录，移除时清除），这段代码没问题。但在实际开发中，**很容易忘记调用清除操作**——怪物可能因为各种原因被销毁（被杀、消失、卸载），而你没法覆盖所有情况。
+
+一旦忘记清除，`all_monsters` 中的引用会一直持有这些已经"应该消失"的实体对象，GC 无法回收它们的内存。这就是**内存泄漏**——随着游戏运行，内存占用越来越大。
+
+### 1.8.2 解决方案：弱引用表
+
+弱引用表的特殊之处在于：**它对其中的键或值持有"弱引用"——如果一个对象只被弱引用表引用（没有任何"强引用"指向它），GC 依然会回收它**。
+
+设置弱引用表很简单——给表的元表设置 `__mode` 字段：
+
+```lua
+-- 弱键：键是弱引用
+local weak_keys = setmetatable({}, {__mode = "k"})
+
+-- 弱值：值是弱引用
+local weak_values = setmetatable({}, {__mode = "v"})
+
+-- 弱键弱值：键和值都是弱引用
+local weak_both = setmetatable({}, {__mode = "kv"})
+```
+
+用弱键表重写上面的怪物追踪：
+
+```lua
+local all_monsters = setmetatable({}, {__mode = "k"})
+
+local function on_monster_created(inst)
+    all_monsters[inst] = true   -- 记录怪物
+end
+-- 不需要手动清除！当怪物实体被销毁后：
+-- 如果没有其他地方引用它，GC 会自动清掉 all_monsters 中的对应条目
+```
+
+这样即使你忘记手动清除，也不会造成内存泄漏。
+
+### 1.8.3 弱引用的三种模式
+
+**弱键（`__mode = "k"`）**
+
+表中的**键**是弱引用。当键对象在表外没有其他强引用时，整个键值对会被 GC 清除。
+
+```lua
+local cache = setmetatable({}, {__mode = "k"})
+
+local obj = {name = "test"}
+cache[obj] = "some cached data"
+
+print(cache[obj])   -- "some cached data"
+
+obj = nil           -- 移除对 obj 的强引用
+collectgarbage()    -- 触发 GC
+
+-- cache 中以 obj 为键的条目已被自动清除
+-- （但我们已经无法验证，因为 obj 变量本身也是 nil 了）
+```
+
+这是饥荒中最常用的弱表模式。
+
+**弱值（`__mode = "v"`）**
+
+表中的**值**是弱引用。当值对象在表外没有其他强引用时，该条目被清除。
+
+```lua
+local name_cache = setmetatable({}, {__mode = "v"})
+
+local function get_entity(name)
+    if name_cache[name] == nil then
+        name_cache[name] = create_entity(name)  -- 缓存新创建的实体
+    end
+    return name_cache[name]
+end
+-- 如果返回的实体在外部不再被引用，缓存条目会自动消失
+```
+
+**弱键弱值（`__mode = "kv"`）**
+
+键和值都是弱引用。只要键或值中的任一个失去强引用，条目就会被清除。
+
+```lua
+local mapping = setmetatable({}, {__mode = "kv"})
+```
+
+### 1.8.4 饥荒中的弱表——UI 更新列表
+
+饥荒的前端系统（`frontend.lua`）用弱键表来管理需要每帧更新的 UI 组件：
+
+```lua
+-- 来自 scripts/frontend.lua
+self.updating_widgets = setmetatable({}, {__mode = "k"})
+```
+
+注册和取消注册：
+
+```lua
+function FrontEnd:StartUpdatingWidget(w)
+    self.updating_widgets[w] = true
+end
+
+function FrontEnd:StopUpdatingWidget(w)
+    self.updating_widgets[w] = nil
+end
+```
+
+为什么用弱键？想象这个场景：一个 UI 面板注册了 `StartUpdatingWidget`，然后用户关闭了面板。理想情况下，面板在关闭时会调用 `StopUpdatingWidget` 取消注册。但如果代码有 bug 或者面板因为异常被销毁而没有正常清理，这个 widget 引用就永远留在 `updating_widgets` 里了。
+
+有了弱键，即使忘记取消注册，当 widget 对象被 GC 回收后，`updating_widgets` 中对应的条目会自动消失。这是一道**安全网**——不替代正常的清理逻辑，但防止最坏的情况发生。
+
+### 1.8.5 饥荒中的弱表——类实例追踪
+
+`class.lua` 中有一个调试功能——追踪所有 Class 实例的创建，用于检测内存泄漏：
+
+```lua
+-- 来自 scripts/class.lua
+if TrackClassInstances == true and CWD ~= nil then
+    if ClassTrackingTable == nil then
+        ClassTrackingTable = {}
+    end
+    ClassTrackingTable[mt] = {}
+    local tablemt = {}
+    setmetatable(ClassTrackingTable[mt], tablemt)
+    tablemt.__mode = "k"         -- 实例追踪表用弱键
+end
+```
+
+每个类都有一个追踪子表，子表的键是该类的所有实例。用弱键的原因很直观：追踪表不应该阻止实例被回收——它只是在"旁观"哪些实例还活着，而不是在"抓住"它们。
+
+配合定期执行的 `HandleClassInstanceTracking()`，开发者可以看到当前存活实例最多的是哪些类，从而发现内存泄漏：
+
+```lua
+-- 来自 scripts/class.lua（简化版）
+function HandleClassInstanceTracking()
+    if TrackClassInstances then
+        collectgarbage()    -- 先强制 GC，让弱表清掉已回收的实例
+        -- 然后统计每个类还有多少存活实例，打印 Top 10
+        for mt, instances in pairs(ClassTrackingTable) do
+            local count = 0
+            for obj, source in pairs(instances) do
+                count = count + 1
+            end
+            -- 排序后打印最多的前 10 个
+        end
+    end
+end
+```
+
+> **给新手的提示**：这个追踪功能默认是关闭的（`TrackClassInstances = false`）。在排查内存问题时，可以临时开启。
+
+### 1.8.6 饥荒中的弱表——MetaClass 的 GC 保护
+
+`metaclass.lua` 中有一个精妙的弱表用法，解决了一个 Lua 的底层问题：
+
+```lua
+-- 来自 scripts/metaclass.lua
+-- 第 1 行注释：因为 GC 的一个怪癖，元表可能在 userdata 之前被回收，导致崩溃
+local metatable_refs = setmetatable({}, {__mode = "k"})
+```
+
+在创建对象时：
+
+```lua
+mt.__call = function(class_tbl, ...)
+    local obj = newproxy(true)          -- 创建 userdata
+    local objmt = getmetatable(obj)     -- 获取其元表
+    metatable_refs[obj] = objmt         -- 用弱表记录关联
+    -- ...
+end
+```
+
+问题是：`newproxy` 创建的 userdata 和它的 metatable 是独立的 Lua 对象。在某些情况下，GC 可能先回收 metatable，后回收 userdata——但 userdata 在析构时还需要访问 metatable，这时就会崩溃。
+
+解决方法：用 `metatable_refs[obj] = objmt` 建立一个从 userdata 到 metatable 的引用链。因为表的键是弱引用（`__mode = "k"`），所以：
+- 只要 `obj`（userdata）还活着，`objmt`（metatable）就不会被回收（因为 `metatable_refs` 持有对 objmt 的强引用——值是强引用）
+- 当 `obj` 被 GC 标记为可回收时，`metatable_refs` 中的条目也会被清除
+
+这保证了 metatable 的生命周期不会短于 userdata，同时不会阻止 userdata 本身被正常回收。非常巧妙。
+
+### 1.8.7 弱表与 inspect 库——调试工具中的精心设计
+
+饥荒内置的 `inspect.lua`（用于漂亮地打印 table 结构）使用了两种弱表：
+
+```lua
+-- 来自 scripts/inspect.lua
+ids = {
+    ['function'] = setmetatable({}, {__mode = "kv"}),
+    ['userdata'] = setmetatable({}, {__mode = "kv"}),
+    ['thread']   = setmetatable({}, {__mode = "kv"}),
+    ['table']    = setmetatable({}, {__mode = "kv"})
+},
+tableAppearances = setmetatable({}, {__mode = "k"})
+```
+
+`ids` 表为 function、userdata 等不可直接序列化的对象分配临时 ID（如 `<function 1>`、`<table 2>`）。用 `"kv"` 弱模式意味着：inspect 只是"路过看看"这些对象，不会因为打印它们而把它们"钉"在内存里。
+
+`tableAppearances` 追踪每个 table 在被 inspect 的结构中出现了几次——如果同一个 table 出现多次，就需要用引用标记来避免无限递归。弱键保证这个临时统计不会泄漏。
+
+### 1.8.8 什么时候该用弱表
+
+总结饥荒中弱表的使用场景，给出实用的判断标准：
+
+**应该用弱表的场景：**
+
+1. **注册/追踪列表**：记录一组对象但不想"拥有"它们（如 `updating_widgets`、`ClassTrackingTable`）
+2. **缓存**：缓存计算结果但允许在内存紧张时被清除
+3. **临时关联**：建立对象之间的映射关系但不想影响生命周期（如 `metatable_refs`、`inspect` 的 ids）
+4. **观察者模式**：监听某些对象的状态但不阻止它们被回收
+
+**不该用弱表的场景：**
+
+1. **你需要保证数据不丢失**——弱引用的条目随时可能消失
+2. **键或值是字符串/数字**——Lua 中字符串和数字不受弱引用影响（它们是"值类型"，由 Lua 内部管理生命周期，不参与普通的 GC 引用计数）
+3. **你需要精确控制清理时机**——弱表的清理取决于 GC 的运行时机，不可预测
+
+### 1.8.9 注意事项——弱引用的陷阱
+
+**陷阱一：字符串和数字不受弱引用影响**
+
+```lua
+local t = setmetatable({}, {__mode = "v"})
+t[1] = "hello"
+t[2] = 42
+
+collectgarbage()
+print(t[1])  -- "hello"（还在！字符串不受弱引用影响）
+print(t[2])  -- 42（还在！数字不受弱引用影响）
+```
+
+只有 table、function、thread、userdata 这些"引用类型"才受弱引用的影响。
+
+**陷阱二：GC 时机不确定**
+
+弱表中条目的清除取决于 GC 什么时候运行。你不能假设"赋值为 nil 后条目立刻消失"：
+
+```lua
+local weak = setmetatable({}, {__mode = "k"})
+local obj = {}
+weak[obj] = "data"
+obj = nil
+-- 此时 weak 中的条目可能还在！需要等 GC 运行
+collectgarbage()
+-- 现在条目才真正被清除
+```
+
+**陷阱三：遍历弱表时要小心**
+
+在遍历弱表的过程中，GC 可能随时清除其中的条目。虽然在实践中这很少导致问题（Lua 的 `pairs` 迭代器是安全的），但你不应该假设遍历开始时的元素在遍历结束时还在。
+
+### 1.8.10 在 Mod 中使用弱表
+
+对于大多数 Mod 来说，你可能不需要直接使用弱表。但如果你的 Mod 需要：
+
+- 维护一个活跃实体的列表
+- 缓存某些计算结果
+- 建立实体之间的临时关联
+
+弱表就是你的好帮手：
+
+```lua
+-- 在 Mod 中：追踪所有被你的 Mod 修改过的实体
+local modified_entities = setmetatable({}, {__mode = "k"})
+
+AddPrefabPostInit("evergreen", function(inst)
+    -- 修改实体...
+    modified_entities[inst] = {
+        original_health = inst.components.health.maxhealth,
+        modified_at = GetTime(),
+    }
+end)
+
+-- 之后可以遍历所有还活着的被修改实体
+for inst, data in pairs(modified_entities) do
+    if inst:IsValid() then
+        print(inst.prefab, "was modified at", data.modified_at)
+    end
+end
+```
+
+这比手动维护列表并在实体销毁时清除要安全得多。
+
+---
+
+> **本节小结**
+> - 弱引用表通过 `setmetatable({}, {__mode = "k"/"v"/"kv"})` 创建
+> - 弱键（`"k"`）：键对象无强引用时，条目被自动清除——饥荒中最常用
+> - 弱值（`"v"`）：值对象无强引用时，条目被清除——适合缓存
+> - 弱表的核心价值：**让你在 table 中引用对象而不阻止其被 GC 回收**
+> - 饥荒中的实际应用：UI 更新列表（`frontend.lua`）、类实例追踪（`class.lua`）、GC 保护（`metaclass.lua`）
+> - 字符串和数字不受弱引用影响，只有引用类型（table、function 等）才受影响
+> - 在 Mod 中，弱键表是管理实体追踪列表的安全方式
