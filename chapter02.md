@@ -1384,7 +1384,598 @@ end)
 
 ## 2.5 EntityScript——所有实体的基类（entityscript.lua 核心 API）
 
-（待编写）
+`EntityScript` 是饥荒联机版中**所有 Lua 实体对象的基类**。当你在 Mod 或 Prefab 代码中拿到一个 `inst`（不管它是角色、物品还是世界），它就是一个 `EntityScript` 的实例。本节将系统梳理它的核心 API，按功能分类，方便你在开发中速查。
+
+### 2.5.1 EntityScript 的构造——一个实体是怎么诞生的
+
+```lua
+-- scripts/entityscript.lua
+EntityScript = Class(function(self, entity)
+    self.entity = entity              -- C++ 引擎实体对象
+    self.components = {}              -- Lua 组件容器
+    self.lower_components_shadow = {} -- 防重复添加（大小写无关）
+    self.GUID = entity:GetGUID()      -- 全局唯一标识符
+    self.spawntime = GetTime()        -- 出生时刻
+    self.persists = true              -- 是否需要存档
+    self.inlimbo = false              -- 是否在 limbo（不可见）状态
+    self.name = nil                   -- 显示名称
+
+    self.event_listeners = nil        -- 别人在"我"身上监听的事件
+    self.event_listening = nil        -- "我"在别人身上监听的事件
+    self.pendingtasks = nil           -- 待执行的定时任务
+    self.children = nil               -- 子实体列表
+
+    -- Replica 组件容器（客户端可访问的组件镜像）
+    self.replica = { _ = {}, inst = self }
+    setmetatable(self.replica, replica_mt)
+end)
+```
+
+每个字段的设计都有特定目的：
+- `entity`：连接 C++ 引擎层，通过它访问 `Transform`、`AnimState`、`Physics` 等底层组件
+- `GUID`：引擎分配的唯一 ID，用于查找实体（`Ents[GUID]`）和绑定定时任务
+- `persists`：设为 `false` 的实体不会被存档（临时特效、粒子等）
+- `replica`：带自定义 `__index` 的 table，让 `inst.replica.xxx` 能自动解析 replica 组件
+
+### 2.5.2 组件管理 API
+
+#### AddComponent(name) / RemoveComponent(name)
+
+```lua
+-- 添加组件
+local cmp = inst:AddComponent("health")
+
+-- 内部流程：
+-- 1. 检查是否已存在（大小写无关）→ 已有则直接返回
+-- 2. require("components/" .. name) 加载组件类
+-- 3. 实例化：cmp(self) → 传入实体作为 inst
+-- 4. 存入 self.components[name]
+-- 5. 调用所有 Mod 的 ComponentPostInit
+-- 6. 注册该组件提供的 Action
+```
+
+```lua
+-- 移除组件
+inst:RemoveComponent("health")
+
+-- 内部流程：
+-- 1. 停止该组件的更新（如果有 OnUpdate）
+-- 2. 从 self.components 中移除
+-- 3. 调用 cmp:OnRemoveFromEntity()（清理回调）
+-- 4. 清理 Replica 组件
+-- 5. 注销该组件的 Action
+```
+
+**Mod 实践要点**：
+
+```lua
+-- 安全地访问组件（组件可能不存在）
+if inst.components.health then
+    inst.components.health:SetMaxHealth(200)
+end
+
+-- 添加组件前不需要检查（重复添加会直接返回已有组件）
+inst:AddComponent("inventoryitem")
+
+-- RemoveComponent 后，组件引用立即失效
+inst:RemoveComponent("combat")
+-- inst.components.combat 现在是 nil
+```
+
+#### StartUpdatingComponent(cmp) / StopUpdatingComponent(cmp)
+
+并非所有组件都需要每帧执行逻辑。只有调用了 `StartUpdatingComponent` 的组件，其 `OnUpdate(dt)` 方法才会在每个游戏帧被调用。
+
+```lua
+-- 组件内部典型用法
+function MyComponent:TurnOn()
+    self.active = true
+    self.inst:StartUpdatingComponent(self)  -- 开始每帧更新
+end
+
+function MyComponent:TurnOff()
+    self.active = false
+    self.inst:StopUpdatingComponent(self)   -- 停止每帧更新
+end
+
+function MyComponent:OnUpdate(dt)
+    -- 每帧执行的逻辑
+end
+```
+
+源码中，`StartUpdatingComponent` 会把实体注册到全局的 `UpdatingEnts` 表中，然后 `update.lua` 中的主循环每帧遍历该表，调用每个组件的 `OnUpdate`：
+
+```lua
+-- entityscript.lua 简化版
+function EntityScript:StartUpdatingComponent(cmp)
+    if not self.updatecomponents then
+        self.updatecomponents = {}
+        NewUpdatingEnts[self.GUID] = self     -- 加入全局更新列表
+        num_updating_ents = num_updating_ents + 1
+    end
+    self.updatecomponents[cmp] = cmpname      -- 记录需要更新的组件
+end
+```
+
+饥荒还有 **WallUpdate**（墙上时钟更新，不受暂停影响）和 **StaticUpdate**（不受游戏时间缩放影响），分别对应 `StartWallUpdatingComponent` 和 `DoStaticPeriodicTask`。
+
+### 2.5.3 定时任务 API——DoTaskInTime 家族
+
+这是 Mod 开发中最常用的 API 之一。EntityScript 提供了四个定时任务方法：
+
+| 方法 | 说明 | 受时间暂停影响 | 执行次数 |
+|---|---|---|---|
+| `DoTaskInTime(time, fn, ...)` | 延迟执行 | 是 | 一次 |
+| `DoPeriodicTask(time, fn, delay, ...)` | 周期执行 | 是 | 无限 |
+| `DoStaticTaskInTime(time, fn, ...)` | 延迟执行 | 否 | 一次 |
+| `DoStaticPeriodicTask(time, fn, delay, ...)` | 周期执行 | 否 | 无限 |
+
+```lua
+-- 3 秒后执行一次
+inst:DoTaskInTime(3, function(inst)
+    print(inst.prefab .. " 3 seconds have passed!")
+end)
+
+-- 每 5 秒执行一次（第 3 个参数是首次延迟，nil = 立即开始第一次计时）
+local task = inst:DoPeriodicTask(5, function(inst)
+    print(inst.prefab .. " periodic tick!")
+end)
+
+-- 取消某个特定任务
+task:Cancel()
+
+-- 取消该实体的所有任务
+inst:CancelAllPendingTasks()
+```
+
+**Static vs 普通**的区别：普通任务使用游戏内时间（受暂停、时间缩放影响），Static 任务使用真实墙钟时间。UI 相关的定时器通常用 Static 版本。
+
+**源码实现细节**——所有任务都注册到 `self.pendingtasks` 表中：
+
+```lua
+function EntityScript:DoTaskInTime(time, fn, ...)
+    local periodic = scheduler:ExecuteInTime(time, fn, self.GUID, self, ...)
+    self.pendingtasks = self.pendingtasks or {}
+    self.pendingtasks[periodic] = true
+    periodic.onfinish = task_finish   -- 完成后自动从 pendingtasks 移除
+    return periodic
+end
+```
+
+这意味着当实体被 `Remove()` 时，`CancelAllPendingTasks()` 会自动取消所有未完成的定时任务——不会出现"实体已删除但定时器还在跑"的问题。
+
+**还有一个便利方法** `PushEventInTime`：
+
+```lua
+-- 3 秒后推送一个事件（相当于 DoTaskInTime + PushEvent 的合体）
+inst:PushEventInTime(3, "timer_done", {source = "magic"})
+```
+
+### 2.5.4 事件系统 API
+
+#### ListenForEvent(event, fn, source)
+
+```lua
+-- 监听自己身上的事件
+inst:ListenForEvent("death", function(inst, data)
+    print(inst.prefab .. " died!")
+end)
+
+-- 监听别的实体的事件（第三个参数指定事件源）
+inst:ListenForEvent("attacked", function(target, data)
+    print(target.prefab .. " was attacked!")
+end, some_target)
+```
+
+事件系统使用**双向注册**——源实体记录"谁在监听我"（`event_listeners`），监听者记录"我在监听谁"（`event_listening`）。这样做是为了：
+1. **推送事件时**：遍历源实体的 `event_listeners` 找到所有回调
+2. **清理时**：遍历监听者的 `event_listening` 取消所有监听（防内存泄漏）
+
+#### RemoveEventCallback(event, fn, source)
+
+```lua
+-- 取消监听（必须传入完全相同的 fn 引用）
+local function on_death(inst, data) ... end
+inst:ListenForEvent("death", on_death)
+inst:RemoveEventCallback("death", on_death)
+```
+
+注意：因为需要传入**同一个函数引用**来取消，所以如果你需要取消监听，就不能使用匿名函数——必须把函数保存到一个变量中。
+
+#### PushEvent(event, data) / PushEventImmediate(event, data)
+
+```lua
+-- 推送事件
+inst:PushEvent("attacked", {attacker = attacker, damage = damage})
+
+-- data 可以是任意 table，约定俗成传递相关信息
+```
+
+`PushEvent` 和 `PushEventImmediate` 的区别在于状态图的处理方式：
+- `PushEvent`：状态图在当前帧末尾处理事件（经过 `SGManager` 调度）
+- `PushEventImmediate`：状态图立即处理事件（`self.sg:HandleEvent` 直接调用）
+
+大多数情况下使用 `PushEvent` 即可。`PushEventImmediate` 主要用于需要状态图**立刻**响应的场景。
+
+### 2.5.5 位置与距离 API
+
+```lua
+-- 获取世界坐标
+local pos = inst:GetPosition()               -- 返回 Point 对象
+local x, y, z = inst.Transform:GetWorldPosition() -- 返回三个数字（更常用）
+
+-- 获取朝向角度
+local rot = inst:GetRotation()
+
+-- 计算到某点的角度
+local angle = inst:GetAngleToPoint(x, y, z)
+
+-- 面朝某个点
+inst:ForceFacePoint(x, y, z)   -- 无条件转向
+inst:FacePoint(x, y, z)        -- 如果状态图在 "busy" 就不转
+
+-- 距离计算（返回距离的平方，避免开方运算）
+local dist_sq = inst:GetDistanceSqToInst(other)
+local dist_sq = inst:GetDistanceSqToPoint(x, y, z)
+
+-- 判断是否在某距离内（内部用 dist² < range² 比较，高效）
+if inst:IsNear(other, 10) then
+    print("within 10 units!")
+end
+
+-- 附近是否有玩家
+if inst:IsNearPlayer(20, true) then  -- 20 格内，且玩家活着
+    print("a living player is nearby")
+end
+```
+
+**为什么用距离平方**？因为 `sqrt()` 是昂贵的运算。如果你只是比较"是否在范围内"，可以直接比较平方值：
+
+```lua
+-- 慢（需要开方）
+if math.sqrt(dist_sq) < 10 then
+
+-- 快（比较平方）
+if dist_sq < 10 * 10 then
+```
+
+`IsNear` 方法内部就是这么做的：
+
+```lua
+function EntityScript:IsNear(otherinst, dist)
+    return otherinst ~= nil and self:GetDistanceSqToInst(otherinst) < dist * dist
+end
+```
+
+### 2.5.6 可见性与场景管理
+
+#### Hide() / Show()
+
+```lua
+inst:Hide()   -- 隐藏实体（不可见，但仍在场景中）
+inst:Show()   -- 重新显示
+```
+
+#### RemoveFromScene() / ReturnToScene()
+
+这对方法比 `Hide/Show` 要"重"得多——它会把实体放入 **Limbo** 状态：
+
+```lua
+-- RemoveFromScene 做了这些事：
+-- 1. 添加 "INLIMBO" tag
+-- 2. 隐藏实体
+-- 3. 停止 AI 脑（Brain）
+-- 4. 停止状态图
+-- 5. 关闭物理碰撞
+-- 6. 暂停动画
+-- 7. 关闭灯光、阴影、小地图图标
+-- 8. 推送 "enterlimbo" 事件
+
+inst:RemoveFromScene()
+
+-- ReturnToScene 是完全相反的操作：
+-- 恢复所有被停止的系统，推送 "exitlimbo" 事件
+inst:ReturnToScene()
+```
+
+**典型应用场景**：物品被捡起放入物品栏时，调用 `RemoveFromScene()` 使其从地面消失；丢弃物品时调用 `ReturnToScene()` 使其重新出现。
+
+### 2.5.7 状态图与 AI 脑
+
+#### SetStateGraph(name)
+
+```lua
+-- 设置状态图（角色/生物的动画状态机）
+inst:SetStateGraph("SGwilson")
+
+-- 内部流程：
+-- 1. 如果已有状态图，先从 SGManager 移除
+-- 2. 加载状态图定义：require("stategraphs/" .. name)
+-- 3. 创建 StateGraphInstance 并注册到 SGManager
+-- 4. 进入默认状态
+```
+
+#### SetBrain(brainfn)
+
+```lua
+-- 设置 AI 脑（生物的行为决策）
+inst:SetBrain(require("brains/spiderbrain"))
+
+-- brainfn 是一个函数，调用后返回 Brain 实例
+-- Brain 内部使用行为树（BehaviourTree）来做决策
+```
+
+Brain 有智能的启用/禁用机制：
+- 实体进入睡眠状态（`IsAsleep`，即离玩家太远）→ Brain 被停用（节省性能）
+- 实体唤醒 → Brain 重新创建并启动
+- `StopBrain(reason)` / `RestartBrain(reason)` 支持多重原因（reason-based），只有所有原因都解除后 Brain 才会重启
+
+```lua
+-- 因为"frozen"而停止 AI
+inst:StopBrain("frozen")
+
+-- 因为"sleeping"也停止 AI
+inst:StopBrain("sleeping")
+
+-- 只解除"frozen"原因——AI 仍然不会启动（还有"sleeping"）
+inst:RestartBrain("frozen")
+
+-- 解除"sleeping"——所有原因都解除了，AI 重启
+inst:RestartBrain("sleeping")
+```
+
+### 2.5.8 线程管理
+
+```lua
+-- 启动一个绑定到实体的线程
+inst:StartThread(function()
+    while true do
+        print("doing something...")
+        Sleep(1)
+    end
+end)
+
+-- 杀死该实体的所有线程
+inst:KillTasks()
+```
+
+`StartThread` 内部使用实体的 GUID 作为线程 ID，这样当实体被 `Remove()` 时，可以通过 `KillThreadsWithID(self.GUID)` 批量终止所有相关线程。
+
+### 2.5.9 世界状态监听
+
+```lua
+-- 监听世界状态变化
+inst:WatchWorldState("isday", function(inst, isday)
+    if isday then
+        print("It's daytime!")
+    end
+end)
+
+-- 停止监听
+inst:StopWatchingWorldState("isday", fn)
+
+-- 停止所有世界状态监听
+inst:StopAllWatchingWorldStates()
+```
+
+常用的世界状态变量包括：`isday`、`isdusk`、`isnight`、`season`、`temperature`、`moisture`、`cycles`（天数）等。这些由 `TheWorld.components.worldstate` 管理。
+
+### 2.5.10 存档系统 API
+
+#### GetPersistData() / SetPersistData(data, newents)
+
+```lua
+-- 存档时调用（自动遍历所有组件的 OnSave）
+function EntityScript:GetPersistData()
+    local data = {}
+    for k, v in pairs(self.components) do
+        if v.OnSave then
+            local t, refs = v:OnSave()
+            if type(t) == "table" and not IsTableEmpty(t) then
+                data[k] = t
+            end
+        end
+    end
+    -- 还会调用实体自身的 OnSave
+    if self.OnSave then
+        self.OnSave(self, data)
+    end
+    return data, references
+end
+```
+
+读档时调用链：
+1. `SetPersistData(data, newents)` → 遍历所有组件的 `OnLoad(data[k])`
+2. `LoadPostPass(newents, savedata)` → 遍历所有组件的 `LoadPostPass`
+
+在你的 Prefab 中使用：
+
+```lua
+local function fn()
+    local inst = CreateEntity()
+    -- ...
+
+    -- 自定义存档逻辑
+    inst.OnSave = function(inst, data)
+        data.my_custom_value = inst.my_value
+    end
+
+    inst.OnLoad = function(inst, data)
+        if data then
+            inst.my_value = data.my_custom_value
+        end
+    end
+
+    return inst
+end
+```
+
+#### LongUpdate(dt)
+
+当玩家长时间离线或世界被暂停后恢复时，饥荒会调用 `LongUpdate` 来追赶错过的时间：
+
+```lua
+function EntityScript:LongUpdate(dt)
+    -- 调用实体自身的 LongUpdate
+    if self.OnLongUpdate ~= nil then
+        self:OnLongUpdate(dt)
+    end
+    -- 调用所有组件的 LongUpdate
+    for k, v in pairs(self.components) do
+        if v.LongUpdate ~= nil then
+            v:LongUpdate(dt)
+        end
+    end
+end
+```
+
+### 2.5.11 实体的销毁——Remove()
+
+`Remove()` 是实体的"死刑"，执行一系列彻底的清理操作：
+
+```lua
+function EntityScript:Remove()
+    -- 1. 从父实体/平台上脱离
+    if self.parent then self.parent:RemoveChild(self) end
+    if self.platform then self.platform:RemovePlatformFollower(self) end
+
+    -- 2. 从全局实体表中注销
+    OnRemoveEntity(self.GUID)
+
+    -- 3. 推送 "onremove" 事件（最后的通知机会）
+    self:PushEvent("onremove")
+
+    -- 4. 清理所有监听和任务
+    self:StopAllWatchingWorldStates()
+    self:RemoveAllEventCallbacks()
+    self:CancelAllPendingTasks()
+
+    -- 5. 通知所有组件和 replica 清理
+    for k, v in pairs(self.components) do
+        if v.OnRemoveEntity then v:OnRemoveEntity() end
+    end
+
+    -- 6. 从更新列表中移除
+    -- 7. 递归移除所有子实体
+    -- 8. 调用实体自身的 OnRemoveEntity
+    -- 9. 标记不存档，交还给引擎
+    self.persists = false
+    self.entity:Retire()
+end
+```
+
+**注意**：`Remove()` 是**不可逆**的。调用后实体永久失效。使用 `IsValid()` 检查实体是否仍然有效：
+
+```lua
+if inst:IsValid() then
+    -- 实体还活着，可以安全操作
+end
+```
+
+### 2.5.12 Replica 系统——客户端的镜像
+
+在联机版中，组件只存在于服务端（`mastersim`）。客户端需要访问某些组件信息时，使用 **Replica** 组件：
+
+```lua
+-- 服务端：直接访问组件
+if TheWorld.ismastersim then
+    inst.components.health:SetMaxHealth(200)
+end
+
+-- 客户端：通过 replica 访问
+local health_replica = inst.replica.health
+if health_replica then
+    local max_hp = health_replica:Max()
+end
+```
+
+Replica 的内部机制依赖一个自定义元表：
+
+```lua
+local replica_mt = {
+    __index = function(t, k)
+        return rawget(t, "inst"):ValidateReplicaComponent(k, rawget(t, "_")[k])
+    end,
+}
+```
+
+访问 `inst.replica.health` 时，实际上是通过 `__index` 元方法去 `_` 子表中查找 replica 组件实例。`ValidateReplicaComponent` 会额外做合法性校验。
+
+### 2.5.13 地形与平台 API
+
+```lua
+-- 判断是否在有效地面上（不包括船）
+inst:IsOnValidGround()
+
+-- 判断是否在可通过的点上（更通用）
+inst:IsOnPassablePoint(include_water, floating_platforms_are_not_passable)
+
+-- 判断是否在海洋上
+inst:IsOnOcean(allow_boats)
+
+-- 获取当前所在平台（船）
+local platform = inst:GetCurrentPlatform()
+
+-- 获取脚下的地形类型
+local tile_type, tile_info = inst:GetCurrentTileType()
+
+-- 如果掉到无效位置，自动移回陆地
+inst:PutBackOnGround(radius)  -- 在 radius 范围内找最近的合法点
+```
+
+### 2.5.14 其他实用 API
+
+#### Debuff（增减益效果）
+
+```lua
+-- 添加 debuff（如果没有 debuffable 组件会自动添加）
+inst:AddDebuff("mymod_buff", "mymod_buff_prefab", {duration = 10})
+
+-- 检查是否有某个 debuff
+if inst:HasDebuff("mymod_buff") then
+
+-- 移除 debuff
+inst:RemoveDebuff("mymod_buff")
+```
+
+#### 显示名称
+
+```lua
+-- 获取显示名称（带形容词，如"潮湿的斧头"）
+local name = inst:GetDisplayName()
+
+-- 获取基础名称（不带形容词）
+local name = inst:GetBasicDisplayName()
+```
+
+#### 子实体管理
+
+```lua
+-- 生成子实体（随父实体一起存档/删除）
+local child = inst:SpawnChild("fireflies")
+
+-- 手动添加/移除子实体
+inst:AddChild(child)
+inst:RemoveChild(child)
+```
+
+---
+
+> **本节小结——EntityScript 核心 API 速查**
+>
+> | 类别 | 核心方法 |
+> |---|---|
+> | 组件管理 | `AddComponent`, `RemoveComponent`, `StartUpdatingComponent`, `StopUpdatingComponent` |
+> | 定时任务 | `DoTaskInTime`, `DoPeriodicTask`, `DoStaticTaskInTime`, `DoStaticPeriodicTask`, `CancelAllPendingTasks` |
+> | 事件系统 | `ListenForEvent`, `RemoveEventCallback`, `PushEvent`, `PushEventImmediate` |
+> | 位置距离 | `GetPosition`, `GetDistanceSqToInst`, `IsNear`, `ForceFacePoint`, `IsNearPlayer` |
+> | 场景管理 | `Hide/Show`, `RemoveFromScene/ReturnToScene`, `Remove`, `IsValid` |
+> | 状态图/AI | `SetStateGraph`, `ClearStateGraph`, `SetBrain`, `StopBrain/RestartBrain` |
+> | 存档系统 | `OnSave/OnLoad`（自定义）, `GetPersistData/SetPersistData`（框架调用）, `LongUpdate` |
+> | 世界状态 | `WatchWorldState`, `StopWatchingWorldState` |
+> | Tag | `AddTag`, `RemoveTag`, `HasTag`, `HasTags`, `HasOneOfTags` |
+> | 地形平台 | `IsOnValidGround`, `IsOnPassablePoint`, `IsOnOcean`, `GetCurrentPlatform` |
+> | Replica | `inst.replica.xxx`——客户端访问服务端组件信息的桥梁 |
 
 ## 2.6 客户端/服务端（C/S）架构——为什么有两份代码
 
