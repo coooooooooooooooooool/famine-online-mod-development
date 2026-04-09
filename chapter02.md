@@ -1979,7 +1979,448 @@ inst:RemoveChild(child)
 
 ## 2.6 客户端/服务端（C/S）架构——为什么有两份代码
 
-（待编写）
+饥荒联机版和单机版最本质的区别不是"能联机"这么简单——它从底层改变了整个游戏的运行方式。理解 C/S 架构，是从"能写 Mod"到"能写**稳定**的 Mod"的分水岭。
+
+### 2.6.1 单机版 vs 联机版——到底改了什么
+
+> **给新手的类比**：想象一个棋盘游戏。
+> - **单机版**就像你一个人下棋——棋子在哪、轮到谁、规则判断，全都在你面前。
+> - **联机版**就像网络对弈——只有**裁判**（服务端）知道完整的棋局状态。每个玩家（客户端）只能看到自己被允许看到的部分，所有操作都要发给裁判，由裁判判定后再通知各玩家结果。
+
+在技术上：
+- **服务端（Server / Master Simulation）**：运行所有游戏逻辑——战斗计算、血量变化、物品掉落、AI 决策、世界状态。它是游戏的"唯一真相"。
+- **客户端（Client）**：负责渲染画面、播放动画和声音、显示 UI、处理玩家输入。它不运行大部分游戏逻辑，只展示服务端告诉它的结果。
+
+```
+┌───────────────────────────────┐
+│         服务端 (Server)        │
+│  ● 所有 components            │
+│  ● 所有游戏逻辑               │
+│  ● AI (Brain + BehaviourTree) │
+│  ● 状态图 (StateGraph)        │
+│  ● 存档 (Save/Load)           │
+│  ● 权威判定                   │
+└─────────────┬─────────────────┘
+              │ 网络同步（net variables）
+              ▼
+┌───────────────────────────────┐
+│         客户端 (Client)        │
+│  ● 渲染 (AnimState)           │
+│  ● UI 界面 (Widgets/Screens)  │
+│  ● 声音 (SoundEmitter)        │
+│  ● replica 组件（只读镜像）    │
+│  ● 输入处理 → 发送给服务端     │
+└───────────────────────────────┘
+```
+
+### 2.6.2 TheWorld.ismastersim——一行代码分两个世界
+
+判断当前代码运行在服务端还是客户端，只需要一个变量：
+
+```lua
+if TheWorld.ismastersim then
+    -- 这里的代码只在服务端运行
+else
+    -- 这里的代码只在客户端运行
+end
+```
+
+在 Prefab 构造函数中，有一个**标准模式**贯穿几乎所有 prefab 文件：
+
+```lua
+-- scripts/prefabs/axe.lua（简化版）
+local function fn()
+    local inst = CreateEntity()
+
+    -- ===== 公共部分：客户端和服务端都要执行 =====
+    inst.entity:AddTransform()       -- 位置（两端都需要）
+    inst.entity:AddAnimState()       -- 动画（两端都需要渲染）
+    inst.entity:AddNetwork()         -- 标记为网络同步实体
+
+    MakeInventoryPhysics(inst)       -- 物理设置
+    inst.AnimState:SetBank("axe")
+    inst.AnimState:SetBuild("axe")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst:AddTag("sharp")             -- Tag（两端都可查询）
+
+    inst.entity:SetPristine()        -- 标记"公共初始化完成"
+
+    -- ===== 分界线 =====
+    if not TheWorld.ismastersim then
+        return inst   -- 客户端到此为止，直接返回
+    end
+
+    -- ===== 服务端专属：添加组件和游戏逻辑 =====
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("tool")
+    inst:AddComponent("weapon")
+    inst:AddComponent("finiteuses")
+
+    inst.components.weapon:SetDamage(27)
+    inst.components.finiteuses:SetMaxUses(100)
+
+    return inst
+end
+```
+
+**三段式结构**：
+1. **公共部分**——`CreateEntity()` 到 `SetPristine()`：设置视觉表现（动画、物理、Tag），两端都执行
+2. **分界线**——`if not TheWorld.ismastersim then return inst end`：客户端在这里离开
+3. **服务端部分**——`AddComponent` 和所有游戏逻辑：只在服务端执行
+
+### 2.6.3 为什么客户端不能有组件
+
+你可能会问：为什么不让客户端也运行完整的组件？
+
+1. **防作弊**——如果客户端自己计算伤害和血量，作弊者可以直接修改这些值
+2. **一致性**——多个客户端各自计算的结果可能不同（浮点精度、时序差异等），只有一个权威来源才能保证所有人看到的是同一个游戏
+3. **带宽**——同步所有组件的完整状态太昂贵。只同步必要的"展示信息"就够了
+
+但客户端确实需要一些信息来渲染 UI——比如显示血条就需要知道当前血量。怎么办？这就是 Replica 和 Classified 的工作。
+
+### 2.6.4 网络变量（Net Variables）——数据同步的基础管道
+
+饥荒使用 **net_xxx** 类型的特殊变量来在服务端和客户端之间同步数据：
+
+```lua
+-- 常见的 net 变量类型
+net_bool(guid, name, dirty_event)         -- 布尔值
+net_byte(guid, name, dirty_event)         -- 0~255
+net_tinybyte(guid, name, dirty_event)     -- 更小范围的整数
+net_smallbyte(guid, name, dirty_event)    -- 小字节
+net_ushortint(guid, name, dirty_event)    -- 无符号短整数
+net_shortint(guid, name, dirty_event)     -- 有符号短整数
+net_uint(guid, name, dirty_event)         -- 无符号整数
+net_int(guid, name, dirty_event)          -- 有符号整数
+net_float(guid, name, dirty_event)        -- 浮点数
+net_string(guid, name, dirty_event)       -- 字符串
+net_hash(guid, name, dirty_event)         -- 哈希值
+net_entity(guid, name, dirty_event)       -- 实体引用
+net_event(guid, name)                     -- 一次性事件触发
+net_bytearray(guid, name, dirty_event)    -- 字节数组
+net_smallbytearray(guid, name, dirty_event) -- 小字节数组
+```
+
+三个参数的含义：
+- `guid`：属于哪个实体
+- `name`：变量名（全局唯一标识）
+- `dirty_event`：变量值改变时触发的事件名（可选）
+
+使用方式：
+
+```lua
+-- 创建
+self.myvalue = net_byte(inst.GUID, "mymod.myvalue", "myvaluedirty")
+
+-- 服务端写入
+self.myvalue:set(42)
+
+-- 客户端读取
+local val = self.myvalue:value()
+
+-- 客户端监听变化（通过 dirty event）
+inst:ListenForEvent("myvaluedirty", function(inst)
+    local new_val = inst.myvalue:value()
+    -- 更新 UI 等
+end)
+```
+
+来看一个真实例子——`player_classified.lua` 中的生命值同步：
+
+```lua
+-- scripts/prefabs/player_classified.lua
+-- 服务端创建网络变量
+inst.currenthealth = net_ushortint(inst.GUID, "health.currenthealth", "healthdirty")
+inst.maxhealth = net_ushortint(inst.GUID, "health.maxhealth", "healthdirty")
+inst.healthpenalty = net_byte(inst.GUID, "health.penalty", "healthdirty")
+inst.istakingfiredamage = net_bool(inst.GUID, "health.takingfiredamage", "istakingfiredamagedirty")
+```
+
+### 2.6.5 Classified 实体——网络数据的"信使"
+
+你注意到上面的 net 变量定义在 `player_classified` 而不是玩家实体本身。为什么要多一个实体？
+
+**Classified** 是饥荒设计的一种特殊实体，专门作为服务端和客户端之间的数据中转站。它：
+- 是一个**隐藏的子实体**（`Hide()` + `AddTag("CLASSIFIED")`），玩家看不到
+- 身上挂载了大量 `net_xxx` 变量
+- 服务端往里面写数据，客户端从里面读数据
+
+创建模式：
+
+```lua
+-- scripts/prefabs/inventoryitem_classified.lua（简化版）
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddNetwork()
+    inst.entity:Hide()
+    inst:AddTag("CLASSIFIED")
+
+    -- 声明网络变量
+    inst.image = net_hash(inst.GUID, "inventoryitem.image", "imagedirty")
+    inst.atlas = net_hash(inst.GUID, "inventoryitem.atlas", "imagedirty")
+    inst.canbepickedup = net_bool(inst.GUID, "inventoryitem.canbepickedup")
+
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        -- 客户端：通过 OnEntityReplicated 把自己挂到父实体上
+        inst.OnEntityReplicated = function(inst)
+            inst._parent = inst.entity:GetParent()
+            inst._parent:TryAttachClassifiedToReplicaComponent(inst, "inventoryitem")
+        end
+        return inst
+    end
+
+    -- 服务端：提供设置数据的方法
+    return inst
+end
+```
+
+**为什么不直接在实体上挂 net 变量**？因为：
+1. 一个实体的 net 变量数量有上限
+2. 不同系统的数据（生命值、饥饿值、物品栏）可以分到不同的 classified 实体上，模块化管理
+3. Classified 可以只发给相关玩家，减少不必要的网络流量
+
+### 2.6.6 Replica 组件——统一的访问接口
+
+客户端上没有 `inst.components.health`，但有 `inst.replica.health`。Replica 组件是一层**适配器**，提供统一的 API，内部根据运行环境自动选择数据来源：
+
+```lua
+-- scripts/components/health_replica.lua
+function Health:GetPercent()
+    if self.inst.components.health ~= nil then
+        -- 服务端：直接读组件的真实值
+        return self.inst.components.health:GetPercent()
+    elseif self.classified ~= nil then
+        -- 客户端：从 classified 的 net 变量读
+        return self.classified.currenthealth:value()
+             / self.classified.maxhealth:value()
+    else
+        -- 兜底：返回默认值
+        return 1
+    end
+end
+```
+
+**同一个方法，两套实现路径**——在服务端走组件，在客户端走 classified。调用者不需要关心自己在哪端：
+
+```lua
+-- 这段代码在客户端和服务端都能正确工作
+local health_percent = inst.replica.health:GetPercent()
+```
+
+#### Replica 的注册机制
+
+哪些组件有 Replica？由 `entityreplica.lua` 中的白名单控制：
+
+```lua
+-- scripts/entityreplica.lua
+local REPLICATABLE_COMPONENTS = {
+    builder = true,
+    combat = true,
+    container = true,
+    equippable = true,
+    health = true,
+    hunger = true,
+    inventory = true,
+    inventoryitem = true,
+    sanity = true,
+    stackable = true,
+    -- ... 等等
+}
+```
+
+当 `AddComponent("health")` 被调用时，框架自动检查白名单，如果命中就加载对应的 `health_replica.lua`：
+
+```lua
+-- scripts/entityreplica.lua
+function EntityScript:ReplicateComponent(name)
+    if not REPLICATABLE_COMPONENTS[name] then
+        return  -- 不在白名单中，跳过
+    end
+
+    if TheWorld.ismastersim then
+        self:AddTag("_" .. name)  -- 服务端加 tag，同步给客户端
+    end
+
+    -- 加载并实例化 replica
+    local cmp = require("components/" .. name .. "_replica")
+    rawset(self.replica._, name, cmp(self))
+end
+```
+
+**Tag 的巧妙用法**：服务端给实体加 `"_health"` tag，这个 tag 同步到客户端后，客户端的 `ReplicateEntity()` 看到 tag 就知道要创建对应的 replica 组件。
+
+**Mod 开发者**可以注册自己的 replica：
+
+```lua
+-- 在 modmain.lua 中
+AddReplicableComponent("mymod_component")
+```
+
+### 2.6.7 完整的数据同步链路
+
+把前面的概念串起来，一个完整的数据同步链路是这样的（以生命值为例）：
+
+```
+服务端 Health 组件                          客户端
+  │                                         │
+  │  health.currenthealth = 80              │
+  │       │                                 │
+  │       ▼                                 │
+  │  player_classified                      │
+  │  .currenthealth:set(80)                 │
+  │       │                                 │
+  │       │  ~~~~ 网络传输 ~~~~              │
+  │       │                                 │
+  │       ▼                                 │
+  │  player_classified                      │
+  │  .currenthealth:value() → 80            │
+  │       │                                 │
+  │       ▼                                 │
+  │  health_replica                         │
+  │  :GetPercent() → 从 classified 读取     │
+  │       │                                 │
+  │       ▼                                 │
+  │  UI 血条更新                            │
+```
+
+### 2.6.8 AddNetwork 与 SetPristine——Prefab 的"网络化仪式"
+
+在 Prefab 构造函数中，有两个关键调用：
+
+**`inst.entity:AddNetwork()`**——把实体标记为"需要网络同步"。调用后：
+- 引擎会把这个实体复制到所有客户端
+- 可以在这个实体上使用 `net_xxx` 变量
+- 会自动创建 `actionreplica`（用于同步动作组件信息）
+
+**`inst.entity:SetPristine()`**——标记"公共初始化完成"。这个调用：
+- 告诉引擎"到此为止的所有设置是两端共享的初始状态"
+- 引擎用它来做初始化优化和预测
+
+这两个调用的顺序是固定的，构成了 Prefab 的"网络化仪式"：
+
+```lua
+local inst = CreateEntity()
+inst.entity:AddTransform()
+inst.entity:AddAnimState()
+inst.entity:AddNetwork()        -- 第一步：注册网络
+
+-- ... 公共设置（动画、tag、物理等）
+
+inst.entity:SetPristine()       -- 第二步：标记完成
+
+if not TheWorld.ismastersim then
+    return inst                 -- 客户端离场
+end
+
+-- ... 服务端专属逻辑
+```
+
+### 2.6.9 Mod 开发中的 C/S 注意事项
+
+#### 最常见的错误：在客户端访问组件
+
+```lua
+-- 错误！在客户端上 inst.components.health 是 nil
+AddPrefabPostInit("wilson", function(inst)
+    print(inst.components.health:GetPercent())  -- 客户端崩溃！
+end)
+
+-- 正确做法
+AddPrefabPostInit("wilson", function(inst)
+    if not TheWorld.ismastersim then return end  -- 客户端跳过
+    print(inst.components.health:GetPercent())
+end)
+
+-- 如果两端都需要获取血量
+AddPrefabPostInit("wilson", function(inst)
+    if TheWorld.ismastersim then
+        -- 服务端：通过组件
+        print(inst.components.health:GetPercent())
+    else
+        -- 客户端：通过 replica
+        print(inst.replica.health:GetPercent())
+    end
+end)
+```
+
+#### Tag 是两端共享的
+
+```lua
+-- Tag 在客户端和服务端都可以查询
+if inst:HasTag("weapon") then
+    -- 两端都能执行到这里
+end
+
+-- 但 Tag 只应该在服务端修改
+if TheWorld.ismastersim then
+    inst:AddTag("mymod_tag")
+end
+```
+
+#### 事件也分客户端和服务端
+
+```lua
+-- 服务端事件：由组件推送
+inst:ListenForEvent("death", fn)         -- 只在服务端收到
+
+-- 客户端事件：由 net variable dirty 触发
+inst:ListenForEvent("healthdirty", fn)   -- 在客户端收到
+
+-- 两端都有的事件（比如 "onremove"）
+inst:ListenForEvent("onremove", fn)      -- 两端都会收到
+```
+
+#### 何时需要自己做网络同步
+
+如果你的 Mod 需要从服务端向客户端传递自定义数据，需要：
+
+```lua
+-- 方法一：用 Tag（简单的开关状态）
+if TheWorld.ismastersim then
+    inst:AddTag("mymod_active")    -- 自动同步到客户端
+end
+
+-- 方法二：用 net variable（数值/字符串数据）
+-- 在公共部分（SetPristine 之前）创建
+inst.mymod_level = net_byte(inst.GUID, "mymod.level", "mymod_leveldirty")
+
+-- 服务端写入
+if TheWorld.ismastersim then
+    inst.mymod_level:set(5)
+end
+
+-- 客户端读取/监听
+if not TheWorld.ismastersim then
+    inst:ListenForEvent("mymod_leveldirty", function(inst)
+        local level = inst.mymod_level:value()
+        -- 更新显示
+    end)
+end
+```
+
+#### 快速判断一个 API 在哪端可用
+
+| 可用性 | API |
+|---|---|
+| **两端** | `inst:HasTag()`, `inst.Transform`, `inst.AnimState`, `inst.replica.xxx`, `inst:GetPosition()`, `inst:IsValid()` |
+| **仅服务端** | `inst.components.xxx`, `inst:AddComponent()`, `inst:PushEvent("xxx")` (组件事件), `inst.sg` (状态图) |
+| **仅客户端** | UI 操作 (`TheFrontEnd`, Widgets), 输入处理, `net_xxx:value()` dirty 事件 |
+
+---
+
+> **本节小结**
+> - 饥荒联机版采用严格的 C/S 架构：服务端是"唯一真相"，客户端只负责展示
+> - `TheWorld.ismastersim` 区分当前代码运行在服务端还是客户端
+> - Prefab 使用"三段式"构造：公共部分 → `SetPristine` → 服务端专属
+> - **net_xxx 变量**是服务端和客户端之间的数据通道，服务端 `set()`，客户端 `value()`
+> - **Classified 实体**是隐藏的子实体，集中存放 net 变量，作为数据中转站
+> - **Replica 组件**提供统一接口，自动根据运行环境选择组件或 classified 作为数据来源
+> - Tag 两端共享、组件仅服务端、net dirty 事件主要在客户端监听
+> - Mod 开发中最常见的错误是在客户端访问 `inst.components.xxx`——这在客户端是 `nil`
 
 ## 2.7 游戏循环：帧更新、定时任务与事件驱动
 
