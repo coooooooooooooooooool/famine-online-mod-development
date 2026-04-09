@@ -2424,7 +2424,457 @@ end
 
 ## 2.7 游戏循环：帧更新、定时任务与事件驱动
 
-（待编写）
+游戏本质上是一个永不停歇的**循环**——每秒执行固定次数，每次检查输入、更新逻辑、渲染画面。理解游戏循环，就理解了饥荒中"什么时候执行什么代码"的根本规律。
+
+### 2.7.1 游戏循环是什么
+
+> **给新手的类比**：想象一个钟表匠制作的机械时钟。
+> - 发条每秒转动 30 下（**Tick**），每转一下，所有齿轮都跟着动一格
+> - 时针齿轮（**组件更新**）每秒动 30 次，检查时间该不该变
+> - 报时齿轮（**定时任务**）平时不动，到了整点才响
+> - 闹钟齿轮（**事件**）被设定了特定条件，满足了就触发
+
+在饥荒中：
+- **帧（Frame）**：游戏以 **30 帧/秒** 运行，每帧间隔约 0.033 秒
+- **Tick**：引擎维护的帧计数器，每帧 +1
+- **帧更新（Update）**：每帧执行一次的代码
+- **定时任务（Task）**：到指定时间后执行的代码
+- **事件（Event）**：条件满足时立即触发的代码
+
+```lua
+-- constants.lua
+FRAMES = 1/30   -- 一帧的时间，约 0.0333 秒
+```
+
+### 2.7.2 三种驱动模式的对比
+
+饥荒中的代码有三种运行方式：
+
+| 驱动模式 | 触发条件 | 典型场景 | API |
+|---|---|---|---|
+| **帧更新** | 每帧自动执行 | 位移插值、动画同步、持续检测 | `OnUpdate(dt)` |
+| **定时任务** | 到达指定时间 | 延迟执行、周期检查 | `DoTaskInTime`, `DoPeriodicTask` |
+| **事件驱动** | 特定条件触发 | 受伤响应、死亡处理、拾取 | `ListenForEvent`, `PushEvent` |
+
+它们各有优缺点：
+
+```lua
+-- 帧更新：每帧都跑，适合平滑的持续行为
+-- 缺点：性能开销大，能不用就不用
+function Locomotor:OnUpdate(dt)
+    -- 每帧更新角色位置
+    self:RunForward(dt)
+end
+
+-- 定时任务：到时间才跑，适合间隔性行为
+-- 缺点：时间精度受帧率限制
+inst:DoPeriodicTask(5, function(inst)
+    -- 每 5 秒检查一次周围
+    local nearby = TheSim:FindEntities(...)
+end)
+
+-- 事件驱动：条件满足才跑，完全不浪费性能
+-- 缺点：依赖事件被正确推送
+inst:ListenForEvent("attacked", function(inst, data)
+    -- 被攻击时才执行
+    inst.components.combat:SetTarget(data.attacker)
+end)
+```
+
+**性能优先级**：事件驱动 > 定时任务 > 帧更新。能用事件就用事件，能用定时任务就不用帧更新。
+
+### 2.7.3 Update 函数——游戏主循环的心脏
+
+饥荒的主循环定义在 `scripts/update.lua` 中。C++ 引擎每帧调用 `Update(dt)`，它是整个 Lua 层面的驱动核心：
+
+```lua
+-- scripts/update.lua（简化注释版）
+function Update(dt)
+    HandleClassInstanceTracking()    -- 类实例跟踪（调试用）
+
+    local tick = TheSim:GetTick()
+
+    -- 第 1 步：运行调度器（执行到期的定时任务和协程）
+    for i = last_tick_seen + 1, tick do
+        RunScheduler(i)
+    end
+
+    -- 第 2 步：更新全局静态组件
+    for k, v in pairs(StaticComponentUpdates) do
+        v(dt)
+    end
+
+    -- 第 3 步：更新所有注册了 OnUpdate 的组件
+    for k, v in pairs(UpdatingEnts) do
+        if v.updatecomponents then
+            for cmp in pairs(v.updatecomponents) do
+                if cmp.OnUpdate and not StopUpdatingComponents[cmp] then
+                    cmp:OnUpdate(dt)
+                end
+            end
+        end
+    end
+
+    -- 处理新注册和取消注册的组件
+    -- （本帧新注册的下帧才开始更新，防止迭代异常）
+
+    -- 第 4 步：更新状态图
+    for i = last_tick_seen + 1, tick do
+        SGManager:Update(i)      -- 状态图更新
+        BrainManager:Update(i)   -- AI 脑更新
+    end
+
+    last_tick_seen = tick
+end
+```
+
+执行顺序非常重要：
+
+```
+每帧执行顺序：
+┌──────────────────────────────────────┐
+│ 1. RunScheduler                       │  ← 定时任务、协程
+│ 2. StaticComponentUpdates             │  ← 全局静态更新
+│ 3. UpdatingEnts → cmp:OnUpdate(dt)    │  ← 组件帧更新
+│ 4. SGManager:Update                   │  ← 状态图
+│ 5. BrainManager:Update                │  ← AI 脑
+└──────────────────────────────────────┘
+```
+
+这意味着：**定时任务先于组件更新，组件更新先于状态图，状态图先于 AI**。
+
+### 2.7.4 WallUpdate——不受暂停影响的更新
+
+除了 `Update`，还有 `WallUpdate`——它使用**墙钟时间**（真实时间），即使游戏暂停也会运行：
+
+```lua
+-- scripts/update.lua
+function WallUpdate(dt)
+    -- 即使游戏暂停也执行的内容：
+    HandleRPCQueue()           -- RPC 消息队列
+    HandleUserCmdQueue()       -- 用户命令
+
+    -- WallUpdate 组件
+    for k, v in pairs(WallUpdatingEnts) do
+        for cmp in pairs(v.wallupdatecomponents) do
+            if cmp.OnWallUpdate then
+                cmp:OnWallUpdate(dt)
+            end
+        end
+    end
+
+    TheMixer:Update(dt)        -- 音频混合
+    TheCamera:Update(dt)       -- 相机
+    TheInput:OnUpdate()        -- 输入
+    TheFrontEnd:Update(dt)     -- UI 前端
+end
+```
+
+**WallUpdate 的典型用户**：UI 动画、输入处理、音频系统——这些即使游戏暂停也需要响应。
+
+### 2.7.5 StaticUpdate——不受时间缩放影响的更新
+
+还有一个 `StaticUpdate`，它不受游戏时间缩放影响（比如游戏加速），也会在暂停时处理特定逻辑：
+
+```lua
+-- scripts/update.lua
+function StaticUpdate(dt)
+    -- 运行 static 调度器
+    for i = last_static_tick_seen + 1, static_tick do
+        RunStaticScheduler(i)
+    end
+
+    -- 暂停时仍更新 static 组件
+    if TheNet:IsServerPaused() then
+        for k, v in pairs(StaticUpdatingEnts) do
+            for cmp in pairs(v.updatecomponents) do
+                if cmp.OnStaticUpdate then
+                    cmp:OnStaticUpdate(0)
+                end
+            end
+        end
+        -- 暂停时仍处理状态图事件
+        SGManager:UpdateEvents()
+    end
+end
+```
+
+### 2.7.6 帧更新的详细机制
+
+#### 组件如何注册帧更新
+
+不是所有组件都有帧更新——只有主动注册了的才会每帧执行：
+
+```lua
+-- 在组件内部
+function MyComponent:StartUpdating()
+    self.inst:StartUpdatingComponent(self)
+end
+
+function MyComponent:StopUpdating()
+    self.inst:StopUpdatingComponent(self)
+end
+
+function MyComponent:OnUpdate(dt)
+    -- 这个方法在 StartUpdatingComponent 之后，每帧调用
+    -- dt 是帧间隔（约 0.033 秒）
+end
+```
+
+底层实现是把实体和组件注册到全局的 `UpdatingEnts` 表中。`Update` 函数每帧遍历这个表。
+
+#### NewUpdatingEnts——延迟注册
+
+注意源码中有一个细节：
+
+```lua
+-- 本帧新注册的组件不会立即被遍历
+NewUpdatingEnts[self.GUID] = self     -- 暂存
+
+-- 遍历完毕后才合并
+if next(NewUpdatingEnts) ~= nil then
+    for k, v in pairs(NewUpdatingEnts) do
+        UpdatingEnts[k] = v           -- 下帧才生效
+    end
+    NewUpdatingEnts = {}
+end
+```
+
+这是为了**安全**——如果在遍历 `UpdatingEnts` 的过程中直接添加新元素，会导致不可预测的迭代行为。
+
+#### StopUpdatingComponents——延迟注销
+
+同样，停止更新也不是立即生效的：
+
+```lua
+function EntityScript:StopUpdatingComponent(cmp)
+    if self.updatecomponents or self.updatestaticcomponents then
+        StopUpdatingComponents[cmp] = self   -- 标记，稍后处理
+    end
+end
+```
+
+在 `Update` 的遍历中，被标记的组件会被跳过（`not StopUpdatingComponents[cmp]`），遍历结束后才真正移除。
+
+### 2.7.7 定时任务的执行时机
+
+`DoTaskInTime` 和 `DoPeriodicTask` 本质上是向 Scheduler 注册一个协程，在指定的 tick 唤醒：
+
+```lua
+-- 当你写
+inst:DoTaskInTime(1, my_function)
+
+-- 等价于：
+-- "在第 current_tick + 30 个 tick 时（1 秒后），唤醒一个协程来执行 my_function"
+```
+
+这些任务在 `Update` 的第一步 `RunScheduler(i)` 中被处理——**先于组件更新**。
+
+```lua
+function RunScheduler(tick)
+    scheduler:OnTick(tick)   -- 唤醒到期的协程
+    scheduler:Run()          -- 执行唤醒的协程
+end
+```
+
+这意味着如果你在一个 `DoTaskInTime` 回调中修改了某个组件的数据，同一帧内该组件的 `OnUpdate` 会看到修改后的值。
+
+### 2.7.8 事件的执行时机
+
+事件（`PushEvent`）是**同步**执行的——调用 `PushEvent` 时，所有监听者的回调**立即**被调用，然后代码才继续往下走：
+
+```lua
+-- PushEvent 是同步的
+print("before")
+inst:PushEvent("myevent", {value = 42})
+print("after")  -- 所有 myevent 的监听器都执行完了才到这里
+```
+
+但有一个特殊情况：状态图对事件的响应是**延迟**的。`PushEvent_Internal` 中状态图不是直接处理事件，而是放入事件队列，等 `SGManager:Update` 时才处理：
+
+```lua
+function EntityScript:PushEvent_Internal(event, data, immediate)
+    -- Lua 监听器：立即执行
+    if self.event_listeners then
+        for entity, fns in pairs(listeners) do
+            for i, fn in ipairs(fns) do fn(self, data) end
+        end
+    end
+
+    -- 状态图：放入队列（除非 immediate = true）
+    if self.sg then
+        if immediate then
+            self.sg:HandleEvent(event, data)        -- 立即
+        elseif self.sg:IsListeningForEvent(event) then
+            self.sg:PushEvent(event, data)          -- 排队
+        end
+    end
+end
+```
+
+### 2.7.9 LongUpdate——追赶错过的时间
+
+当发生时间跳跃时（跳过夜晚、从洞穴返回、服务器长时间暂停后恢复），游戏调用 `LongUpdate(dt)` 让所有实体"补课"：
+
+```lua
+-- scripts/update.lua
+function LongUpdate(dt, ignore_player)
+    -- 全局静态组件的 LongUpdate
+    for k, v in pairs(StaticComponentLongUpdates) do
+        v(dt)
+    end
+
+    -- 所有实体的 LongUpdate
+    for k, v in pairs(Ents) do
+        v:LongUpdate(dt)
+    end
+end
+```
+
+`ignore_player` 为 `true` 时，会跳过玩家及其物品，只让世界"老化"（典型场景：进洞穴后地上世界的植物需要继续生长，但玩家的物品不应该变化）。
+
+在组件中实现 `LongUpdate`：
+
+```lua
+function Growable:LongUpdate(dt)
+    -- 在 dt 秒内，跳过的时间里应该生长了多少
+    if self.stage and self.growtime then
+        local stages_to_advance = math.floor(dt / self.growtime)
+        for i = 1, stages_to_advance do
+            self:DoGrowth()
+        end
+    end
+end
+```
+
+### 2.7.10 PostUpdate——帧末尾的清理
+
+在 `Update` 之后，引擎还会调用 `PostUpdate`：
+
+```lua
+function PostUpdate(dt)
+    EmitterManager:PostUpdate()    -- 粒子发射器
+    UpdateLooper_PostUpdate()      -- PostUpdate 回调
+end
+```
+
+`UpdateLooper` 组件提供了一种比 `DoPeriodicTask(0)` 更精确的每帧回调机制（因为 `DoPeriodicTask(0)` 不保证严格每帧触发一次）。
+
+### 2.7.11 用一张图理清完整的帧执行顺序
+
+```
+C++ 引擎每帧调用：
+
+┌─── WallUpdate(dt) ─────────────────────────┐
+│  RPC 队列处理                               │
+│  WallUpdate 组件（不受暂停影响）             │
+│  音频、相机、输入、UI 更新                   │
+└─────────────────────────────────────────────┘
+           ↓
+┌─── StaticUpdate(dt) ───────────────────────┐
+│  RunStaticScheduler（Static 定时任务）       │
+│  暂停时的 Static 组件更新                    │
+│  暂停时的状态图事件                          │
+└─────────────────────────────────────────────┘
+           ↓ （仅在未暂停时）
+┌─── Update(dt) ─────────────────────────────┐
+│  ① RunScheduler → 定时任务 / 协程           │
+│  ② StaticComponentUpdates                   │
+│  ③ UpdatingEnts → cmp:OnUpdate(dt)          │
+│  ④ SGManager:Update → 状态图               │
+│  ⑤ BrainManager:Update → AI 脑            │
+└─────────────────────────────────────────────┘
+           ↓
+┌─── PostUpdate(dt) ─────────────────────────┐
+│  粒子系统                                   │
+│  PostUpdate 回调                            │
+└─────────────────────────────────────────────┘
+           ↓
+┌─── C++ 引擎 ───────────────────────────────┐
+│  物理模拟                                   │
+│  渲染                                       │
+│  网络同步                                   │
+└─────────────────────────────────────────────┘
+```
+
+### 2.7.12 Mod 开发的实践指导
+
+#### 选择合适的驱动模式
+
+```lua
+-- 场景 1：角色被攻击时反击 → 事件驱动（最高效）
+inst:ListenForEvent("attacked", function(inst, data)
+    inst.components.combat:SetTarget(data.attacker)
+end)
+
+-- 场景 2：每 10 秒恢复 1 点生命 → 定时任务
+inst:DoPeriodicTask(10, function(inst)
+    if inst.components.health then
+        inst.components.health:DoDelta(1)
+    end
+end)
+
+-- 场景 3：角色头上的光环需要平滑移动 → 帧更新
+function AuraComponent:OnUpdate(dt)
+    local x, y, z = self.inst.Transform:GetWorldPosition()
+    self.aura_fx.Transform:SetPosition(x, y + 2, z)
+end
+
+-- 场景 4：需要在暂停时也能操作的 UI → WallUpdate
+function UIWidget:OnWallUpdate(dt)
+    self:UpdateAnimation(dt)
+end
+```
+
+#### 注意帧更新的性能开销
+
+```lua
+-- 不要这样做——大量实体每帧更新会严重拖慢性能
+-- 100 个实体各有 3 个帧更新组件 = 每帧 300 次 OnUpdate 调用
+
+-- 更好的做法：用定时任务替代不需要精确帧同步的逻辑
+inst:DoPeriodicTask(0.5, CheckNearby)    -- 每 0.5 秒检查一次就够了
+
+-- 或者：只在需要时开启帧更新
+function MyComponent:Activate()
+    self.active = true
+    self.inst:StartUpdatingComponent(self)
+end
+
+function MyComponent:Deactivate()
+    self.active = false
+    self.inst:StopUpdatingComponent(self)   -- 不需要时关掉
+end
+```
+
+#### dt 参数的含义
+
+```lua
+function MyComponent:OnUpdate(dt)
+    -- dt 是自上一帧以来的时间（秒），通常约 0.033
+    -- 使用 dt 而不是硬编码值，让逻辑在任何帧率下都正确
+
+    -- 正确：
+    self.timer = self.timer - dt
+    self.position = self.position + self.speed * dt
+
+    -- 错误：
+    self.timer = self.timer - 0.033    -- 假设帧率固定是危险的
+end
+```
+
+---
+
+> **本节小结**
+> - 饥荒以 30 帧/秒运行，每帧依次执行：WallUpdate → StaticUpdate → Update → PostUpdate
+> - **三种驱动模式**：帧更新（每帧）、定时任务（到时间）、事件驱动（条件触发），性能优先级依次升高
+> - `Update` 内部顺序：调度器 → 静态组件 → 组件 OnUpdate → 状态图 → AI 脑
+> - `WallUpdate` 不受暂停影响，主要服务 UI、输入、音频
+> - `StaticUpdate` 不受时间缩放影响，处理 static 调度器和暂停时的状态图事件
+> - `LongUpdate` 用于时间跳跃后"补课"（跳夜、进出洞穴）
+> - 组件帧更新需要主动注册（`StartUpdatingComponent`），注册和注销都是延迟生效
+> - 事件是同步执行的（除了状态图的事件响应是延迟到 SGManager:Update）
+> - Mod 中应优先使用事件驱动，其次定时任务，最后帧更新
 
 ## 2.8 scheduler.lua——任务调度器与协程管理的核心
 
