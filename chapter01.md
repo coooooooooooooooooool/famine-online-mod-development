@@ -1910,7 +1910,511 @@ Profile = PlayerProfile()
 
 ## 1.6 协程基础与 StartThread——饥荒中的"线程"
 
-（待编写）
+饥荒是一个单线程游戏，但它经常需要做"跨越多帧"的事情——比如读一本书，触手一个接一个从地里冒出来（每个间隔 0.33 秒）；角色说一句台词，等几秒，再说下一句。如果用传统的函数调用，一个函数在一帧内就执行完了，怎么做到"暂停几秒后继续"？答案就是 Lua 的**协程（coroutine）**。
+
+### 1.6.1 协程是什么——可以暂停的函数
+
+普通函数一旦开始执行就会一口气跑完。协程和普通函数的唯一区别是：**它可以在执行过程中主动暂停（yield），然后在之后的某个时刻被恢复（resume）继续执行**。
+
+先看一个纯 Lua 的例子感受一下：
+
+```lua
+-- 创建一个协程
+local co = coroutine.create(function()
+    print("第一步")
+    coroutine.yield()      -- 暂停！控制权交还给调用者
+    print("第二步")
+    coroutine.yield()      -- 再次暂停
+    print("第三步")
+end)
+
+print(coroutine.status(co))   -- "suspended"（挂起状态）
+
+coroutine.resume(co)          -- 输出 "第一步"，然后暂停
+print(coroutine.status(co))   -- "suspended"
+
+coroutine.resume(co)          -- 输出 "第二步"，然后暂停
+
+coroutine.resume(co)          -- 输出 "第三步"，函数执行完毕
+print(coroutine.status(co))   -- "dead"（已结束）
+```
+
+每次 `coroutine.resume` 让协程从上次暂停的地方继续；`coroutine.yield` 让协程把控制权交回去。就像在看书时合上书签记住页码，下次打开从书签处继续读。
+
+协程的四种状态：
+
+| 状态 | 含义 | 转换 |
+|------|------|------|
+| `suspended` | 挂起（刚创建或 yield 后）| `resume` → `running` |
+| `running` | 正在执行 | `yield` → `suspended`，函数结束 → `dead` |
+| `dead` | 已结束（函数执行完毕或出错）| 不可恢复 |
+| `normal` | 当前协程恢复了另一个协程 | 被恢复的协程 yield 时恢复 |
+
+### 1.6.2 协程可以传递数据
+
+`yield` 和 `resume` 之间可以互相传数据：
+
+```lua
+local co = coroutine.create(function(a)
+    print("收到:", a)                          -- 收到: 10
+    local b = coroutine.yield(a * 2)           -- 向外传 20，暂停
+    print("收到:", b)                          -- 收到: 30
+    return a + b                               -- 协程结束，返回 40
+end)
+
+local ok, val = coroutine.resume(co, 10)       -- 传入 10
+print("产出:", val)                            -- 产出: 20
+
+local ok, val = coroutine.resume(co, 30)       -- 传入 30
+print("返回:", val)                            -- 返回: 40
+```
+
+饥荒的调度器正是利用这个特性——协程通过 `yield` 告诉调度器"我想睡多久"，调度器在时间到了之后 `resume` 恢复它。
+
+### 1.6.3 饥荒的调度器——让协程按时运行
+
+饥荒的游戏循环每秒执行 30 帧（30 tick），每一帧都会调用 `RunScheduler(tick)`。调度器（`Scheduler`）负责管理所有活跃的协程，决定哪些该执行、哪些还在等待。
+
+调度器在 `scripts/scheduler.lua` 中定义，核心结构如下：
+
+```lua
+-- 来自 scripts/scheduler.lua（简化版）
+local Scheduler = Class(function(self)
+    self.tasks = {}           -- 所有活跃的协程任务
+    self.running = {}         -- 本帧需要执行的任务
+    self.waitingfortick = {}  -- 按 tick 等待的任务（Sleep 后放这里）
+    self.hibernating = {}     -- 冬眠的任务（Hibernate 后放这里）
+    self.waking = {}          -- 即将唤醒的任务
+    self.attime = {}          -- 定时回调（DoTaskInTime 等用这个）
+end)
+```
+
+每一帧，调度器做以下事情：
+
+```
+1. OnTick(tick):
+   - 检查 waitingfortick[tick]，把到时间的任务放入 waking
+   - 执行 attime[tick] 中的定时回调（DoTaskInTime / DoPeriodicTask）
+
+2. Run():
+   - 把 waking 中的任务移到 running
+   - 遍历 running 中的所有协程，逐个 resume
+   - 根据 yield 的返回值决定任务去向：
+     - yield("sleep", tick) → 放入 waitingfortick[tick]
+     - yield("hibernate")  → 放入 hibernating
+     - yield()            → 留在 running（下一帧继续）
+     - 函数结束（dead）   → 清理移除
+```
+
+来看关键的 `Run` 方法：
+
+```lua
+-- 来自 scripts/scheduler.lua
+function Scheduler:Run()
+    -- 把即将唤醒的任务移到运行队列
+    for k, v in pairs(self.waking) do
+        v:SetList(self.running)
+    end
+    self.waking = {}
+
+    -- 遍历所有运行中的任务
+    for k, v in pairs(self.running) do
+        if coroutine.status(v.co) == "dead" then
+            -- 协程已结束，清理
+            self.tasks[v.co] = nil
+        else
+            -- 恢复协程执行
+            local success, yieldtype, yieldparam = coroutine.resume(v.co, v.param)
+
+            if success and coroutine.status(v.co) ~= "dead" then
+                if yieldtype == HIBERNATE then
+                    v:SetList(self.hibernating)      -- 冬眠
+                elseif yieldtype == SLEEP then
+                    v:SetList(self.waitingfortick[yieldparam])  -- 按 tick 等待
+                end
+                -- 如果什么都没 yield（yieldtype == nil），留在 running，下帧继续
+            end
+        end
+    end
+end
+```
+
+### 1.6.4 Sleep、Yield、Hibernate——三种暂停方式
+
+饥荒提供了三个全局函数供协程内部使用：
+
+**`Sleep(time)`——暂停指定秒数**
+
+```lua
+-- 来自 scripts/scheduler.lua
+function Sleep(time)
+    local schedule = GetCurrentScheduler()
+    local desttick = math.ceil((GetSchedulerTime(schedule.isstatic) + time) / GetTickTime())
+    if GetSchedulerTick(schedule.isstatic) < desttick then
+        coroutine.yield(SLEEP, desttick)    -- 告诉调度器：在 desttick 时唤醒我
+    else
+        coroutine.yield()                   -- 时间已到，只让出本帧
+    end
+end
+```
+
+`Sleep(0.33)` 意思是"暂停 0.33 秒后继续"。调度器会计算出对应的目标 tick，把任务放进等待队列，到了那个 tick 再唤醒它。
+
+**`Yield()`——只暂停一帧**
+
+```lua
+function Yield()
+    coroutine.yield()
+end
+```
+
+不传参数的 `yield` 让任务留在 `running` 列表中，下一帧立即继续执行。适合"每帧做一点工作"的场景。
+
+**`Hibernate()`——进入冬眠**
+
+```lua
+function Hibernate()
+    coroutine.yield(HIBERNATE)
+end
+```
+
+冬眠的任务不会被自动唤醒，需要外部显式调用 `WakeTask(task)` 才能恢复。适合"等待某个事件发生"的场景。
+
+### 1.6.5 StartThread——启动协程的标准方式
+
+`StartThread` 是饥荒中启动协程的入口函数：
+
+```lua
+-- 来自 scripts/scheduler.lua
+function StartThread(fn, id, param)
+    if id == nil then
+        local task = scheduler:GetCurrentTask()
+        if task ~= nil then
+            id = task.id
+        end
+    end
+    return scheduler:AddTask(fn, id, param)
+end
+```
+
+它的内部调用 `AddTask`，而 `AddTask` 用 `coroutine.create` 把你传入的函数包装成协程：
+
+```lua
+function Scheduler:AddTask(fn, id, param)
+    local task = Task(fn, id, param)  -- Task 的构造函数里会 coroutine.create(fn)
+    self.tasks[task.co] = task
+    task:SetList(self.running)         -- 放入运行队列，下一帧开始执行
+    return task
+end
+```
+
+实体上有一个便捷的封装 `inst:StartThread`，它会自动把实体的 GUID 作为线程 ID：
+
+```lua
+-- 来自 scripts/entityscript.lua
+function EntityScript:StartThread(fn)
+    return StartThread(fn, self.GUID)
+end
+```
+
+为什么要绑定 GUID？因为当实体被销毁时，引擎会调用 `KillThreadsWithID(self.GUID)` 一次性杀掉该实体的所有线程，避免实体已销毁但线程还在跑的"孤儿线程"问题。
+
+### 1.6.6 实战：触手书——一个经典的 StartThread 用例
+
+现在来看饥荒中最经典的协程使用场景——韦伯利的触手书。读书后，触手一个接一个从地里冒出来，每个间隔 0.33 秒：
+
+```lua
+-- 来自 scripts/prefabs/books.lua
+reader:StartThread(function()
+    for i, pos in ipairs(positions) do
+        -- 生成触手
+        local tentacle = SpawnPrefab("tentacle")
+        tentacle.Transform:SetPosition(pos.x, 0, pos.z)
+        tentacle.sg:GoToState("attack_pre")
+
+        -- 视觉效果
+        SpawnPrefab("splash_ocean").Transform:SetPosition(pos.x, 0, pos.z)
+        ShakeAllCameras(CAMERASHAKE.FULL, .2, .02, .25, reader, 40)
+
+        Sleep(0.33)  -- 暂停 0.33 秒，等下一帧继续循环
+    end
+end)
+```
+
+如果不用协程，要实现同样的效果你需要：
+1. 维护一个计数器记录当前生成到第几个触手
+2. 用 `DoTaskInTime` 设置定时器
+3. 在回调里检查计数器、生成触手、递增计数器、设置下一个定时器……
+
+对比之下，协程版本简直像写伪代码一样直观——一个循环，中间暂停，继续循环。这就是协程的核心价值：**让"分布在多帧的逻辑"看起来像顺序执行的代码**。
+
+同样的模式在雷电书中也有体现：
+
+```lua
+-- 来自 scripts/prefabs/books.lua —— 硫磺火雨书
+reader:StartThread(function()
+    for k = 0, num_lightnings do
+        local rad = math.random(3, 15)
+        local angle = k * 4 * PI / num_lightnings
+        local pos = pt + Vector3(rad * math.cos(angle), 0, rad * math.sin(angle))
+        TheWorld:PushEvent("ms_sendlightningstrike", pos)
+        Sleep(.3 + math.random() * .2)  -- 0.3~0.5 秒的随机间隔
+    end
+end)
+```
+
+16 道闪电依次劈下，每道之间有随机的短暂间隔——用协程写就像描述故事一样自然。
+
+### 1.6.7 台词系统——协程的另一个经典应用
+
+角色说台词时，需要按顺序显示每句话，每句话之间等待不同的时间。`Talker` 组件用协程完美实现了这个需求：
+
+```lua
+-- 来自 scripts/components/talker.lua
+function Talker:Say(script, time, noanim, force, ...)
+    CancelSay(self)  -- 先取消之前的台词
+    local lines = type(script) == "string" and { Line(script, noanim, time) } or script
+    if lines ~= nil then
+        -- 启动协程来逐句显示台词
+        self.task = self.inst:StartThread(function()
+            sayfn(self, lines, ...)
+        end)
+    end
+end
+
+-- sayfn 在协程中逐句执行
+local function sayfn(self, script, ...)
+    for i, line in ipairs(script) do
+        local duration = line.duration or 2.5
+
+        -- 显示当前台词
+        if self.widget ~= nil then
+            self.widget.text:SetString(line.message)
+        end
+        self.inst:PushEvent("ontalk", { duration = duration })
+
+        Sleep(duration)  -- 等待这句话的显示时间
+
+        -- 检查实体是否还有效
+        if not self.inst:IsValid() then
+            return
+        end
+    end
+
+    -- 所有台词说完
+    self.inst:PushEvent("donetalking")
+    self.task = nil
+end
+```
+
+注意 `Sleep(duration)` 后面的安全检查——因为在等待的这段时间里，角色可能已经被杀死或移除了。在协程中做这种"中途可能发生变化"的处理非常自然。
+
+### 1.6.8 DoTaskInTime 和 DoPeriodicTask——轻量级定时
+
+协程适合"需要跨帧执行的复杂逻辑"。对于简单的"过一段时间执行一个回调"或"每隔一段时间重复执行"，饥荒提供了更轻量的方式：
+
+```lua
+-- 来自 scripts/entityscript.lua
+function EntityScript:DoTaskInTime(time, fn, ...)
+    local periodic = scheduler:ExecuteInTime(time, fn, self.GUID, self, ...)
+    self.pendingtasks = self.pendingtasks or {}
+    self.pendingtasks[periodic] = true
+    periodic.onfinish = task_finish
+    return periodic
+end
+
+function EntityScript:DoPeriodicTask(time, fn, initialdelay, ...)
+    local periodic = scheduler:ExecutePeriodic(time, fn, nil, initialdelay, self.GUID, self, ...)
+    self.pendingtasks = self.pendingtasks or {}
+    self.pendingtasks[periodic] = true
+    periodic.onfinish = task_finish
+    return periodic
+end
+```
+
+这两个函数不创建协程，而是用调度器的 `attime` 队列——在指定的 tick 直接调用函数。它们的区别：
+
+| 特性 | `DoTaskInTime` | `DoPeriodicTask` | `StartThread` |
+|------|---------------|-----------------|---------------|
+| 执行次数 | 一次 | 重复（直到取消）| 一次（但内部可循环）|
+| 实现方式 | 定时回调 | 周期回调 | 协程 |
+| 适用场景 | 延迟执行 | 定期检查/更新 | 复杂的跨帧逻辑 |
+| 取消方式 | `task:Cancel()` | `task:Cancel()` | `KillThread(task)` |
+| 开销 | 极低 | 极低 | 较低（协程有少量开销）|
+
+使用示例：
+
+```lua
+-- 3 秒后执行一次
+inst:DoTaskInTime(3, function(inst)
+    print(inst.prefab .. " 的定时任务触发了")
+end)
+
+-- 每 5 秒执行一次（立即开始第一次）
+local task = inst:DoPeriodicTask(5, function(inst)
+    print("周期检查：" .. inst.prefab)
+end, 0)  -- 第三个参数 0 表示初始延迟为 0（立即执行第一次）
+
+-- 取消周期任务
+task:Cancel()
+```
+
+**什么时候用协程、什么时候用定时任务？**
+
+- 逻辑是**顺序的、有状态的**（比如"做 A → 等 2 秒 → 做 B → 等 1 秒 → 做 C"）→ 用 `StartThread` + `Sleep`
+- 逻辑是**独立的一次性事件**（比如"3 秒后爆炸"）→ 用 `DoTaskInTime`
+- 逻辑是**重复的无状态检查**（比如"每 5 秒检查血量"）→ 用 `DoPeriodicTask`
+
+### 1.6.9 KillThread——安全地终止协程
+
+当你不再需要一个协程时，应该用 `KillThread` 终止它：
+
+```lua
+-- 来自 scripts/scheduler.lua
+function KillThread(task)
+    if scheduler.tasks[task.co] then
+        scheduler:KillTask(task)
+    elseif staticScheduler.tasks[task.co] then
+        staticScheduler:KillTask(task)
+    end
+end
+```
+
+在实际使用中，通常保存启动线程时返回的 task 引用，需要时取消：
+
+```lua
+-- 来自 scripts/components/talker.lua —— 取消说话
+local function CancelSay(self)
+    if self.task ~= nil then
+        scheduler:KillTask(self.task)
+        self.task = nil
+        self.inst:PushEvent("donetalking")
+    end
+end
+```
+
+还有一种批量清理方式——按 ID 清除：
+
+```lua
+-- 来自 scripts/entityscript.lua —— 清除实体的所有线程
+function EntityScript:KillTasks()
+    KillThreadsWithID(self.GUID)
+end
+```
+
+因为 `inst:StartThread(fn)` 会把 `self.GUID` 作为线程 ID，所以 `KillThreadsWithID(self.GUID)` 能一次性清除该实体的所有线程。这在实体被销毁时自动调用，防止"孤儿线程"继续运行导致报错。
+
+### 1.6.10 Yield 的实际应用——逐帧动画
+
+`Yield()` 只暂停一帧，适合需要"每帧执行"的场景。来看 UI 缩放动画的实现：
+
+```lua
+-- 来自 scripts/simutil.lua
+function AnimateUIScale(item, total_time, start_scale, end_scale)
+    item:StartThread(function()
+        local start_time = GetTime()
+        while true do
+            local percent = (GetTime() - start_time) / total_time
+            if percent > 1 then
+                item.UITransform:SetScale(end_scale, end_scale, end_scale)
+                return  -- 动画结束，协程自然退出
+            end
+            local scale = (1 - percent) * start_scale + percent * end_scale
+            item.UITransform:SetScale(scale, scale, scale)
+            Yield()  -- 等待一帧，下一帧继续
+        end
+    end)
+end
+```
+
+这段代码实现了一个平滑的缩放动画。每一帧计算当前的缩放比例，设置 UI 元素的缩放，然后 `Yield()` 等待下一帧。当动画时间到了（`percent > 1`），函数 `return` 退出，协程自然结束。
+
+### 1.6.11 协程的注意事项
+
+**注意一：Sleep 和 Yield 只能在协程中调用**
+
+如果你在普通函数中调用 `Sleep()` 或 `Yield()`，会报错，因为它们内部依赖 `coroutine.yield`，而普通函数不是协程。
+
+```lua
+-- 错误！这不是在协程中
+inst.components.health:DoDelta(-10)
+Sleep(1)  -- 报错：cannot yield from non-coroutine context
+inst.components.health:DoDelta(-10)
+
+-- 正确：用 StartThread 包装
+inst:StartThread(function()
+    inst.components.health:DoDelta(-10)
+    Sleep(1)
+    inst.components.health:DoDelta(-10)
+end)
+```
+
+**注意二：协程中要检查实体是否还有效**
+
+在 `Sleep` 等待的过程中，世界可能发生很多变化——实体可能被销毁、组件可能被移除。恢复执行后要做检查：
+
+```lua
+inst:StartThread(function()
+    Sleep(5)
+    -- 5 秒后，实体可能已经不存在了
+    if inst:IsValid() and inst.components.health ~= nil then
+        inst.components.health:DoDelta(10)
+    end
+end)
+```
+
+**注意三：保存线程引用以便取消**
+
+如果协程可能需要提前终止，一定要保存 `StartThread` 返回的 task：
+
+```lua
+self.mytask = inst:StartThread(function()
+    while true do
+        -- 某种循环逻辑
+        Sleep(1)
+    end
+end)
+
+-- 需要停止时
+if self.mytask ~= nil then
+    KillThread(self.mytask)
+    self.mytask = nil
+end
+```
+
+**注意四：不要在协程中做长时间的阻塞计算**
+
+协程是协作式的——它依赖你主动 `yield` 让出控制权。如果你在协程中做了很长时间的计算而不 yield，游戏会卡住直到计算完成。
+
+```lua
+-- 不好的做法：一次性处理大量数据
+inst:StartThread(function()
+    for i = 1, 1000000 do
+        heavy_computation(i)  -- 游戏会卡住！
+    end
+end)
+
+-- 好的做法：分批处理，每批让出一帧
+inst:StartThread(function()
+    for i = 1, 1000000 do
+        heavy_computation(i)
+        if i % 100 == 0 then
+            Yield()  -- 每 100 次让出一帧，避免卡顿
+        end
+    end
+end)
+```
+
+---
+
+> **本节小结**
+> - 协程是"可以暂停和恢复的函数"，通过 `yield` 暂停、`resume` 恢复
+> - 饥荒的调度器每帧 `resume` 所有活跃的协程，根据 `yield` 的参数决定任务的去向
+> - `Sleep(time)` 暂停指定秒数，`Yield()` 暂停一帧，`Hibernate()` 进入冬眠等待唤醒
+> - `StartThread` / `inst:StartThread` 是启动协程的标准方式
+> - 协程最适合"顺序逻辑跨帧执行"的场景（触手书、台词、动画）
+> - 简单的定时需求用 `DoTaskInTime`（一次）或 `DoPeriodicTask`（重复）更合适
+> - 协程中要注意：只在协程内调用 Sleep/Yield、检查实体有效性、保存 task 引用、避免阻塞计算
 
 ## 1.7 字符串模式匹配——饥荒代码中的 string.find / string.match
 
