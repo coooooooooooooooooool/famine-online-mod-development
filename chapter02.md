@@ -697,11 +697,690 @@ A：Mod 按照 `modinfo.lua` 中的 `priority` 值排序加载。priority 越高
 
 ## 2.3 class.lua——饥荒的面向对象系统实现
 
-（待编写）
+在 1.4 节中，我们从 Lua 语言的角度学习了元表和 `Class` 函数的基本原理。这一节换个视角——从**游戏架构设计**的角度，深入分析 `class.lua` 为什么这样设计、它在整个游戏系统中扮演什么角色，以及做 Mod 时如何充分利用这个系统。
+
+### 2.3.1 为什么饥荒需要自己的 Class 系统
+
+Lua 本身不提供面向对象语法。饥荒团队（Klei）面临一个选择：要么用纯函数式/过程式编程，要么自己造一套面向对象系统。他们选择了后者，原因很实际：
+
+1. **游戏有大量相似但又有差异的实体**——所有武器都有攻击力和耐久，但具体数值不同。用类继承来共享通用逻辑、在子类中定制差异，比复制粘贴代码高效得多。
+
+2. **组件需要统一的接口**——几百个组件都要有 `OnSave`、`OnLoad`、`GetDebugString` 等方法，需要一个一致的"类"结构来约束。
+
+3. **状态图、行为树等系统有天然的继承层次**——`DecoratorNode` 继承 `BehaviourNode`，`Recipe2` 继承 `Recipe`，这些用 Class 系统实现最自然。
+
+### 2.3.2 class.lua 的完整源码解读
+
+`class.lua` 只有约 260 行代码，但支撑了整个游戏。让我们逐段剖析它的完整实现（1.4 中只看了简化版，这里看完整版）。
+
+**ClassRegistry——热重载的基础设施**
+
+```lua
+-- 来自 scripts/class.lua 第 6 行
+ClassRegistry = {}
+```
+
+每个通过 `Class` 创建的类都会被注册到 `ClassRegistry` 中，记录它从基类继承了哪些方法。这是为**热重载（hot reload）**准备的——开发者在运行时修改代码后，引擎能知道哪些方法是继承来的、哪些是类自己定义的，从而正确地更新。
+
+```lua
+-- 来自 scripts/class.lua 第 205 行
+ClassRegistry[c] = c_inherited
+```
+
+`c_inherited` 记录的是从基类浅拷贝过来的方法。当热重载时，系统对比 `c` 的当前方法和 `c_inherited` 中的版本，就能分辨哪些方法是子类**重写**的（和 inherited 不同）、哪些是直接继承的（和 inherited 相同）。
+
+> **给老鸟的提示**：热重载逻辑在 `reload.lua` 中实现。它利用 `ClassRegistry` 来做"猴子补丁"——重新加载一个模块后，把新版本的方法覆盖到旧的类原型表上。这样运行中的实例不需要重新创建就能获得新的方法实现。这是一个纯开发期的功能，生产环境中不使用。
+
+**props 系统——__index 和 __newindex 的分支**
+
+```lua
+-- 来自 scripts/class.lua 第 102-109 行
+if props ~= nil then
+    c.__index = __index        -- 自定义的 __index，拦截读取
+    c.__newindex = __newindex   -- 自定义的 __newindex，拦截赋值
+else
+    c.__index = c              -- 标准模式：实例找不到方法就去类原型找
+end
+```
+
+这是一个关键的分支：
+
+- **没有 props**（绝大多数情况）：`__index = c`，标准的原型查找，性能最好
+- **有 props**（如 health 组件）：使用自定义的 `__index` 和 `__newindex`，每次读写都经过拦截函数
+
+为什么有 props 时要改变 `__index`？因为 props 系统把被监听的属性存储在一个隐藏的 `_` 表中（而不是直接存在实例上），`__index` 需要先去 `_` 表里找属性值：
+
+```lua
+-- 来自 scripts/class.lua 第 28-34 行
+local function __index(t, k)
+    local p = rawget(t, "_")[k]    -- 先看 _ 表里有没有这个属性
+    if p ~= nil then
+        return p[1]                 -- 有就返回属性值（p[1] 是值，p[2] 是回调）
+    end
+    return getmetatable(t)[k]       -- 没有就走正常的原型链查找
+end
+```
+
+这个设计在性能和功能之间做了取舍：大多数类不需要属性监听，走最快的路径；少数需要网络同步的核心组件才使用 props。
+
+### 2.3.3 is_a、is_class、is_instance——三种类型检查
+
+`class.lua` 为每个类提供了三个类型检查工具：
+
+```lua
+-- 来自 scripts/class.lua 第 197-202 行
+c.is_a = _is_a               -- 实例方法：obj:is_a(SomeClass)
+c.is_class = _is_class         -- 判断自身是类还是实例
+c.is_instance = function(obj)  -- 静态方法：SomeClass.is_instance(obj)
+    return type(obj) == "table" and _is_a(obj, c)
+end
+```
+
+它们的用法和区别：
+
+```lua
+local h = Health(inst)
+
+-- is_a：检查一个对象是否是某个类（或其子类）的实例
+h:is_a(Health)         -- true
+h:is_a(Combat)         -- false
+
+-- is_instance：从类的角度检查（不需要对象引用）
+Health.is_instance(h)  -- true
+Combat.is_instance(h)  -- false
+
+-- is_class：判断是类本身还是实例
+Health:is_class()      -- true（Health 是类定义，有 is_instance 方法）
+h:is_class()           -- false（h 是实例，没有 is_instance 方法）
+```
+
+`is_instance` 的实际用途——在不确定对象类型时安全地判断：
+
+```lua
+-- 来自 scripts/mainfunctions.lua —— 检查 LoadPrefabFile 的返回值
+for i, val in ipairs(ret) do
+    if type(val) == "table" and val.is_a and val:is_a(Prefab) then
+        RegisterSinglePrefab(val)
+    end
+end
+```
+
+这里先检查 `val` 是不是 table，再检查有没有 `is_a` 方法，最后才调用——层层防御，避免在非 Class 对象上调用 `is_a` 导致报错。
+
+### 2.3.4 makereadonly 和 addsetter——运行时属性控制
+
+`class.lua` 还提供了两个强大但较少使用的工具：
+
+**`makereadonly(t, k)`——把属性变为只读**
+
+```lua
+-- 来自 scripts/class.lua 第 51-61 行
+function makereadonly(t, k)
+    local _ = rawget(t, "_")
+    assert(_ ~= nil, "Class does not support read only properties")
+    local p = _[k]
+    if p == nil then
+        _[k] = { t[k], onreadonly }   -- 把当前值存入 _ 表，设回调为 onreadonly
+        rawset(t, k, nil)              -- 从实例上删除原始属性
+    else
+        p[2] = onreadonly              -- 替换回调为只读检查
+    end
+end
+```
+
+`onreadonly` 回调在赋值时断言新值必须等于旧值——如果不等就报错：
+
+```lua
+local function onreadonly(t, v, old)
+    assert(v == old, "Cannot change read only property")
+end
+```
+
+**`addsetter(t, k, fn)`——给属性添加自定义 setter**
+
+```lua
+function addsetter(t, k, fn)
+    local _ = rawget(t, "_")
+    local p = _[k]
+    if p == nil then
+        _[k] = { t[k], fn }
+        rawset(t, k, nil)
+    else
+        p[2] = fn
+    end
+end
+```
+
+这允许你在运行时**动态地**给一个已创建的对象添加属性监听器。而 props 参数是在类定义时静态设置的。
+
+**`removesetter(t, k)`——移除属性监听器**
+
+```lua
+function removesetter(t, k)
+    local _ = rawget(t, "_")
+    if _ ~= nil and _[k] ~= nil then
+        rawset(t, k, _[k][1])   -- 把值从 _ 表移回实例上
+        _[k] = nil               -- 删除监听
+    end
+end
+```
+
+> **给 Mod 开发者的提示**：`addsetter` 和 `removesetter` 可以用于在 Mod 中给已有组件的属性添加自定义监听逻辑。但要注意，只有使用了 props 参数创建的类才支持这些操作（因为需要 `_` 表的存在）。
+
+### 2.3.5 Class 系统在游戏中的层次结构
+
+整个饥荒的代码可以看做一个类层次结构树：
+
+```
+Class (class.lua)
+├── EntityScript (entityscript.lua)          ← 所有实体的基类
+├── Vector3 (vector3.lua)                    ← 三维向量
+├── Prefab (prefabs.lua)                     ← Prefab 定义
+├── Brain (brain.lua)                        ← AI 大脑基类
+│   ├── AbigailBrain                         ← 阿比盖尔的 AI
+│   ├── SpiderBrain                          ← 蜘蛛的 AI
+│   └── ...
+├── BehaviourNode (behaviourtree.lua)        ← 行为树节点基类
+│   ├── DecoratorNode                        ← 装饰器
+│   ├── ConditionNode                        ← 条件节点
+│   ├── SequenceNode                         ← 序列节点
+│   └── ...
+├── StateGraph (stategraph.lua)              ← 状态图定义
+├── StateGraphInstance                       ← 状态图运行实例
+├── State / EventHandler / ActionHandler     ← 状态图组件
+│
+├── 组件（无继承，独立定义）
+│   ├── Health                               ← 带 props
+│   ├── Combat                               ← 无 props
+│   ├── Inventory                            ← 无 props
+│   └── ...（约 400+ 个）
+│
+├── Widget (widgets/widget.lua)              ← UI 基类
+│   ├── Text                                 ← 文本
+│   ├── Image                                ← 图片
+│   ├── Button                               ← 按钮
+│   └── ...
+├── Screen (screens/screen.lua)              ← 界面基类
+│   ├── MainScreen                           ← 主菜单
+│   ├── PlayerHud                            ← 游戏 HUD
+│   └── ...
+│
+└── 工具类
+    ├── BT (behaviourtree.lua)               ← 行为树容器
+    ├── Scheduler / Task / Periodic          ← 调度系统
+    ├── Recipe / Recipe2                     ← 合成配方（Recipe2 继承 Recipe）
+    └── ...
+```
+
+注意一个有趣的事实：**绝大多数组件之间没有继承关系**。`Health` 不继承自某个"BaseComponent"，`Combat` 也不继承自 `Health`。它们都是独立的 `Class(function(self, inst) ... end)` 定义。
+
+这是**组合优于继承**的设计哲学——不是通过继承树来复用代码，而是通过给实体**组合不同的组件**来构建功能。一个实体有 `Health`（能受伤）+ `Combat`（能打架）+ `Locomotor`（能移动）= 一个可战斗的生物。
+
+少数例外是确实需要继承的场景：
+- `Recipe2` 继承 `Recipe`——在原版配方基础上扩展新功能
+- `AOEWeapon_Leap` 继承 `AOEWeapon_Base`——范围武器的变体
+- `WobyRack` 继承 `DryingRack`——沃比的移动晾肉架
+
+### 2.3.6 MetaClass——另一种 Class 实现
+
+饥荒中还有一个 `metaclass.lua`，它提供了另一种面向对象的实现方式——基于 `newproxy` 的 userdata 对象：
+
+```lua
+-- 来自 scripts/metaclass.lua
+mt.__call = function(class_tbl, ...)
+    local obj = newproxy(true)        -- 创建 userdata（不是 table！）
+    local objmt = getmetatable(obj)
+    metatable_refs[obj] = objmt       -- 防止 GC 顺序问题
+    objmt._ = {}                      -- 属性存储
+    objmt.c = c                       -- 类引用
+    for k, v in pairs(metafunctions) do
+        objmt[k] = v                  -- 安装所有元方法
+    end
+    if c._ctor then
+        c._ctor(obj, ...)
+    end
+    return obj
+end
+```
+
+`MetaClass` 和 `Class` 的核心区别：
+
+| 特性 | `Class` | `MetaClass` |
+|------|---------|-------------|
+| 实例类型 | table | userdata |
+| 属性存储 | 直接在 table 上 | 存在 metatable._ 中 |
+| 直接访问属性 | `rawget(obj, key)` | 不可能（userdata 不支持）|
+| 内存占用 | 较大 | 较小（userdata 比 table 轻量）|
+| 用途 | 几乎所有游戏对象 | 特殊的轻量对象 |
+
+`MetaClass` 创建的对象是 userdata，外部代码无法绕过元方法直接读写属性。这提供了更好的封装性，但代价是灵活性降低。
+
+> **给 Mod 开发者的提示**：你在 Mod 中基本不会用到 `MetaClass`。如果你遇到一个对象 `type(obj)` 返回 `"userdata"` 但它表现得像 table（有方法可以调用），那它可能就是 `MetaClass` 创建的。这时你不能用 `rawget` 直接读它的属性。
+
+### 2.3.7 热重载系统——开发者的利器
+
+`class.lua` 配合 `reload.lua`，实现了一个开发期的**热重载**系统。当你修改了一个 Lua 文件并保存后，不需要重启游戏就能看到效果。
+
+热重载的原理：
+
+```lua
+-- 来自 scripts/reload.lua（简化后的核心逻辑）
+function hotswap(modname)
+    local ok, oldmod = pcall(require, modname)  -- 获取旧模块
+
+    package.loaded[modname] = nil                -- 清除缓存
+    local newmod = require(modname)              -- 重新加载
+
+    -- 把新版本的方法更新到旧版本的表上
+    if type(oldmod) == "table" then
+        update(oldmod, newmod)
+    end
+end
+```
+
+关键在于 `update` 函数——它把新模块的方法逐个复制到旧模块的表上。由于所有实例都通过 `__index` 指向类原型表，更新类原型表就等于更新了所有实例的方法。
+
+`ClassRegistry` 的 `c_inherited` 在这里派上了用场：当基类被热重载时，系统需要把新方法同步到所有子类。通过对比 `c_inherited`，系统知道子类的哪些方法是从基类继承的（需要更新），哪些是子类自己定义的（不应被覆盖）。
+
+### 2.3.8 Mod 开发中的 Class 实战模式
+
+**模式一：定义新组件（最常见）**
+
+```lua
+-- scripts/components/mycomponent.lua
+local MyComponent = Class(function(self, inst)
+    self.inst = inst
+    self.power = 0
+end)
+
+function MyComponent:SetPower(val)
+    self.power = val
+    self.inst:PushEvent("powerchanged", {power = val})
+end
+
+function MyComponent:OnSave()
+    return {power = self.power}
+end
+
+function MyComponent:OnLoad(data)
+    if data then self.power = data.power or 0 end
+end
+
+return MyComponent
+```
+
+**模式二：扩展已有类（通过 PostInit）**
+
+如果你想给已有的组件添加新方法，不需要继承——直接通过 Mod API 注入：
+
+```lua
+-- modmain.lua
+AddComponentPostInit("combat", function(self)
+    local old_GetAttacked = self.GetAttacked
+    function self:GetAttacked(attacker, damage, ...)
+        -- 在原有逻辑前做点什么
+        print(self.inst.prefab .. " is being attacked!")
+        -- 调用原版逻辑
+        return old_GetAttacked(self, attacker, damage, ...)
+    end
+end)
+```
+
+这是饥荒 Mod 最常见的模式——**包装（wrapping）**原版方法。先保存原方法的引用，再定义新方法，在新方法中调用原方法。
+
+**模式三：创建带继承的类**
+
+```lua
+-- scripts/components/my_special_weapon.lua
+local AOEWeapon_Base = require("components/aoeweapon_base")
+
+local MySpecialWeapon = Class(AOEWeapon_Base, function(self, inst)
+    AOEWeapon_Base._ctor(self, inst)  -- 必须手动调用父类构造函数
+    self.special_damage = 50
+end)
+
+function MySpecialWeapon:DoSpecialAttack(target)
+    -- 先调用基类的方法
+    self:DoAOEAttack(target)
+    -- 再做额外的特殊处理
+    target.components.health:DoDelta(-self.special_damage)
+end
+
+return MySpecialWeapon
+```
+
+---
+
+> **本节小结**
+> - `class.lua` 是饥荒全部面向对象代码的基础，约 260 行代码支撑了 3900+ 个文件
+> - `ClassRegistry` 记录每个类的继承信息，为热重载提供支持
+> - props 系统通过自定义 `__index`/`__newindex` 实现属性监听，只有需要网络同步的组件使用
+> - `makereadonly`/`addsetter`/`removesetter` 提供运行时的属性控制能力
+> - 饥荒的类层次以"组合优于继承"为设计哲学——组件独立定义，通过组合赋予实体能力
+> - `MetaClass` 是另一种基于 userdata 的轻量实现，用于特殊场景
+> - Mod 开发中最常用三种模式：定义新组件、包装已有方法、创建带继承的类
 
 ## 2.4 实体-组件-系统（ECS）架构概述
 
-（待编写）
+如果说 `class.lua` 是饥荒的"语法"，那么 **实体-组件** 架构就是饥荒的"语法结构"——它决定了游戏世界中每一样东西是如何被构造和组织的。理解这个架构，你就能理解为什么饥荒的代码长那个样子、为什么 Mod 的 API 是那样设计的。
+
+### 2.4.1 什么是实体-组件架构
+
+> **给新手的类比**：想象你在组装一台电脑。电脑本身就是一个"实体"（Entity）——一个空壳子。你往里面装 CPU（计算能力）、内存（临时存储）、硬盘（永久存储）、显卡（图形处理）。每个硬件就是一个"组件"（Component）。同一个机箱可以装不同的配置——游戏主机装好显卡，办公电脑可能不需要。
+
+在饥荒中：
+- **实体（Entity）**：游戏世界中的"一样东西"——一棵树、一块石头、一把斧头、一只蜘蛛、威尔逊本人，甚至世界本身
+- **组件（Component）**：赋予实体特定能力的模块——生命值、战斗、移动、可被捡起、可燃烧等
+
+一把斧头的组成：
+
+```lua
+-- 实体（空壳）
+local inst = CreateEntity()
+
+-- 添加组件（赋予能力）
+inst:AddComponent("inventoryitem")   -- 能力：可以被捡起放进物品栏
+inst:AddComponent("equippable")      -- 能力：可以被装备到手上
+inst:AddComponent("tool")            -- 能力：可以用来砍/挖/锤等
+inst:AddComponent("weapon")          -- 能力：可以用来攻击造成伤害
+inst:AddComponent("finiteuses")      -- 能力：有耐久度，用完会坏
+inst:AddComponent("inspectable")     -- 能力：可以被检查（右键查看描述）
+```
+
+一棵常青树的组成：
+
+```lua
+local inst = CreateEntity()
+inst:AddComponent("inspectable")     -- 可以被检查
+inst:AddComponent("workable")        -- 可以被工具作用（砍）
+inst:AddComponent("lootdropper")     -- 被砍倒后掉落物品（原木）
+inst:AddComponent("burnable")        -- 可以被点燃
+inst:AddComponent("propagator")      -- 火焰可以蔓延到附近
+inst:AddComponent("growable")        -- 会生长（小树 → 中树 → 大树）
+```
+
+注意到关键的区别：斧头有 `weapon`（能攻击）和 `finiteuses`（有耐久），树没有；树有 `growable`（会生长）和 `workable`（可被砍），斧头没有。**通过组合不同的组件，同一套代码可以创造出千变万化的实体**。
+
+### 2.4.2 为什么用组件而不用继承
+
+你可能会想：为什么不定义一个 `Tool` 类继承自 `Item`，`Weapon` 也继承自 `Item`？
+
+问题是：一把**斧头**既是工具又是武器。如果你用继承，Lua 不支持多重继承（一个类只能有一个 `_base`）。即使语言支持，多重继承也会带来"菱形继承"等一系列问题。
+
+```
+继承方式（问题多多）：         组件方式（饥荒的选择）：
+
+    Item                        Entity
+   /    \                    + inventoryitem
+  Tool  Weapon                + tool
+   \    /                    + weapon
+    ???（斧头该继承谁？）       + finiteuses
+                              → 斧头！
+```
+
+组件系统的优势：
+1. **灵活组合**——任何组件都可以自由搭配，不受继承层次限制
+2. **独立修改**——修改 `weapon` 组件不影响 `tool` 组件
+3. **运行时增删**——游戏运行中可以动态添加或移除组件（比如角色获得/失去某个能力）
+4. **Mod 友好**——Mod 开发者可以用 `AddComponent` 给已有实体加新能力
+
+### 2.4.3 饥荒的"两层"实体
+
+饥荒的实体有两个层次——**C++ 层**（引擎实体）和 **Lua 层**（`EntityScript`）：
+
+```lua
+-- 创建实体时，两层同时建立
+local inst = CreateEntity()
+
+-- C++ 层的引擎组件（由 entity 对象管理）
+inst.entity:AddTransform()       -- 位置/旋转/缩放
+inst.entity:AddAnimState()       -- 动画状态
+inst.entity:AddSoundEmitter()    -- 声音发射器
+inst.entity:AddNetwork()         -- 网络同步
+inst.entity:AddPhysics()         -- 物理碰撞
+
+-- Lua 层的游戏组件（由 EntityScript 管理）
+inst:AddComponent("health")      -- 生命值
+inst:AddComponent("combat")      -- 战斗
+inst:AddComponent("locomotor")   -- 移动
+```
+
+**C++ 层组件**负责底层的渲染、物理和网络，它们的数据和逻辑在 C++ 引擎中运行，性能极高。
+
+**Lua 层组件**负责游戏逻辑——血量扣多少、攻击力是多少、移动速度快不快。这些是我们在 Mod 开发中主要打交道的部分。
+
+C++ 层的组件通过 `inst.entity:AddXxx()` 添加，之后通过 `inst.Transform`、`inst.AnimState`、`inst.SoundEmitter` 等访问。Lua 层的组件通过 `inst:AddComponent("xxx")` 添加，之后通过 `inst.components.xxx` 访问。
+
+### 2.4.4 AddComponent 的背后——组件如何被加载和挂载
+
+当你调用 `inst:AddComponent("health")` 时，饥荒内部做了这些事：
+
+```lua
+-- 来自 scripts/entityscript.lua（简化版）
+function EntityScript:AddComponent(name)
+    -- 1. 检查是否已有同名组件
+    if self.lower_components_shadow[string.lower(name)] ~= nil then
+        return self.components[name]   -- 已经有了，直接返回
+    end
+
+    -- 2. 加载组件类（require("components/" .. name)）
+    local cmp = LoadComponent(name)
+
+    -- 3. 注册 replica 组件（如果有的话）
+    self:ReplicateComponent(name)
+
+    -- 4. 实例化组件，传入 self（实体）
+    local loadedcmp = cmp(self)        -- 等价于 Health(self)
+
+    -- 5. 存储到 components 表
+    self.components[name] = loadedcmp
+
+    -- 6. 执行 Mod 的 ComponentPostInit
+    local postinitfns = ModManager:GetPostInitFns("ComponentPostInit", name)
+    for _, fn in ipairs(postinitfns) do
+        fn(loadedcmp, self)            -- 让 Mod 有机会修改这个组件
+    end
+
+    -- 7. 注册组件的可用动作
+    self:RegisterComponentActions(name)
+
+    return loadedcmp
+end
+```
+
+注意第 6 步——这就是为什么 `AddComponentPostInit` 有效。每次一个组件被添加到任何实体上时，你注册的回调都会被调用。
+
+### 2.4.5 组件之间如何通信——事件系统
+
+组件是独立的模块，但它们经常需要相互配合。比如角色的 `health` 组件生命值归零时，需要通知 `combat` 停止战斗、`locomotor` 停止移动、`inventory` 掉落物品。
+
+饥荒用**事件系统**来实现这种组件间通信：
+
+```lua
+-- 发送事件（"我死了！"）
+self.inst:PushEvent("death", {cause = attacker})
+
+-- 监听事件（"如果他死了，我要做点什么"）
+self.inst:ListenForEvent("death", function(inst, data)
+    inst.components.inventory:DropEverything()
+end)
+```
+
+事件系统的实现原理：
+
+```lua
+-- 来自 scripts/entityscript.lua
+function EntityScript:PushEvent_Internal(event, data)
+    if self.event_listeners then
+        local listeners = self.event_listeners[event]
+        if listeners then
+            -- 复制一份监听者列表再遍历（防止遍历过程中列表被修改）
+            local tocall = {}
+            for entity, fns in pairs(listeners) do
+                for i, fn in ipairs(fns) do
+                    table.insert(tocall, fn)
+                end
+            end
+            for i, fn in ipairs(tocall) do
+                fn(self, data)
+            end
+        end
+    end
+
+    -- 事件也会传递给状态图
+    if self.sg then
+        self.sg:PushEvent(event, data)
+    end
+end
+```
+
+**重要的设计选择**：事件在传递给 Lua 监听器后，还会传递给状态图（`self.sg`）。这让状态图可以响应任何组件触发的事件——比如 `health` 组件推送 `"attacked"` 事件后，状态图可以切换到"被打"的动画状态。
+
+**你也可以监听另一个实体的事件**：
+
+```lua
+-- 在 inst 上监听 other_entity 的事件
+inst:ListenForEvent("death", function(other, data)
+    print(other.prefab .. " died!")
+end, other_entity)   -- 第三个参数指定事件源
+```
+
+### 2.4.6 Tag 系统——轻量级的"标签"
+
+除了组件和事件，饥荒还有一个**Tag 系统**——给实体打上标签，用于快速查询。
+
+```lua
+-- 添加标签
+inst:AddTag("weapon")
+inst:AddTag("sharp")
+
+-- 检查标签
+if inst:HasTag("weapon") then ... end
+if inst:HasTag("sharp") then ... end
+
+-- 移除标签
+inst:RemoveTag("weapon")
+```
+
+Tag 是在 C++ 引擎层实现的，查询速度极快。组件通常在初始化时给实体添加 tag，让其他系统可以快速判断一个实体有什么能力，**而不需要检查它有哪些组件**。
+
+为什么不直接检查组件？因为组件检查需要：
+
+```lua
+-- 慢：需要访问 Lua table
+if inst.components.weapon ~= nil then
+
+-- 快：tag 查询在 C++ 层完成
+if inst:HasTag("weapon") then
+```
+
+更重要的是，在**客户端**上，你无法访问服务端的组件（组件只存在于服务端），但你可以检查 tag（tag 会自动同步到客户端）。这就是 tag 在 C/S 架构中的关键作用。
+
+### 2.4.7 组件的生命周期
+
+一个组件从创建到销毁，经历这些阶段：
+
+```
+1. 加载       LoadComponent(name) → require("components/name")
+2. 实例化     cmp(inst) → 执行构造函数，初始化字段
+3. PostInit   Mod 的 ComponentPostInit 回调
+4. 运行       处理事件、执行方法、可选的 OnUpdate
+5. 存档       OnSave() → 序列化数据
+6. 读档       OnLoad(data) → 恢复数据
+7. 移除       OnRemoveFromEntity() → 清理资源
+```
+
+**OnSave / OnLoad** 是饥荒存档系统的核心——你的组件需要把所有"重要状态"保存下来：
+
+```lua
+function MyComponent:OnSave()
+    return {
+        level = self.level,
+        experience = self.experience,
+        is_active = self.is_active,
+    }
+end
+
+function MyComponent:OnLoad(data)
+    if data then
+        self.level = data.level or 1
+        self.experience = data.experience or 0
+        self.is_active = data.is_active or false
+    end
+end
+```
+
+**OnRemoveFromEntity** 在组件被动态移除时调用，用于清理资源（取消定时器、移除事件监听等）。
+
+### 2.4.8 实体的查找——FindEntities
+
+游戏运行中经常需要查找附近的实体（比如"找到周围 10 格内的所有可攻击生物"）。饥荒提供了 C++ 层的高效查找函数：
+
+```lua
+-- 查找指定范围内的实体
+local x, y, z = inst.Transform:GetWorldPosition()
+local entities = TheSim:FindEntities(x, y, z, 10,    -- 半径 10
+    {"_combat"},        -- 必须有的 tag（must_tags）
+    {"player", "wall"}, -- 不能有的 tag（cant_tags）
+    {"monster", "pig"}  -- 至少有一个的 tag（oneof_tags）
+)
+
+for _, ent in ipairs(entities) do
+    -- 对每个找到的实体做处理
+end
+```
+
+注意 `FindEntities` 使用的是 **tag** 而不是组件名。这就是为什么每个组件在初始化时通常会给实体添加对应的 tag——让 `FindEntities` 能快速筛选。
+
+### 2.4.9 用组件思维设计你的 Mod
+
+理解了 ECS 架构后，来看如何应用到 Mod 开发中。
+
+**思考方式**：不要想"我要做一个什么东西"，而是想"我要给这个东西什么能力"。
+
+例如：你想做一个"魔法宝石"——
+- 可以被捡起 → `inventoryitem` 组件
+- 可以被装备 → `equippable` 组件
+- 提供光环效果 → 自定义组件或 `inst:DoPeriodicTask` 检测周围
+- 有耐久 → `finiteuses` 组件
+- 用完后消失 → 在 finiteuses 用完的回调中 `inst:Remove()`
+
+**Mod 中操作组件的常用方法**：
+
+```lua
+-- 给已有 prefab 添加新组件
+AddPrefabPostInit("axe", function(inst)
+    inst:AddComponent("waterproofer")  -- 让斧头防水
+    inst.components.waterproofer:SetEffectiveness(0.5)
+end)
+
+-- 修改已有组件的参数
+AddPrefabPostInit("wilson", function(inst)
+    if inst.components.health then
+        inst.components.health:SetMaxHealth(200)  -- 威尔逊血量改为 200
+    end
+end)
+
+-- 动态添加/移除组件
+inst:ListenForEvent("equip", function(inst, data)
+    inst:AddComponent("nightvision")  -- 装备时获得夜视
+end)
+inst:ListenForEvent("unequip", function(inst, data)
+    inst:RemoveComponent("nightvision")  -- 卸下时失去夜视
+end)
+```
+
+---
+
+> **本节小结**
+> - 饥荒采用实体-组件架构：实体是空壳，组件赋予能力，通过组合构建功能
+> - 组件系统的优势：灵活组合、独立修改、运行时增删、Mod 友好
+> - 实体有两层：C++ 层（Transform、AnimState 等）和 Lua 层（health、combat 等）
+> - `AddComponent` 内部：加载组件类 → 实例化 → 存入 components 表 → 执行 PostInit
+> - 组件间通过**事件系统**（`PushEvent` / `ListenForEvent`）通信
+> - **Tag 系统**是轻量级标签，在 C++ 层实现，查询快、可跨客户端/服务端使用
+> - 组件生命周期：实例化 → 运行 → OnSave/OnLoad（存档）→ OnRemoveFromEntity（清理）
+> - `FindEntities` 基于 tag 查找，是游戏中查找附近实体的标准方式
 
 ## 2.5 EntityScript——所有实体的基类（entityscript.lua 核心 API）
 

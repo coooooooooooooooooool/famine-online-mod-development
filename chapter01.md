@@ -1830,6 +1830,51 @@ local ACTIONS = _G.ACTIONS
 local FOODTYPE = _G.FOODTYPE
 ```
 
+小贴士：一些mod会在modmain开头增加如下代码
+```lua
+-- modmain.lua 开头
+GLOBAL.setmetatable(env, {
+    __index = function(t, k)
+        return GLOBAL.rawget(GLOBAL, k)
+    end
+})
+```
+这里利用了 Lua 的元表查找机制，核心原理是：
+
+当你在一个表中查找某个 key，发现找不到（值为 nil）时，Lua 不会立刻返回 nil，而是会去看这个表有没有设置元表，元表里有没有 __index 字段。如果有，就按 __index 的规则去"补查"。
+
+具体过程是这样的：
+
+setmetatable(env, {...}) —— 给 mod 的沙箱环境 env 设置了一个元表
+__index = function(t, k) —— 当你访问 env 中不存在的变量时，Lua 会自动调用这个函数，t 是 env 本身，k 是你要找的变量名
+GLOBAL.rawget(GLOBAL, k) —— 去真正的全局环境 _G 里找这个变量并返回
+
+举个具体例子
+假设你在 modmain 里写了 TheWorld（没加 GLOBAL.）：
+
+Lua 先在 env 表里找 TheWorld → 找不到（沙箱里没有）
+Lua 发现 env 有元表，且元表有 __index
+调用 __index(env, "TheWorld")
+函数内部执行 GLOBAL.rawget(GLOBAL, "TheWorld")，也就是从全局环境 _G 里拿 TheWorld成功拿到了！返回给你
+效果：mod 代码里所有找不到的变量名，都会自动去全局环境里查。相当于把沙箱的"墙"打了个洞——任何全局变量都能直接用，不需要再写 GLOBAL. 前缀了。
+
+
+为什么用 rawget 而不是直接 GLOBAL[k]？
+rawget 是 Lua 的原始读取函数，它绕过元表直接查表。这样做是为了避免：如果 _G 本身也有元表（理论上可能），直接用 GLOBAL[k] 可能触发 _G 的元方法，导致意外的链式查找甚至无限递归。用 rawget 更安全、更纯粹。
+
+
+这种做法好不好？
+方便是很方便，但有一些隐患：
+
+1.破坏了沙箱设计：游戏开发者设沙箱是为了隔离 mod，防止 mod 之间互相干扰或意外修改全局变量。这段代码等于绕过了这层保护。
+2.调试更困难：如果你不小心写错了变量名，正常情况下会立刻报错（nil），但有了这个"回退查找"，它可能静默返回 _G 里某个你意想不到的东西，bug 更难定位。
+3.潜在命名冲突：你在 mod 里定义的局部变量可能和全局变量重名，行为可能不如预期。
+
+不过实际开发中，很多大型 mod（比如你看到的神话书说、人物 mod 等）都用了这个技巧，因为不用到处写 GLOBAL. 确实让代码简洁得多。这是一个便利性 vs 安全性的权衡。
+
+如果你追求规范，推荐的做法还是在 modmain 开头手动提取需要的变量，这样既清晰又安全，而且能明确看出你的 mod 依赖了哪些全局变量。
+
+
 ### 1.5.8 require 的常见陷阱与调试
 
 **陷阱一：循环引用**
