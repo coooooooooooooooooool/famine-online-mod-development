@@ -2878,7 +2878,477 @@ end
 
 ## 2.8 scheduler.lua——任务调度器与协程管理的核心
 
-（待编写）
+在 1.6 节中，我们从 Lua 语言的角度学习了协程的基本概念和用法。本节将深入饥荒的 **调度器**（Scheduler）系统——它是协程在游戏中真正运行的"舞台管理者"，负责控制数百个协程何时苏醒、何时休眠、何时执行。
+
+### 2.8.1 调度器的角色——为什么需要它
+
+> **给新手的类比**：想象一个机场的航班调度塔。
+> - 每架飞机（**协程/任务**）都有自己的飞行计划
+> - 调度塔（**Scheduler**）决定什么时候让哪架飞机起飞或降落
+> - 有些飞机需要延迟起飞（**Sleep**——等待特定时间）
+> - 有些飞机在待机位等待信号（**Hibernate**——无限期等待，直到被唤醒）
+> - 有些飞机周期性起降（**Periodic**——每隔固定时间执行一次）
+
+Lua 的 `coroutine.resume/yield` 只是"手动挡"——你必须自己决定什么时候恢复哪个协程。饥荒的调度器把它变成了"自动挡"——你只需要说"3 秒后叫我"或"每 5 秒提醒我一次"，调度器会在正确的时刻自动恢复你的协程。
+
+### 2.8.2 两个全局调度器实例
+
+饥荒有**两个**独立的调度器：
+
+```lua
+-- scripts/scheduler.lua
+scheduler = Scheduler()             -- 游戏时间调度器
+staticScheduler = Scheduler(true)   -- 墙钟时间调度器
+```
+
+| 调度器 | 时间基准 | 受暂停影响 | 受时间缩放影响 | 典型用途 |
+|---|---|---|---|---|
+| `scheduler` | 游戏内 Tick | 是 | 是 | 游戏逻辑（战斗冷却、生长周期） |
+| `staticScheduler` | 静态 Tick | 否 | 否 | UI 动画、网络心跳、不可暂停的逻辑 |
+
+当游戏暂停时，`scheduler` 停止推进，但 `staticScheduler` 继续运行。这就是为什么 `DoTaskInTime`（用 `scheduler`）在暂停时不会触发，但 `DoStaticTaskInTime`（用 `staticScheduler`）仍会按墙钟时间触发。
+
+### 2.8.3 调度器的内部数据结构
+
+Scheduler 类维护着五个关键列表：
+
+```lua
+Scheduler = Class(function(self, isstatic)
+    self.tasks = {}           -- 所有活着的 Task 协程（co → task 映射）
+    self.running = {}         -- 当前帧要执行的任务
+    self.waitingfortick = {}  -- 按 tick 分桶等待的任务（tick → list 映射）
+    self.waking = {}          -- 本帧被唤醒、等待加入 running 的任务
+    self.hibernating = {}     -- 无限期休眠的任务
+    self.attime = {}          -- 按 tick 分桶的 Periodic 回调
+    self.isstatic = isstatic  -- 是否是静态调度器
+end)
+```
+
+可以想象成一个"任务宿舍"：
+
+```
+┌─ running ─────────┐  正在排队等执行的任务
+│  Task A, Task C    │
+├─ waking ──────────┤  刚被闹钟叫醒，等待入队
+│  Task E            │
+├─ waitingfortick ──┤  按时间排队睡觉的任务
+│  tick 150: Task B  │
+│  tick 200: Task D  │
+├─ hibernating ─────┤  深度睡眠（等待手动唤醒）
+│  Task F            │
+├─ attime ──────────┤  Periodic 回调队列
+│  tick 150: Per. G  │
+│  tick 155: Per. H  │
+└───────────────────┘
+```
+
+### 2.8.4 Task 类——协程的包装器
+
+`Task` 是对 Lua 协程的封装：
+
+```lua
+local Task = Class(function(self, fn, id, param)
+    self.guid = taskguid       -- 全局唯一编号
+    taskguid = taskguid + 1
+    self.param = param         -- 传给协程的参数
+    self.id = id               -- 标识符（通常是实体的 GUID）
+    self.fn = fn               -- 协程函数
+    self.co = coroutine.create(fn)  -- 创建协程
+    self.list = nil            -- 当前所在的列表
+end)
+```
+
+每个 Task 可以在不同列表之间迁移，`SetList` 方法确保"离开旧列表、加入新列表"的原子性：
+
+```lua
+function Task:SetList(list)
+    if self.list then
+        self.list[self.guid] = nil   -- 从旧列表移除
+    end
+    if list then
+        list[self.guid] = self       -- 加入新列表
+    end
+    self.list = list
+end
+```
+
+### 2.8.5 Periodic 类——"闹钟式"的定时回调
+
+`Periodic` 不使用协程，而是直接存储回调函数：
+
+```lua
+Periodic = Class(function(self, fn, period, limit, id, nexttick, ...)
+    self.fn = fn           -- 回调函数
+    self.id = id           -- 标识符（实体 GUID）
+    self.period = period   -- 执行间隔（秒）
+    self.limit = limit     -- 执行次数限制（nil = 无限，1 = 执行一次）
+    self.nexttick = nexttick  -- 下次触发的 tick
+    self.arg = toarrayornil(...)  -- 额外参数
+    self.onfinish = nil    -- 完成/取消时的回调
+end)
+```
+
+`limit` 的设计很巧妙：
+- `limit = nil`：无限次重复（`DoPeriodicTask`）
+- `limit = 1`：只执行一次（`DoTaskInTime` 实际上就是 `ExecutePeriodic` + `limit=1`）
+
+```lua
+-- DoTaskInTime 的实现——就是一次性的 Periodic
+function Scheduler:ExecuteInTime(timefromnow, fn, id, ...)
+    return self:ExecutePeriodic(timefromnow, fn, 1, nil, id, ...)
+end
+```
+
+#### Cancel——取消定时任务
+
+```lua
+function Periodic:Cancel()
+    self.limit = 0                -- 标记为已完成
+    if self.list then
+        self.list[self] = nil     -- 从所在列表移除
+        self.list = nil
+    end
+    if self.onfinish then
+        self.onfinish(self, false, ...)  -- false 表示"非正常完成"
+        self.onfinish = nil
+    end
+    self.fn = nil                 -- 释放引用
+    self.arg = nil
+end
+```
+
+### 2.8.6 OnTick——每帧的"闹钟检查"
+
+每帧开始时，引擎调用 `RunScheduler(tick)`，它分两步：
+
+```lua
+function RunScheduler(tick)
+    scheduler:OnTick(tick)  -- 第 1 步：检查闹钟
+    scheduler:Run()         -- 第 2 步：执行任务
+end
+```
+
+`OnTick` 做两件事：
+
+```lua
+function Scheduler:OnTick(tick)
+    -- 1. 唤醒到期的 Task（协程）
+    if self.waitingfortick[tick] ~= nil then
+        for k, v in pairs(self.waitingfortick[tick]) do
+            v:SetList(self.waking)     -- 移到"苏醒"列表
+        end
+        self.waitingfortick[tick] = nil
+    end
+
+    -- 2. 执行到期的 Periodic（回调）
+    if self.attime[tick] ~= nil then
+        for k, v in pairs(self.attime[tick]) do
+            if v and k.fn then
+                -- 直接调用回调函数
+                if k.arg then
+                    k.fn(unpack(k.arg))
+                else
+                    k.fn()
+                end
+
+                -- 递减计数器
+                if k.limit then
+                    k.limit = k.limit - 1
+                end
+
+                -- 如果还没用完，注册下一次
+                if not k.limit or k.limit > 0 then
+                    local list, nexttick = self:GetListForTimeFromNow(k.period)
+                    list[k] = true
+                    k.nexttick = nexttick
+                else
+                    -- 用完了，执行完成回调并清理
+                    if k.onfinish then
+                        k.onfinish(k, true, ...)  -- true 表示"正常完成"
+                    end
+                    k:Cleanup()
+                end
+            end
+        end
+        self.attime[tick] = nil
+    end
+end
+```
+
+**关键区别**：`Periodic` 回调在 `OnTick` 中**直接执行**，不需要 `coroutine.resume`。`Task`（协程）则需要等到 `Run` 阶段才执行。
+
+### 2.8.7 Run——协程的执行引擎
+
+`Run` 是调度器的核心循环，负责执行所有就绪的协程：
+
+```lua
+function Scheduler:Run()
+    -- 先把刚唤醒的任务加入 running
+    for k, v in pairs(self.waking) do
+        v:SetList(self.running)
+    end
+    self.waking = {}
+
+    -- 遍历 running 列表，逐个恢复协程
+    for k, v in pairs(self.running) do
+        if coroutine.status(v.co) == "dead" then
+            -- 协程已完成，清理
+            self:KillTask(v)
+        else
+            -- 恢复协程执行
+            local success, yieldtype, yieldparam = coroutine.resume(v.co, v.param)
+
+            if success and coroutine.status(v.co) ~= "dead" then
+                -- 协程 yield 了，根据 yield 类型分流
+                if yieldtype == HIBERNATE then
+                    v:SetList(self.hibernating)        -- 深度睡眠
+                elseif yieldtype == SLEEP then
+                    yieldparam = math.floor(yieldparam)
+                    local list = self.waitingfortick[yieldparam]
+                    if not list then
+                        list = GetNewList()
+                        self.waitingfortick[yieldparam] = list
+                    end
+                    v:SetList(list)                    -- 按 tick 休眠
+                end
+                -- yieldtype 为 nil（Yield()）→ 留在 running，下帧继续
+            else
+                -- 协程完成或崩溃
+                if not success then
+                    -- 崩溃！打印错误堆栈
+                    print(debug.traceback(v.co, "COROUTINE CRASH: " .. tostring(yieldtype)))
+                end
+                self:KillTask(v)
+            end
+        end
+    end
+end
+```
+
+#### 三种 yield 导致三种命运
+
+```
+协程执行到 yield 后...
+
+┌─ Sleep(time) ──→ yield(SLEEP, desttick) ──→ waitingfortick[desttick]
+│                                              到达 desttick 后自动唤醒
+│
+├─ Hibernate() ──→ yield(HIBERNATE) ────────→ hibernating
+│                                              需要手动 Wake() 唤醒
+│
+└─ Yield() ──────→ yield() ─────────────────→ 留在 running
+                                               下帧继续执行
+```
+
+### 2.8.8 Sleep 的精确时间计算
+
+`Sleep(time)` 把秒数转换成目标 tick：
+
+```lua
+function Sleep(time)
+    local schedule = GetCurrentScheduler()
+    local desttick = math.ceil(
+        (GetSchedulerTime(schedule.isstatic) + time) / GetTickTime()
+    )
+    if GetSchedulerTick(schedule.isstatic) < desttick then
+        coroutine.yield(SLEEP, desttick)
+    else
+        coroutine.yield()   -- 时间已过，直接让出一帧
+    end
+end
+```
+
+由于 tick 是整数（30 帧/秒），`Sleep` 的实际精度是 **1/30 秒**（约 0.033 秒）。`Sleep(0.1)` 实际上会等 3 个 tick（0.1 秒）。
+
+`GetListForTimeFromNow` 也有类似的逻辑，并且包含浮点误差修正：
+
+```lua
+function Scheduler:GetListForTimeFromNow(dt)
+    local nowtick = GetSchedulerTick(self.isstatic)
+    local wakeuptick = math.ceil(
+        (GetSchedulerTime(self.isstatic) + dt) / GetTickTime() - 0.0001
+    )
+    -- epsilon 修正：防止 FRAMES (1/30) 的浮点误差导致多等一帧
+    if wakeuptick <= nowtick then
+        wakeuptick = nowtick + 1   -- 至少等一帧
+    end
+    return self.attime[wakeuptick] or {}, wakeuptick
+end
+```
+
+### 2.8.9 列表回收机制
+
+一个小而精巧的优化——列表回收器：
+
+```lua
+local listrecycler = {}
+
+local function GetNewList()
+    local numre = #listrecycler
+    if numre > 0 then
+        local list = listrecycler[numre]
+        table.remove(listrecycler)
+        return list           -- 复用旧列表
+    else
+        return {}             -- 创建新列表
+    end
+end
+
+-- OnTick 中用完的列表会被回收
+table.insert(listrecycler, list)
+```
+
+每个 tick 的等待列表用完后不会被垃圾回收，而是放回回收池。下次需要新列表时优先从池中取，减少 GC 压力。这在每秒处理 30 个 tick 的高频场景下意义重大。
+
+### 2.8.10 全局便利函数
+
+`scheduler.lua` 底部导出了一系列全局函数，这是你在代码中直接调用的 API：
+
+| 全局函数 | 说明 | 使用场景 |
+|---|---|---|
+| `StartThread(fn, id)` | 启动一个新协程 | 需要使用 Sleep/Yield 的序列逻辑 |
+| `StartStaticThread(fn, id)` | 在 static 调度器上启动协程 | 不受暂停影响的序列逻辑 |
+| `Sleep(time)` | 在协程内休眠指定秒数 | 等待一段时间后继续 |
+| `Yield()` | 让出当前帧，下帧继续 | 长时间计算分帧处理 |
+| `Hibernate()` | 无限期休眠 | 等待外部唤醒 |
+| `Wake()` | 唤醒当前协程 | 从 Hibernate 恢复 |
+| `WakeTask(task)` | 唤醒指定的 Task | 外部触发唤醒 |
+| `KillThread(task)` | 杀死指定协程 | 提前终止 |
+| `KillThreadsWithID(id)` | 杀死指定 ID 的所有协程 | 实体销毁时批量清理 |
+
+### 2.8.11 Task vs Periodic——协程和回调的选择
+
+调度器管理两种截然不同的执行单元：
+
+```lua
+-- Task（协程）——有状态的、可暂停的执行流
+StartThread(function()
+    print("step 1")
+    Sleep(2)              -- 等 2 秒
+    print("step 2")
+    Sleep(1)              -- 再等 1 秒
+    print("step 3")
+end)
+
+-- Periodic（回调）——无状态的、定时触发的函数调用
+inst:DoPeriodicTask(3, function(inst)
+    print("periodic tick!")  -- 每 3 秒执行一次，没有"上次执行到哪"的记忆
+end)
+```
+
+**选择指南**：
+
+| 特征 | Task（协程） | Periodic（回调） |
+|---|---|---|
+| 有执行状态 | 有（可以 Sleep 后继续） | 无（每次调用都是独立的） |
+| 适合顺序逻辑 | 非常适合 | 不适合 |
+| 性能开销 | 较高（需要维护协程栈） | 较低 |
+| 取消方式 | `KillThread` | `task:Cancel()` |
+| 崩溃影响 | 打印错误后该协程终止 | 可能影响整个 OnTick 循环 |
+
+### 2.8.12 实际案例——调度器如何驱动游戏
+
+#### 案例 1：闪电书的序列效果
+
+```lua
+-- 闪电书：一连串闪电依次劈下
+StartThread(function()
+    for i = 1, num_lightnings do
+        -- 在目标附近随机位置劈下闪电
+        local pos = FindRandomPos(target)
+        SpawnPrefab("lightning").Transform:SetPosition(pos:Get())
+
+        Sleep(0.3 + math.random() * 0.1)  -- 每道闪电间隔 0.3~0.4 秒
+    end
+end)
+```
+
+调度器在这里的作用：协程执行到 `Sleep(0.3)` 时 yield，调度器计算目标 tick（约 9 帧后），把协程放入 `waitingfortick[current+9]`。9 帧后 `OnTick` 唤醒协程，`Run` 恢复执行到下一个 `Sleep`。
+
+#### 案例 2：DoPeriodicTask 检查周围敌人
+
+```lua
+inst:DoPeriodicTask(2, function(inst)
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local enemies = TheSim:FindEntities(x, y, z, 15, {"_combat"}, {"player"})
+    if #enemies > 0 then
+        inst.components.combat:SetTarget(enemies[1])
+    end
+end)
+```
+
+调度器的处理：创建一个 `Periodic` 对象，`limit = nil`（无限次），`period = 2`（秒）。每 60 个 tick（2 秒 × 30 tick/秒），`OnTick` 直接调用回调函数，然后注册下一次。
+
+#### 案例 3：Hibernate + Wake 等待特定条件
+
+```lua
+local task = StartThread(function()
+    while true do
+        Hibernate()   -- 深度休眠，等待唤醒
+        -- 被唤醒后执行
+        print("Something happened!")
+        DoSomeResponse()
+    end
+end)
+
+-- 在某个事件触发时唤醒
+inst:ListenForEvent("special_signal", function()
+    WakeTask(task)
+end)
+```
+
+`Hibernate` 把协程放入 `hibernating` 列表——不像 `Sleep` 会在特定 tick 自动唤醒，`Hibernate` 需要外部调用 `WakeTask` 才能恢复。这种模式适合"等待不确定时间"的场景。
+
+### 2.8.13 ID 机制——批量清理的秘密
+
+`Task` 和 `Periodic` 都有 `id` 字段，通常设为实体的 GUID：
+
+```lua
+-- EntityScript 中的定时任务都传入 self.GUID 作为 id
+function EntityScript:DoTaskInTime(time, fn, ...)
+    local periodic = scheduler:ExecuteInTime(time, fn, self.GUID, self, ...)
+    ...
+end
+
+function EntityScript:StartThread(fn)
+    return StartThread(fn, self.GUID)
+end
+```
+
+当实体被销毁时，`KillThreadsWithID(self.GUID)` 一次性清除所有相关的协程和定时任务：
+
+```lua
+function KillThreadsWithID(id)
+    scheduler:KillTasksWithID(id)
+    staticScheduler:KillTasksWithID(id)
+end
+
+function Scheduler:KillTasksWithID(id)
+    local function pred(task) return task.id == id end
+    removeif(self.tasks, pred)
+    removeif(self.hibernating, pred)
+    removeif(self.running, pred)
+    removeif(self.waking, pred)
+    for k, v in pairs(self.waitingfortick) do
+        removeif(v, pred)
+    end
+end
+```
+
+这就是为什么实体被 `Remove()` 后，所有相关的定时任务和线程都不会"泄漏"——ID 机制保证了批量清理的能力。
+
+---
+
+> **本节小结**
+> - 饥荒有两个调度器：`scheduler`（游戏时间）和 `staticScheduler`（墙钟时间）
+> - `Task` 是协程的封装，支持 Sleep/Yield/Hibernate 三种暂停方式
+> - `Periodic` 是回调的封装，支持定时/周期执行和取消
+> - `OnTick` 每帧检查闹钟：唤醒到期的 Task、执行到期的 Periodic
+> - `Run` 每帧执行所有 running 中的协程，根据 yield 类型分流
+> - Sleep 精度为 1/30 秒，有浮点误差修正（epsilon）
+> - 列表回收机制减少高频场景下的 GC 压力
+> - ID 机制（通常是实体 GUID）支持批量清理，防止"僵尸任务"泄漏
+> - 选择建议：顺序逻辑用 Task（协程 + Sleep），独立的定时检查用 Periodic（DoPeriodicTask）
 
 ## 2.9 Shard 系统——多世界（地上/洞穴）通信
 
