@@ -1444,7 +1444,469 @@ return MyComponent
 
 ## 1.5 模块系统与 require
 
-（待编写）
+在饥荒联机版中，整个游戏由几百个 Lua 文件组成——组件、prefab、状态图、行为树、工具函数……这些文件如何组织在一起、如何互相引用？答案就是 Lua 的**模块系统**和 `require` 函数。对于 Mod 开发者来说，理解模块系统不仅是加载代码的基础，更是避免"为什么我的代码不生效"这类问题的关键。
+
+### 1.5.1 require 的基本用法——加载并执行一个文件
+
+`require` 是 Lua 的内置函数，它的作用是**加载一个 Lua 文件，执行它，并返回执行结果**。
+
+```lua
+-- 加载 easing 模块（缓动函数库）
+local easing = require("easing")
+
+-- 现在可以使用 easing 里的函数了
+local value = easing.inQuad(t, b, c, d)
+```
+
+`require("easing")` 做了三件事：
+1. 在搜索路径中找到 `easing.lua` 文件
+2. 执行这个文件
+3. 返回文件的返回值（通常是一个 table）
+
+一个关键特性：**`require` 有缓存机制**。同一个模块只会被加载一次，后续的 `require` 直接返回第一次的结果：
+
+```lua
+local a = require("easing")
+local b = require("easing")
+print(a == b)  -- true，是同一个 table
+```
+
+这意味着无论你在多少个文件里写 `require("easing")`，`easing.lua` 只会被执行一次，所有地方拿到的都是同一个 table。这既节省了内存，也保证了数据的一致性。
+
+### 1.5.2 模块的四种返回模式
+
+饥荒源码中，模块的返回值主要有四种模式：
+
+**模式一：返回一个函数/方法表——工具库**
+
+最经典的模块模式，文件末尾 `return` 一个包含各种函数的 table：
+
+```lua
+-- 来自 scripts/easing.lua
+local function linear(t, b, c, d)
+    return c * t / d + b
+end
+
+local function inQuad(t, b, c, d)
+    t = t / d
+    return c * t * t + b
+end
+
+-- ... 几十个缓动函数 ...
+
+return {
+    linear = linear,
+    inQuad = inQuad,
+    outQuad = outQuad,
+    inOutQuad = inOutQuad,
+    -- ...
+}
+```
+
+使用时：
+
+```lua
+local easing = require("easing")
+local value = easing.outBounce(t, b, c, d)
+```
+
+类似的还有 `techtree.lua`，它返回一个包含数据和函数的 table：
+
+```lua
+-- 来自 scripts/techtree.lua
+return
+{
+    AVAILABLE_TECH = AVAILABLE_TECH,
+    BONUS_TECH = BONUS_TECH,
+    Create = Create,
+}
+```
+
+**模式二：返回一个 Class——组件和系统类**
+
+大多数组件文件在末尾返回用 `Class` 创建的类：
+
+```lua
+-- 来自 scripts/components/health.lua
+local Health = Class(function(self, inst)
+    self.inst = inst
+    self.maxhealth = 100
+    -- ...
+end)
+
+function Health:DoDelta(amount)
+    -- ...
+end
+
+-- 文件末尾
+return Health
+```
+
+使用时：
+
+```lua
+local Health = require("components/health")
+-- 当实体需要 health 组件时，引擎会调用 Health(inst) 创建实例
+```
+
+**模式三：返回 Prefab 实例——实体定义文件**
+
+prefab 文件比较特殊，它们返回一个或多个 `Prefab` 对象：
+
+```lua
+-- 来自 scripts/prefabs/axe.lua
+local assets = {
+    Asset("ANIM", "anim/axe.zip"),
+    Asset("ANIM", "anim/swap_axe.zip"),
+}
+
+local function normal()
+    local inst = CreateEntity()
+    -- ... 创建斧头实体 ...
+    return inst
+end
+
+local function golden()
+    -- ... 创建金斧头 ...
+end
+
+-- 返回多个 Prefab 实例
+return Prefab("axe", normal, assets),
+    Prefab("goldenaxe", golden, golden_assets),
+    Prefab("moonglassaxe", moonglass, moonglass_assets)
+```
+
+注意 prefab 文件不是通过 `require` 加载的，而是通过 `LoadPrefabFile` 函数——它用 `loadfile` 执行文件，然后收集返回的所有 `Prefab` 对象并注册到引擎中。后面会详细讲。
+
+**模式四：无返回值——副作用加载**
+
+有些文件不返回任何东西，`require` 它们纯粹是为了执行其中的代码（注册全局变量、修改全局状态等）：
+
+```lua
+-- 在 scripts/main.lua 中
+require("class")      -- 注册全局函数 Class()
+require("vector3")    -- 注册全局类 Vector3
+require("tuning")     -- 注册全局表 TUNING
+require("strings")    -- 注册全局表 STRINGS
+```
+
+`class.lua` 里直接定义了全局函数 `function Class(...)`，没有 `local`，也没有 `return`。`require("class")` 执行后，全局变量 `Class` 就可以在任何地方使用了。
+
+> **最佳实践**：如果你在写 Mod，优先使用模式一或模式二（有返回值的模块）。无返回值的副作用加载虽然方便，但会污染全局环境，容易和其他 Mod 冲突。
+
+### 1.5.3 require 的路径规则
+
+在饥荒中，`require` 的路径**以 `scripts` 文件夹为根目录**，用 `/` 或 `.` 分隔：
+
+```lua
+-- 加载 scripts/components/health.lua
+local Health = require("components/health")
+
+-- 加载 scripts/widgets/containerwidget.lua
+local ContainerWidget = require("widgets/containerwidget")
+
+-- 加载 scripts/brains/abigailbrain.lua
+local brain = require("brains/abigailbrain")
+
+-- 加载 scripts/map/customize.lua
+local Customize = require("map/customize")
+
+-- 加载 scripts/stategraphs/commonstates.lua（副作用加载，不需要返回值）
+require("stategraphs/commonstates")
+```
+
+不需要写 `.lua` 后缀，也不需要写 `scripts/` 前缀。
+
+饥荒在启动时配置了搜索路径：
+
+```lua
+-- 来自 scripts/main.lua
+package.path = "scripts\\?.lua;scriptlibs\\?.lua"
+```
+
+`?` 是占位符，会被替换成你传给 `require` 的模块名。所以 `require("components/health")` 会依次尝试：
+1. `scripts/components/health.lua`
+2. `scriptlibs/components/health.lua`
+
+找到第一个存在的文件就加载它。
+
+### 1.5.4 饥荒的自定义加载器——kleiloadlua
+
+饥荒并没有使用 Lua 标准的文件加载方式（`fopen`），而是用引擎提供的 `kleiloadlua` 函数来读取文件。这是因为游戏资源可能打包在压缩包中，标准的文件操作无法直接读取。
+
+饥荒在标准 `require` 的基础上插入了自己的加载器：
+
+```lua
+-- 来自 scripts/main.lua（简化版）
+local loadfn = function(modulename)
+    local errmsg = ""
+    local modulepath = string.gsub(modulename, "[%.\\]", "/")
+    for path in string.gmatch(package.path, "([^;]+)") do
+        local filename = string.gsub(path, "%?", modulepath)
+        local result = kleiloadlua(filename)  -- 用引擎的函数加载
+        if result then
+            return result
+        end
+        errmsg = errmsg .. "\n\tno file '" .. filename .. "'"
+    end
+    return errmsg
+end
+-- 插入到加载器列表的第二个位置（优先级高于默认加载器）
+table.insert(package.loaders, 2, loadfn)
+```
+
+对于 Mod 开发者来说，你不需要关心 `kleiloadlua` 的细节——只需要知道 `require` 正常工作就行。但了解这个机制有助于理解一些问题，比如"为什么我的文件明明在目录里，`require` 却找不到"——可能是路径格式不对。
+
+### 1.5.5 Prefab 的加载机制——与 require 不同
+
+Prefab 文件（`scripts/prefabs/*.lua`）的加载方式和普通 `require` 不同，它使用的是 `LoadPrefabFile`：
+
+```lua
+-- 来自 scripts/mainfunctions.lua
+function LoadPrefabFile(filename)
+    local fn = loadfile(filename)         -- 加载文件，得到一个函数
+    assert(fn, "Could not load file " .. filename)
+    
+    local ret = {fn()}                    -- 执行函数，收集所有返回值
+    
+    for i, val in ipairs(ret) do
+        if type(val) == "table" and val.is_a and val:is_a(Prefab) then
+            RegisterSinglePrefab(val)     -- 注册 Prefab 到引擎
+        end
+    end
+    
+    return ret
+end
+```
+
+而在 `gamelogic.lua` 中，引擎遍历 prefab 列表并逐个加载：
+
+```lua
+-- 来自 scripts/gamelogic.lua
+for i, file in ipairs(PREFABFILES) do
+    LoadPrefabFile("prefabs/" .. file)
+end
+```
+
+`PREFABFILES` 是一个在 `prefablist.lua` 中自动生成的列表：
+
+```lua
+-- 来自 scripts/prefablist.lua（自动生成）
+PREFABFILES = {
+    "abigail",
+    "abigail_attack_fx",
+    "axe",
+    -- ... 上千个 prefab 文件名 ...
+}
+```
+
+为什么 prefab 不用 `require` 而要用 `loadfile`？因为：
+1. **一个文件可以返回多个 Prefab**——比如 `axe.lua` 同时返回斧头、金斧头和月光石斧
+2. **不需要缓存**——prefab 文件执行一次后，返回的 `Prefab` 对象被注册到引擎，文件本身不再需要
+3. **需要收集返回的 Prefab 对象**——`LoadPrefabFile` 会检查每个返回值是否是 `Prefab` 实例
+
+### 1.5.6 Mod 的模块加载——modimport 与 Mod 环境
+
+作为 Mod 开发者，你有两种方式加载自己的代码文件：
+
+**方式一：`require`——加载 `scripts` 文件夹下的文件**
+
+如果你的 Mod 有 `scripts` 文件夹，其中的文件可以用标准 `require` 加载。饥荒在加载 Mod 时会把 Mod 的 `scripts` 路径加入搜索路径：
+
+```lua
+-- 来自 scripts/mods.lua —— 加载 Mod 时
+package.path = MODS_ROOT .. modname .. "\\scripts\\?.lua;" .. package.path
+```
+
+所以如果你的 Mod 目录结构是：
+
+```
+mods/my_mod/
+    modinfo.lua
+    modmain.lua
+    scripts/
+        components/
+            mycomponent.lua
+        prefabs/
+            myitem.lua
+```
+
+你在 `modmain.lua` 中就可以这样引用：
+
+```lua
+-- 在 modmain.lua 中
+-- scripts/components/mycomponent.lua 会被自动找到
+-- 不过组件通常是通过 AddComponentPostInit 或 prefab 中 AddComponent 来加载的
+```
+
+**方式二：`modimport`——加载 Mod 根目录下的文件**
+
+`modimport` 是饥荒专门为 Mod 提供的加载函数，它以**Mod 的根目录**为起点加载文件：
+
+```lua
+-- 在 modmain.lua 中
+modimport("scripts/myutils.lua")     -- 加载 mods/my_mod/scripts/myutils.lua
+modimport("config.lua")              -- 加载 mods/my_mod/config.lua
+```
+
+`modimport` 和 `require` 的关键区别是：
+
+| 特性 | `require` | `modimport` |
+|------|-----------|-------------|
+| 搜索起点 | `scripts/` 全局搜索路径 | Mod 根目录 |
+| 缓存 | 同名文件只加载一次 | 每次调用都重新加载 |
+| 环境 | 全局环境 | Mod 的沙箱环境 |
+| 后缀 | 不需要写 `.lua` | 需要写 `.lua`（虽然不写也行）|
+
+`modimport` 的实现其实很简单：
+
+```lua
+-- 来自 scripts/mods.lua（简化版）
+env.modimport = function(modulename)
+    local result = kleiloadlua(env.MODROOT .. modulename)  -- 从 Mod 根目录加载
+    if result == nil then
+        error("Error in modimport: " .. modulename .. " not found!")
+    end
+    setfenv(result, env.env)  -- 在 Mod 的沙箱环境中执行
+    result()
+end
+```
+
+注意 `setfenv(result, env.env)` 这行——它把加载的代码放在 Mod 的沙箱环境中执行。这意味着 `modimport` 加载的文件可以直接访问 Mod 环境中的所有变量（如 `TUNING`、`GLOBAL`、`AddPrefabPostInit` 等）。
+
+### 1.5.7 Mod 的沙箱环境——为什么 Mod 代码和原版不一样
+
+每个 Mod 都运行在一个独立的**沙箱环境**中，这是饥荒的一个重要安全机制。沙箱环境只暴露了部分全局变量和函数：
+
+```lua
+-- 来自 scripts/mods.lua —— Mod 环境中可用的变量
+local env = {
+    -- Lua 标准库
+    pairs = pairs,
+    ipairs = ipairs,
+    print = print,
+    math = math,
+    table = table,
+    type = type,
+    string = string,
+    tostring = tostring,
+    
+    -- 饥荒核心
+    require = require,
+    Class = Class,
+    TUNING = TUNING,
+    
+    -- Mod 专用
+    GLOBAL = _G,           -- 通过 GLOBAL 可以访问真正的全局环境
+    modname = modname,     -- 当前 Mod 的名称
+    MODROOT = MODS_ROOT .. modname .. "/",  -- Mod 的根目录路径
+}
+```
+
+这就是为什么在 Mod 里你经常看到 `GLOBAL.TheWorld` 而不是直接写 `TheWorld`——因为 `TheWorld` 不在 Mod 的沙箱环境中，需要通过 `GLOBAL` 访问。
+
+```lua
+-- 在 modmain.lua 中
+-- 错误写法（TheWorld 不在 Mod 环境中）：
+-- local world = TheWorld  -- 报错！
+
+-- 正确写法：
+local world = GLOBAL.TheWorld
+
+-- 或者先提取到局部变量：
+local TheWorld = GLOBAL.TheWorld
+local SpawnPrefab = GLOBAL.SpawnPrefab
+```
+
+一些常用的"提取全局变量"写法（你会在很多 Mod 开头看到）：
+
+```lua
+-- modmain.lua 开头
+local _G = GLOBAL
+local TheWorld = _G.TheWorld
+local TheNet = _G.TheNet
+local SpawnPrefab = _G.SpawnPrefab
+local ACTIONS = _G.ACTIONS
+local FOODTYPE = _G.FOODTYPE
+```
+
+### 1.5.8 require 的常见陷阱与调试
+
+**陷阱一：循环引用**
+
+如果 A 文件 `require` 了 B，B 又 `require` 了 A，会发生什么？不会死循环，但 B 拿到的 A 的返回值可能是不完整的（因为 A 还没执行完）：
+
+```lua
+-- a.lua
+local b = require("b")  -- 此时 b.lua 还没执行完
+return { name = "a", b = b }
+
+-- b.lua
+local a = require("a")  -- 拿到的是 a.lua 执行到一半的状态（可能是 nil）
+return { name = "b", a = a }
+```
+
+饥荒源码中通过良好的文件组织避免了循环引用。Mod 开发时也要注意这个问题。
+
+**陷阱二：路径中的斜杠方向**
+
+在 `require` 中，用 `/` 或 `.` 都可以，但不要用 `\`：
+
+```lua
+-- 正确
+require("components/health")
+require("components.health")
+
+-- 避免（虽然饥荒做了兼容，但不推荐）
+require("components\\health")
+```
+
+**陷阱三：Mod 中 require 和原版文件冲突**
+
+如果你的 Mod 的 `scripts` 目录下有一个和原版同名的文件，`require` 会优先加载你的版本（因为 Mod 路径被插入到搜索路径前面）。这可以用来**替换**原版文件，但要谨慎使用，因为它会完全覆盖原版逻辑。
+
+### 1.5.9 实际代码中的 require 模式总览
+
+最后，来看饥荒启动时 `main.lua` 的 require 顺序，感受一下模块系统是如何把整个游戏串起来的：
+
+```lua
+-- 来自 scripts/main.lua（关键的 require 顺序）
+require("strict")          -- 严格模式，访问未定义全局变量报错
+require("debugprint")      -- 调试输出工具
+require("config")          -- 游戏配置
+require("vector3")         -- Vector3 类（注册为全局变量）
+require("mainfunctions")   -- 核心函数（LoadPrefabFile 等）
+require("preloadsounds")   -- 预加载音效
+require("mods")            -- Mod 管理系统
+require("json")            -- JSON 解析
+require("tuning")          -- 全局数值表 TUNING
+
+-- 这行很有意思：require 返回 Class，立即 () 创建实例
+Profile = require("playerprofile")()
+
+LOC = require("languages/loc")  -- 本地化系统
+require("languages/language")    -- 语言包
+require("strings")               -- 字符串表
+```
+
+注意 `require("playerprofile")()` 这个写法——`require` 返回的是 `PlayerProfile` 这个 Class，后面的 `()` 立即调用它创建了一个实例。这等价于：
+
+```lua
+local PlayerProfile = require("playerprofile")
+Profile = PlayerProfile()
+```
+
+---
+
+> **本节小结**
+> - `require` 加载并执行一个 Lua 文件，有缓存机制（同一文件只执行一次）
+> - 模块的四种返回模式：函数表（工具库）、Class（组件）、Prefab 实例（实体定义）、无返回值（副作用）
+> - `require` 的路径以 `scripts/` 为根，用 `/` 分隔，不需要写 `.lua` 后缀
+> - Prefab 文件使用 `LoadPrefabFile`（基于 `loadfile`）加载，不经过 `require` 缓存
+> - Mod 代码有两种加载方式：`require`（搜索 `scripts/` 路径）和 `modimport`（搜索 Mod 根目录）
+> - Mod 运行在沙箱环境中，访问全局变量需要通过 `GLOBAL`
+> - 避免循环引用，注意路径格式，谨慎替换原版文件
+
 
 ## 1.6 协程基础与 StartThread——饥荒中的"线程"
 
