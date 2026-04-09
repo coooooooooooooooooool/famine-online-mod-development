@@ -2418,7 +2418,435 @@ end)
 
 ## 1.7 字符串模式匹配——饥荒代码中的 string.find / string.match
 
-（待编写）
+在 1.1.5 中我们说过，字符串是饥荒的"万能标识符"——prefab 名、tag 名、动画名、皮肤名。而当你需要**从字符串中提取信息、判断字符串是否符合某种格式、或者批量替换字符串内容**时，就需要用到 Lua 的**模式匹配（pattern matching）**。
+
+需要注意的是，Lua 的模式匹配**不是**正则表达式（regex），它有自己的一套语法，比正则简单很多，但在饥荒开发中已经完全够用了。
+
+### 1.7.1 模式匹配的基本语法
+
+Lua 的模式中，有几类特殊字符：
+
+**字符类——匹配一类字符**
+
+| 模式 | 含义 | 示例 |
+|------|------|------|
+| `.` | 任意单个字符 | `"a.c"` 匹配 `"abc"`、`"axc"` |
+| `%a` | 字母（a-z, A-Z）| `"%a+"` 匹配 `"hello"` |
+| `%d` | 数字（0-9）| `"%d+"` 匹配 `"42"` |
+| `%l` | 小写字母 | `"%l+"` 匹配 `"hello"` |
+| `%u` | 大写字母 | `"%u+"` 匹配 `"HELLO"` |
+| `%w` | 字母和数字 | `"%w+"` 匹配 `"hello123"` |
+| `%s` | 空白字符 | `"%s+"` 匹配 `" \t\n"` |
+| `%p` | 标点符号 | `"%p+"` 匹配 `"!@#"` |
+| `[...]` | 自定义字符集 | `"[aeiou]"` 匹配元音字母 |
+| `[^...]` | 取反字符集 | `"[^/]*$"` 匹配最后一个 `/` 之后的内容 |
+
+大写版本（`%A`、`%D` 等）表示取反——匹配不属于该类的字符。
+
+**重复限定符**
+
+| 模式 | 含义 |
+|------|------|
+| `*` | 重复 0 次或更多（贪婪）|
+| `+` | 重复 1 次或更多（贪婪）|
+| `-` | 重复 0 次或更多（非贪婪）|
+| `?` | 出现 0 次或 1 次 |
+
+**锚点**
+
+| 模式 | 含义 |
+|------|------|
+| `^` | 匹配字符串开头 |
+| `$` | 匹配字符串结尾 |
+
+**转义**
+
+Lua 模式中用 `%` 来转义特殊字符。比如要匹配字面的 `.`，写 `%.`；匹配字面的 `(`，写 `%(`。
+
+### 1.7.2 string.find——查找子串的位置
+
+`string.find(s, pattern)` 返回模式在字符串中第一次出现的**起始位置**和**结束位置**。找不到返回 `nil`。
+
+**基本用法：判断某个字符串是否包含特定内容**
+
+```lua
+-- 来自 scripts/prefabs/player_common.lua —— 判断目标是否是猪人
+if string.find(target.prefab, "pig") ~= nil and target:HasTag("pig") then
+    -- 目标是猪人，使用对应的战斗台词
+end
+```
+
+为什么不直接 `target.prefab == "pig"`？因为饥荒有很多种猪相关的 prefab——`pigman`、`pigking`、`pigguard`、`pighouse` 等。`string.find` 能一次匹配所有包含 `"pig"` 的名字。
+
+**用模式提取路径中的文件名**
+
+```lua
+-- 来自 scripts/mainfunctions.lua —— 从路径中提取 prefab 名
+function SpawnPrefabFromSim(name)
+    name = string.sub(name, string.find(name, "[^/]*$"))
+    name = string.lower(name)
+    -- ...
+end
+```
+
+`[^/]*$` 的意思是"从最后一个 `/` 之后到字符串末尾的所有字符"。`[^/]` 表示"不是 `/` 的任意字符"，`*` 表示重复，`$` 锚定到末尾。
+
+所以如果 `name = "prefabs/axe"`，`string.find` 返回的起始位置就是 `a` 的位置，`string.sub` 从那里截取，得到 `"axe"`。
+
+**查找字面的特殊字符**
+
+```lua
+-- 来自 scripts/prefabs/wagboss_util.lua —— 解析 "tx.ty" 格式的坐标
+local function IdToTileCoords(id)
+    local sep = string.find(id, "%.")  -- %.  匹配字面的点号
+    return tonumber(string.sub(id, 1, sep - 1)),
+           tonumber(string.sub(id, sep + 1))
+end
+-- IdToTileCoords("15.23") 返回 15, 23
+```
+
+如果不写 `%.` 而写 `.`，就变成"匹配任意字符"了，第一个字符就会被匹配到。
+
+### 1.7.3 string.match——提取匹配的内容
+
+`string.match(s, pattern)` 不返回位置，而是直接返回匹配到的**内容**。如果模式中有**捕获组**（用圆括号括起来的部分），则返回捕获的内容。
+
+**不带捕获——返回整个匹配**
+
+```lua
+-- 来自 scripts/containers.lua —— 检查物品是否是种子（名字以 _seeds 结尾）
+function params.seedpouch.itemtestfn(container, item, slot)
+    return item.prefab == "seeds"
+        or string.match(item.prefab, "_seeds")
+        or item:HasTag("treeseed")
+end
+```
+
+如果 `item.prefab` 中包含 `"_seeds"`，`string.match` 返回 `"_seeds"`（真值），否则返回 `nil`（假值）。
+
+**带捕获——提取你需要的部分**
+
+```lua
+-- 来自 scripts/builtinusercommands.lua —— 解析骰子表达式 "2d6"
+local dice, sides = string.match(params.dice, "(%d+)[dD](%d+)")
+-- params.dice = "2d6" → dice = "2", sides = "6"
+-- params.dice = "3D20" → dice = "3", sides = "20"
+```
+
+`(%d+)` 是一个**捕获组**——圆括号内的部分会被单独返回。`%d+` 匹配一个或多个数字。`[dD]` 匹配字母 d 或 D。
+
+所以整个模式的含义是："一个或多个数字，然后 d 或 D，然后一个或多个数字"，两个 `()` 分别捕获前后两个数字。
+
+**链式 match——逐步剥离**
+
+```lua
+-- 来自 scripts/prefabs/wormwood.lua —— 从皮肤名中提取信息
+local skin_build = string.match(
+    inst.AnimState:GetSkinBuild() or "", "wormwood(_.+)") or ""
+skin_build = skin_build:match("(.*)_build$") or skin_build
+skin_build = skin_build:match("(.*)_stage_?%d$") or skin_build
+```
+
+第一步：从完整的皮肤构建名中提取 `wormwood` 后面的部分（`_victorian` 等）
+第二步：去掉可能存在的 `_build` 后缀
+第三步：去掉可能存在的 `_stage1`、`_stage2` 等后缀
+
+每一步的 `or skin_build` 保证如果匹配失败就保留原值。这种"链式剥离"是处理复杂字符串格式的常见技巧。
+
+**用 match 提取数字**
+
+```lua
+-- 来自 scripts/prefabs/hats.lua —— 从南瓜帽皮肤名中提取变体编号
+local base = skin_build and tonumber(string.match(skin_build, "^pumpkinhat_(%d)")) or 1
+-- skin_build = "pumpkinhat_3" → base = 3
+-- skin_build = nil → base = 1
+```
+
+**从房间 ID 中提取数字**
+
+```lua
+-- 来自 scripts/prefabs/vaultroom_defs.lua
+local _, n = string.match(roomid, "^(hall)(%d+)")
+roomid = tonumber(n)
+-- roomid = "hall3" → n = "3" → roomid = 3
+```
+
+### 1.7.4 string.gmatch——迭代所有匹配
+
+`string.gmatch(s, pattern)` 返回一个迭代器，每次迭代返回下一个匹配。它通常和 `for` 循环配合使用，非常适合"把一个字符串按分隔符拆开"的场景。
+
+**按分隔符拆分字符串**
+
+```lua
+-- 来自 scripts/componentutil.lua —— 把拓扑 ID 按 : 和 / 拆分
+local function SplitTopologyId(s)
+    local a = {}
+    for word in string.gmatch(s, '[^/:]+') do
+        a[#a + 1] = word
+    end
+    return a
+end
+-- SplitTopologyId("BG_NOISE:3/ROOM_A") → {"BG_NOISE", "3", "ROOM_A"}
+```
+
+`[^/:]+` 表示"一个或多个非 `:` 非 `/` 的字符"。`gmatch` 会逐个找出所有匹配的子串。
+
+**按分隔符遍历路径**
+
+```lua
+-- 来自 scripts/klump.lua —— 按字符串路径逐层下钻表结构
+local s = _G
+for i in string.gmatch(string_id, "[%w_]+") do
+    s = s[i]
+end
+-- string_id = "STRINGS.NAMES.AXE" → 依次访问 _G["STRINGS"]["NAMES"]["AXE"]
+```
+
+`[%w_]+` 匹配"一个或多个字母、数字或下划线"，正好对应 Lua 标识符的格式。点号不在字符集里，自然被当做分隔符跳过了。
+
+### 1.7.5 string.gsub——查找并替换
+
+`string.gsub(s, pattern, replacement)` 是最强大的字符串函数——它找到所有匹配模式的部分，替换成指定内容。返回两个值：替换后的字符串和替换次数。
+
+**简单替换——去掉不需要的部分**
+
+```lua
+-- 来自 scripts/cookbookdata.lua —— 从食材名中去掉 "cooked" 相关前后缀
+function CookbookData:RemoveCookedFromName(ingredients)
+    local ret = {}
+    for i, v in ipairs(ingredients) do
+        local str = v
+        str = string.gsub(str, "_cooked_", "")
+        str = string.gsub(str, "cooked_", "")
+        str = string.gsub(str, "_cooked", "")
+        str = string.gsub(str, "cooked", "")
+        table.insert(ret, str)
+    end
+    return ret
+end
+-- "meat_cooked" → "meat"
+-- "cooked_fish" → "fish"
+```
+
+为什么要写这么多条 `gsub` 而不是一条？因为 `_cooked_` 出现在词中间、`cooked_` 出现在开头、`_cooked` 出现在结尾是不同的情况，需要分别处理以避免误删。
+
+**用捕获组引用替换——去掉首尾空白**
+
+```lua
+-- 来自 scripts/screens/redux/serverlistingscreen.lua
+token = string.gsub(token, "^%s*(.-)%s*$", "%1")
+```
+
+这就是 Lua 版的 `trim()` 函数。`^%s*` 匹配开头的空白，`%s*$` 匹配末尾的空白，`(.-)` 非贪婪地捕获中间的内容。`%1` 引用第一个捕获组的内容。
+
+**用函数作为替换——高级替换逻辑**
+
+`gsub` 的第三个参数可以是一个函数。每次匹配成功时，用匹配到的内容调用这个函数，函数的返回值作为替换结果。
+
+```lua
+-- 来自 scripts/stringutil.lua —— 花括号模板替换
+function subfmt(s, tab)
+    return (s:gsub('(%b{})', function(w) return tab[w:sub(2, -2)] or w end))
+end
+
+-- 使用示例：
+subfmt("这是一个{adjective}的字符串，读了{number}遍！",
+    {adjective = "有趣", number = "三"})
+-- → "这是一个有趣的字符串，读了三遍！"
+```
+
+`%b{}` 是 Lua 特有的**平衡匹配**模式——它匹配一对配对的 `{` 和 `}`，包括内容。`w:sub(2, -2)` 去掉首尾的花括号，剩下的作为键在 `tab` 中查找。
+
+这个 `subfmt` 函数在饥荒中被广泛使用，用于台词中的变量插值：
+
+```lua
+-- 实际使用：钓鱼称重播报
+local str = subfmt(GetString(inst, "ANNOUNCE_WEIGHT"), {weight = string.format("%0.2f", weight)})
+inst.components.talker:Say(str)
+-- → "哇！这条鱼重 3.50 磅！"
+```
+
+**用函数回调实现复杂替换——深层表赋值**
+
+```lua
+-- 来自 scripts/util.lua —— 按点号路径设置深层 table 的值
+string.gsub(Name, '([^%.]+)(%.*)',
+    function(Word, Delimiter)
+        if Delimiter == '.' then
+            if type(Table[Word]) ~= 'table' then
+                Table[Word] = {}
+            end
+            Table = Table[Word]
+        else
+            Key = Key .. Word .. Delimiter
+        end
+    end)
+```
+
+这段代码把 `"STRINGS.NAMES.AXE"` 这样的路径逐段拆开，一层层深入 table 结构。`([^%.]+)` 捕获点号之间的标识符，`(%.*) ` 捕获后面的点号（如果有的话）。
+
+### 1.7.6 string.format——格式化输出
+
+虽然 `string.format` 不涉及模式匹配，但它是字符串操作中最常用的函数之一，在前面章节已经简单提过。这里补充一些饥荒中的高级用法：
+
+**控制数字显示精度**
+
+```lua
+-- 来自 scripts/widgets/itemtile.lua —— 物品耐久度百分比显示
+self.percent:SetString(string.format("%2.0f%%", val_to_show))
+-- val_to_show = 73.5 → "74%"
+-- %2.0f  = 最少 2 位宽，0 位小数
+-- %%     = 字面的百分号
+```
+
+```lua
+-- 来自 scripts/stategraphs/SGwilson.lua —— 鱼的重量精确到两位小数
+local str = subfmt(GetString(inst, "ANNOUNCE_WEIGHT"),
+    {weight = string.format("%0.2f", weight)})
+-- weight = 3.5 → "3.50"
+```
+
+**零填充的编号**
+
+```lua
+-- 来自 scripts/recipes.lua —— 图片资源名用 4 位零填充编号
+image = string.format("%s%04d.tex", partname, variation)
+-- partname = "dial", variation = 3 → "dial0003.tex"
+```
+
+**调试信息格式化**
+
+```lua
+-- 来自 scripts/vector3.lua
+function Vector3:__tostring()
+    return string.format("(%2.2f, %2.2f, %2.2f)", self.x, self.y, self.z)
+end
+-- Vector3(1.5, 0, -3.7) → "(1.50, 0.00, -3.70)"
+```
+
+常用的格式符总结：
+
+| 格式符 | 含义 | 示例 |
+|--------|------|------|
+| `%d` | 十进制整数 | `string.format("%d", 42)` → `"42"` |
+| `%f` | 浮点数 | `string.format("%.2f", 3.14)` → `"3.14"` |
+| `%s` | 字符串 | `string.format("%s", "axe")` → `"axe"` |
+| `%x` | 十六进制 | `string.format("%x", 255)` → `"ff"` |
+| `%04d` | 4 位零填充 | `string.format("%04d", 7)` → `"0007"` |
+| `%%` | 字面 `%` | `string.format("100%%")` → `"100%"` |
+
+### 1.7.7 面向对象风格的字符串方法
+
+Lua 的字符串库有一个方便的特性——你可以用冒号语法直接在字符串上调用方法：
+
+```lua
+local s = "Hello World"
+
+-- 这两种写法等价
+string.find(s, "World")
+s:find("World")
+
+-- 更多例子
+s:lower()                    -- "hello world"
+s:upper()                    -- "HELLO WORLD"
+s:sub(1, 5)                  -- "Hello"
+s:match("(%w+)")             -- "Hello"
+s:gsub("World", "Lua")       -- "Hello Lua"
+s:len()                      -- 11
+```
+
+饥荒源码中两种风格都有使用：
+
+```lua
+-- 来自 scripts/prefabs/wormwood.lua —— 冒号风格
+skin_build = skin_build:match("(.*)_build$") or skin_build
+if skin_build:len() > 0 then
+
+-- 来自 scripts/stringutil.lua —— 冒号风格
+return str:gsub("^%l", string.upper)
+```
+
+### 1.7.8 实用技巧——Mod 开发中的常见模式匹配场景
+
+**判断 prefab 名是否属于某类**
+
+```lua
+-- 判断是否是食物：所有食物的 prefab 名都以 _cooked 结尾或包含 food
+if string.find(inst.prefab, "_cooked") then
+    print("这是一个烹饪过的食物")
+end
+
+-- 判断是否是某系列的 prefab（比如所有蜘蛛）
+if string.match(inst.prefab, "^spider") then
+    print("这是某种蜘蛛")
+end
+```
+
+**从复合字符串中提取数据**
+
+```lua
+-- 假设一个自定义系统用 "item:count" 格式存储数据
+local itemname, count = string.match(data, "^(%w+):(%d+)$")
+count = tonumber(count)
+```
+
+**批量处理字符串列表**
+
+```lua
+-- 把一串用逗号分隔的 tag 变成 table
+local tags = {}
+for tag in string.gmatch("sharp,weapon,tool", "[^,]+") do
+    table.insert(tags, tag)
+end
+-- tags = {"sharp", "weapon", "tool"}
+```
+
+**安全地拼接字符串**
+
+```lua
+-- 生成有编号的唯一名称
+for i = 1, 10 do
+    local name = string.format("mymod_item_%02d", i)
+    -- "mymod_item_01", "mymod_item_02", ..., "mymod_item_10"
+end
+```
+
+### 1.7.9 Lua 模式 vs 正则表达式——区别与限制
+
+如果你有其他语言的经验，这里列出 Lua 模式和正则表达式的主要区别：
+
+| 特性 | 正则表达式 | Lua 模式 |
+|------|-----------|---------|
+| 或（alternation）| `a\|b` | 不支持（需要多次匹配）|
+| 分组 | `(...)` | `(...)` 用于捕获，不可嵌套量词 |
+| 量词 | `{n,m}` | 不支持（只有 `*`、`+`、`-`、`?`）|
+| 反向引用 | `\1` | `%1`（仅在 `gsub` 的替换字符串中）|
+| 字符类 | `\d`、`\w` | `%d`、`%w`（用 `%` 代替 `\`）|
+| 平衡匹配 | 不内置 | `%b()` 匹配配对括号 |
+| 非贪婪 | `*?`、`+?` | `-`（只有一种非贪婪量词）|
+
+最大的限制是**没有"或"运算符**。在正则中你可以写 `cat|dog`，但在 Lua 模式中你需要分两次匹配：
+
+```lua
+-- Lua 中没法一个模式同时匹配 "cat" 或 "dog"
+if string.find(s, "cat") or string.find(s, "dog") then
+    print("找到了猫或狗")
+end
+```
+
+对于饥荒 Mod 开发来说，这些限制很少成为真正的问题——游戏中的字符串格式通常很规则，简单的模式匹配完全够用。
+
+---
+
+> **本节小结**
+> - Lua 模式匹配用 `%` 作转义字符，`%d` 匹配数字、`%a` 匹配字母、`%.` 匹配字面点号
+> - `string.find` 返回匹配位置，常用于"是否包含"的判断
+> - `string.match` 返回匹配内容，配合捕获组 `()` 提取子串
+> - `string.gmatch` 返回迭代器，适合按分隔符拆分字符串
+> - `string.gsub` 查找并替换，第三个参数可以是字符串、表或函数
+> - `string.format` 用于格式化输出，支持精度控制、零填充等
+> - 饥荒中大量使用模式匹配来解析 prefab 名、皮肤名、拓扑 ID、翻译文件等
+> - `subfmt` 是饥荒提供的花括号模板替换工具，广泛用于台词插值
 
 ## 1.8 弱引用表（Weak Table）——避免内存泄漏的利器
 
