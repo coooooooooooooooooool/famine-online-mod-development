@@ -4589,7 +4589,375 @@ end)
 
 ## 2.12 STRINGS 系统——游戏文本的组织结构与访问方式
 
-（待编写）
+游戏中每一句文字——物品名称、制作描述、角色台词、UI 按钮、系统提示——都来自一个巨大的嵌套表：`STRINGS`。理解它的结构，是做出"能说话"的 Mod 的基础。
+
+### 2.12.1 STRINGS 表的整体结构
+
+> **给新手的类比**：`STRINGS` 就像一本超级字典——按"分类 → 子分类 → 具体词条"的方式组织。你想知道一把斧头叫什么？翻到"名称"分类，找到"AXE"条目。
+
+`STRINGS` 定义在 `scripts/strings.lua` 中，是一个超过 18000 行的巨型嵌套表：
+
+```lua
+STRINGS = {
+    CHARACTER_NAMES = { ... },    -- 角色的显示名
+    CHARACTER_QUOTES = { ... },   -- 角色选择界面的引言
+    NAMES = { ... },              -- 所有物品/实体的名称
+    RECIPE_DESC = { ... },        -- 制作配方的描述
+    CHARACTERS = { ... },         -- 每个角色的台词（检查、动作失败等）
+    UI = { ... },                 -- UI 界面文本
+    ACTIONS = { ... },            -- 动作名称
+    -- ... 更多分类
+}
+```
+
+### 2.12.2 NAMES——物品和实体的名称
+
+```lua
+STRINGS.NAMES = {
+    DEFAULT = "INVENTORY ITEM",
+    NONE = "Nothing",
+    LUCY = "Lucy the Axe",
+    AXE = "Axe",
+    GOLDENAXE = "Luxury Axe",
+    SPEAR = "Spear",
+    FIREPIT = "Fire Pit",
+    -- ... 数千个条目
+}
+```
+
+**键名规则**：使用 **prefab 名称的大写形式**。`"axe"` prefab 的名称就是 `STRINGS.NAMES.AXE`。
+
+当你在游戏中看到一个物品的名字时，这个过程是：
+
+```lua
+-- entityscript.lua 中的 GetBasicDisplayName
+function EntityScript:GetBasicDisplayName()
+    return self.name                     -- 如果有自定义 name
+        or STRINGS.NAMES[string.upper(self.prefab)]  -- 否则从 STRINGS 查
+end
+```
+
+### 2.12.3 RECIPE_DESC——制作配方描述
+
+```lua
+STRINGS.RECIPE_DESC = {
+    AXE = "Keep your eye on the birdie.",
+    SPEAR = "A good poking stick.",
+    FIREPIT = "A nice fire to sit around.",
+    BOOK_BIRDS = "1000 species: habits, habitats, and calls.",
+    -- ...
+}
+```
+
+这些文本显示在制作栏中物品名称下方的描述区域。
+
+### 2.12.4 CHARACTERS——角色的台词
+
+这是 STRINGS 中最庞大的部分。每个角色有自己独立的台词文件：
+
+```lua
+-- scripts/strings.lua
+STRINGS.CHARACTERS = {
+    GENERIC = require "speech_wilson",       -- 威尔逊（也是默认模板）
+    WAXWELL = require "speech_waxwell",      -- 麦斯威尔
+    WOLFGANG = require "speech_wolfgang",    -- 沃尔夫冈
+    WILLOW = require "speech_willow",        -- 薇洛
+    WENDY = require "speech_wendy",          -- 温蒂
+    -- ... 每个角色一个文件
+}
+```
+
+每个角色的台词文件（如 `speech_wilson.lua`）结构如下：
+
+```lua
+-- scripts/speech_wilson.lua（返回一个 table）
+return {
+    ACTIONFAIL = {              -- 动作失败时的台词
+        ACTIVATE = {
+            LOCKED_GATE = "The gate is locked.",
+        },
+        CHOP = {
+            PROTECTED_TREE = "I can't bring myself to do it.",
+        },
+    },
+
+    DESCRIBE = {                -- 检查/描述物品时的台词
+        AXE = "That's a fine axe.",
+        SPEAR = "Pointy!",
+        FIREPIT = {             -- 有些物品有多种状态
+            EMBERS = "I could stoke it a bit.",
+            GENERIC = "That's one fine fire.",
+            HIGH = "That fire is getting out of hand!",
+            NORMAL = "Nice and toasty.",
+            OUT = "The fire's gone out.",
+        },
+    },
+
+    ANNOUNCE_HUNGRY = "I could go for some food right about now.",
+    ANNOUNCE_STARVING = "I'm starving!",
+    -- ...
+}
+```
+
+**GENERIC vs 角色名**：`STRINGS.CHARACTERS.GENERIC` 是威尔逊的台词，同时也是"默认模板"——如果某个角色的台词文件没有定义某句话，就会使用 GENERIC 中的。
+
+当角色检查一个物品时，游戏的查找过程是：
+
+```lua
+-- 简化逻辑
+local character = string.upper(inst.prefab)   -- 如 "WILSON"
+local item_name = string.upper(target.prefab) -- 如 "AXE"
+
+-- 先查角色专属台词
+local speech = STRINGS.CHARACTERS[character]
+    and STRINGS.CHARACTERS[character].DESCRIBE
+    and STRINGS.CHARACTERS[character].DESCRIBE[item_name]
+
+-- 如果没有，查通用台词
+if speech == nil then
+    speech = STRINGS.CHARACTERS.GENERIC.DESCRIBE[item_name]
+end
+```
+
+### 2.12.5 UI——界面文本
+
+```lua
+STRINGS.UI = {
+    HUD = {
+        HUNGER = "Hunger",
+        HEALTH = "Health",
+        SANITY = "Sanity",
+        SPOILED = "Stale",
+        -- ...
+    },
+    CRAFTING = {
+        NEEDSCIENCEMACHINE = "Locked until prototyped",
+        -- ...
+    },
+    MAINSCREEN = {
+        PLAY = "Play!",
+        -- ...
+    },
+}
+```
+
+### 2.12.6 本地化系统——如何翻译
+
+饥荒使用标准的 **PO 文件**（GNU gettext 格式）进行翻译。流程是：
+
+```
+1. strings.lua 定义英文原文（STRINGS 表）
+2. createstringspo.lua 工具提取出 strings.pot 模板
+3. 翻译者用 POEdit 等工具翻译为 .po 文件
+4. 游戏启动时加载 .po 文件
+5. TranslateStringTable 用翻译覆盖 STRINGS 表中的英文
+```
+
+**翻译的内部实现**（`scripts/translator.lua`）：
+
+```lua
+-- 全局翻译器
+LanguageTranslator = Translator()
+
+-- 递归遍历 STRINGS 表的每个字段
+local function DoTranslateStringTable(base, tbl)
+    for k, v in pairs(tbl) do
+        local path = base .. "." .. k       -- 如 "STRINGS.NAMES.AXE"
+        if type(v) == "table" then
+            DoTranslateStringTable(path, v)  -- 递归子表
+        else
+            -- 用路径查找翻译
+            local str = LanguageTranslator:GetTranslatedString(path)
+            if str and str ~= "" then
+                tbl[k] = str                 -- 用翻译替换英文
+            end
+        end
+    end
+end
+
+function TranslateStringTable(tbl)
+    DoTranslateStringTable("STRINGS", tbl)
+end
+```
+
+翻译查找的 key 是 **表的完整路径**（如 `STRINGS.NAMES.AXE`），这就是为什么 PO 文件中的 `msgctxt` 是路径格式。
+
+### 2.12.7 Mod 中添加文本
+
+#### 添加物品名称和描述
+
+```lua
+-- 在 modmain.lua 中
+-- 方法 1：直接赋值（最简单）
+STRINGS.NAMES.MYMOD_SWORD = "Flame Sword"
+STRINGS.RECIPE_DESC.MYMOD_SWORD = "A blade wreathed in fire."
+
+-- 方法 2：使用 GLOBAL（沙箱环境中）
+GLOBAL.STRINGS.NAMES.MYMOD_SWORD = "Flame Sword"
+```
+
+#### 添加角色检查台词
+
+```lua
+-- 所有角色的通用台词
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYMOD_SWORD = "It burns with an inner fire!"
+
+-- 特定角色的专属台词
+STRINGS.CHARACTERS.WILLOW.DESCRIBE.MYMOD_SWORD = "Ooh, fire AND pointy!"
+STRINGS.CHARACTERS.WOLFGANG.DESCRIBE.MYMOD_SWORD = "Is mighty fire sword!"
+```
+
+#### 添加角色的动作失败台词
+
+```lua
+STRINGS.CHARACTERS.GENERIC.ACTIONFAIL.MYACTION = {
+    REASON1 = "I can't do that right now.",
+    REASON2 = "That doesn't seem right.",
+}
+```
+
+#### 多语言支持
+
+如果你的 Mod 想支持多语言，可以加载自己的 PO 文件：
+
+```lua
+-- 在 modmain.lua 中
+-- modutil.lua 提供了 LoadPOFile 函数
+local _G = GLOBAL
+local lang = _G.TheNet:GetLanguageCode()  -- 获取当前语言代码
+
+if lang == "zh" or lang == "zhr" then
+    -- 中文
+    STRINGS.NAMES.MYMOD_SWORD = "烈焰之剑"
+    STRINGS.RECIPE_DESC.MYMOD_SWORD = "被火焰包裹的刀刃。"
+    STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYMOD_SWORD = "它燃烧着内在的火焰！"
+elseif lang == "ja" then
+    -- 日文
+    STRINGS.NAMES.MYMOD_SWORD = "炎の剣"
+end
+
+-- 或者使用 PO 文件（更规范的方式）
+-- modutil 里提供的 API
+-- env.LoadPOFile("scripts/languages/zh.po", "zh")
+```
+
+### 2.12.8 STRINGS 表的访问模式
+
+游戏中不同系统访问 STRINGS 的方式：
+
+```lua
+-- 1. 物品名称（自动通过 prefab 名查找）
+-- entityscript.lua 内部自动做 STRINGS.NAMES[string.upper(prefab)]
+-- 你只需要确保 STRINGS.NAMES.XXX 存在即可
+
+-- 2. 制作描述（制作系统自动查找）
+-- 制作 UI 自动做 STRINGS.RECIPE_DESC[string.upper(prefab)]
+
+-- 3. 角色台词（talker/inspectable 系统查找）
+-- 基于角色的 prefab 名和目标的 prefab 名
+
+-- 4. 手动查找（你自己在代码中使用）
+local name = STRINGS.NAMES.AXE or "Unknown"
+local desc = STRINGS.CHARACTERS.GENERIC.DESCRIBE.AXE or "..."
+```
+
+### 2.12.9 有状态的台词——table 形式
+
+有些物品的台词不是一个字符串，而是一个 table——因为物品在不同状态下有不同台词：
+
+```lua
+-- 营火有多种状态
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.FIREPIT = {
+    EMBERS = "I could stoke it a bit.",
+    GENERIC = "That's one fine fire.",
+    HIGH = "That fire is getting out of hand!",
+    NORMAL = "Nice and toasty.",
+    OUT = "The fire's gone out.",
+}
+```
+
+游戏通过实体的 `GetStatus` 函数返回当前状态名来选择正确的台词：
+
+```lua
+-- inspectable 组件的逻辑（简化）
+local status = self.getstatus and self:getstatus(inst) or nil
+local character = string.upper(viewer.prefab)
+local prefab = string.upper(inst.prefab)
+
+if status then
+    speech = STRINGS.CHARACTERS[character].DESCRIBE[prefab][status]
+else
+    speech = STRINGS.CHARACTERS[character].DESCRIBE[prefab]
+    if type(speech) == "table" then
+        speech = speech.GENERIC
+    end
+end
+```
+
+在你的 Mod 物品中使用状态台词：
+
+```lua
+-- prefab 中
+inst:AddComponent("inspectable")
+inst.components.inspectable.getstatus = function(inst)
+    if inst.components.fueled:IsEmpty() then
+        return "EMPTY"
+    elseif inst.components.fueled:GetPercent() < 0.2 then
+        return "LOW"
+    end
+    -- 不返回值 = 使用 GENERIC
+end
+
+-- strings 中
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYMOD_LAMP = {
+    GENERIC = "A lovely lamp.",
+    LOW = "The fuel's getting low.",
+    EMPTY = "It's all out of fuel.",
+}
+```
+
+### 2.12.10 随机台词——table 中的数组形式
+
+有些物品的台词是随机的——同一个物品每次检查说不同的话：
+
+```lua
+-- 如果 DESCRIBE 项是一个数组（没有字符串 key 的 table），则随机选一句
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYMOD_CRYSTAL = {
+    "It sparkles in the light.",
+    "I wonder what's inside.",
+    "Such a beautiful crystal!",
+}
+```
+
+### 2.12.11 speech 文件的设计哲学
+
+为什么每个角色要有独立的台词文件？
+
+1. **个性化**——每个角色看到同一个东西说不同的话，是饥荒的核心魅力之一
+2. **模块化**——翻译者可以单独翻译一个角色的文件，不影响其他角色
+3. **模板继承**——`speech_wilson.lua` 作为 GENERIC 模板，其他角色只需要覆盖不同的部分
+
+文件头的注释清楚说明了这个设计：
+
+```lua
+-- speech_wilson.lua
+-- This file is the template for other speech files.
+-- Once a new string is added here, simply run PropagateSpeech.bat
+```
+
+Klei 有一个工具（`PropagateSpeech.bat`）会自动把 Wilson 的新台词模板同步到其他角色的文件中。
+
+---
+
+> **本节小结**
+> - `STRINGS` 是游戏中所有文本的巨型嵌套表，定义在 `strings.lua`（18000+ 行）
+> - `STRINGS.NAMES.XXX`：物品名称，XXX 是 prefab 名的大写
+> - `STRINGS.RECIPE_DESC.XXX`：制作描述
+> - `STRINGS.CHARACTERS.角色名.DESCRIBE.XXX`：角色检查物品的台词
+> - 台词可以是字符串（单一台词）、table 带 key（状态台词）、或数组（随机台词）
+> - 本地化通过 PO 文件 + `TranslateStringTable` 实现，用路径（如 `STRINGS.NAMES.AXE`）作为翻译 key
+> - Mod 中直接赋值 `STRINGS.NAMES.XXX = "..."` 即可添加文本
+> - 多语言支持：通过 `TheNet:GetLanguageCode()` 判断语言，或加载 PO 文件
 
 ## 2.13 数据驱动设计模式——tuning.lua / recipes.lua / containers.lua 的设计哲学
 
