@@ -4183,7 +4183,409 @@ local SpawnPrefab = _G.SpawnPrefab
 
 ## 2.11 定时任务详解：DoTaskInTime、DoPeriodicTask、Timer 组件
 
-（待编写）
+前面的章节已经从调度器底层（2.8）和游戏循环（2.7）的角度介绍了定时任务的运作原理。本节将从**使用者的角度**深入讲解：什么时候用哪个 API、它们之间的区别、以及 Timer 组件如何在此基础上提供更高级的功能。
+
+### 2.11.1 定时任务家族速览
+
+饥荒提供了三个层次的定时机制：
+
+```
+底层 ←────────────────────────────────→ 高层
+
+Scheduler                EntityScript API            Timer 组件
+(scheduler.lua)          (entityscript.lua)          (components/timer.lua)
+                                                     
+ExecuteInTime()  ──→  DoTaskInTime()      ──→  StartTimer()
+ExecutePeriodic()──→  DoPeriodicTask()          PauseTimer()
+                      DoStaticTaskInTime()       ResumeTimer()
+                      DoStaticPeriodicTask()     SetTimeLeft()
+                                                 OnSave/OnLoad ✓
+```
+
+选择哪个取决于你的需求：
+- **简单的延迟/周期执行**：用 `DoTaskInTime` / `DoPeriodicTask`
+- **需要暂停/恢复/查询剩余时间**：用 `Timer` 组件
+- **需要跨存档保持**：用 `Timer` 组件（自带 OnSave/OnLoad）
+
+### 2.11.2 DoTaskInTime——"过一会儿执行"
+
+```lua
+local task = inst:DoTaskInTime(time, fn, ...)
+```
+
+| 参数 | 说明 |
+|---|---|
+| `time` | 延迟时间（秒） |
+| `fn` | 回调函数，签名：`fn(inst, ...)` |
+| `...` | 传递给回调的额外参数 |
+| 返回值 | `Periodic` 对象（可用于取消） |
+
+```lua
+-- 示例 1：3 秒后爆炸
+inst:DoTaskInTime(3, function(inst)
+    inst.components.explosive:OnBurnt()
+end)
+
+-- 示例 2：延迟 0 帧——"下一帧执行"
+-- 常用于避免在当前帧的回调中修改正在遍历的数据
+inst:DoTaskInTime(0, function(inst)
+    inst:Remove()   -- 不在当前回调中直接删除，而是下帧删
+end)
+
+-- 示例 3：带额外参数
+inst:DoTaskInTime(2, function(inst, target, damage)
+    if target:IsValid() then
+        target.components.health:DoDelta(-damage)
+    end
+end, target, 50)
+
+-- 取消任务
+local task = inst:DoTaskInTime(5, some_function)
+task:Cancel()   -- 取消，不会执行
+```
+
+**关键行为**：
+- 回调的第一个参数始终是 `inst`（发起 DoTaskInTime 的实体）
+- 实体被 `Remove()` 时，所有 pending 的 task 自动取消
+- `time = 0` 不是"立即执行"，而是"最早下一帧执行"
+
+### 2.11.3 DoPeriodicTask——"每隔一段时间执行"
+
+```lua
+local task = inst:DoPeriodicTask(period, fn, initialdelay, ...)
+```
+
+| 参数 | 说明 |
+|---|---|
+| `period` | 周期间隔（秒） |
+| `fn` | 回调函数，签名：`fn(inst, ...)` |
+| `initialdelay` | 首次执行前的延迟（nil = 等待一个周期后首次执行） |
+| `...` | 传递给回调的额外参数 |
+
+```lua
+-- 示例 1：每 5 秒检查附近是否有敌人
+local patrol_task = inst:DoPeriodicTask(5, function(inst)
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local enemies = TheSim:FindEntities(x, y, z, 15, {"_combat"}, {"player"})
+    if #enemies > 0 then
+        inst.components.combat:SetTarget(enemies[1])
+    end
+end)
+
+-- 示例 2：立即执行第一次，然后每 10 秒重复
+inst:DoPeriodicTask(10, function(inst)
+    inst.components.health:DoDelta(5)  -- 每 10 秒恢复 5 点血
+end, 0)   -- initialdelay = 0 → 立即执行首次
+
+-- 示例 3：3 秒后开始，然后每 10 秒重复
+inst:DoPeriodicTask(10, function(inst)
+    print("periodic!")
+end, 3)   -- initialdelay = 3 → 3 秒后首次执行
+
+-- 停止周期任务
+patrol_task:Cancel()
+```
+
+**常见陷阱**：
+
+```lua
+-- ❌ 忘记保存引用，之后无法取消
+inst:DoPeriodicTask(1, function(inst)
+    print("can't stop me!")
+end)
+
+-- ✅ 保存引用
+inst._my_task = inst:DoPeriodicTask(1, function(inst)
+    print("can be stopped")
+end)
+-- 之后取消
+if inst._my_task then
+    inst._my_task:Cancel()
+    inst._my_task = nil
+end
+```
+
+### 2.11.4 Static 版本——不受暂停影响
+
+```lua
+inst:DoStaticTaskInTime(time, fn, ...)
+inst:DoStaticPeriodicTask(period, fn, initialdelay, ...)
+```
+
+与普通版本的唯一区别：使用 `staticScheduler` 而非 `scheduler`，因此：
+- **不受游戏暂停影响**——暂停时仍然计时
+- **不受时间缩放影响**——使用真实墙钟时间
+
+```lua
+-- 典型用途：UI 相关的定时器
+inst:DoStaticPeriodicTask(0.1, function(inst)
+    -- 更新 UI 动画，即使游戏暂停也要继续
+    self:UpdateAnimation()
+end)
+
+-- 典型用途：网络心跳
+inst:DoStaticPeriodicTask(30, function(inst)
+    -- 每 30 秒发送一次心跳
+    SendHeartbeat()
+end)
+```
+
+### 2.11.5 四种方法的对比
+
+| | DoTaskInTime | DoPeriodicTask | DoStaticTaskInTime | DoStaticPeriodicTask |
+|---|---|---|---|---|
+| 执行次数 | 1 次 | 无限次 | 1 次 | 无限次 |
+| 暂停时 | 停止计时 | 停止计时 | 继续计时 | 继续计时 |
+| 时间缩放 | 受影响 | 受影响 | 不受影响 | 不受影响 |
+| 可取消 | `.Cancel()` | `.Cancel()` | `.Cancel()` | `.Cancel()` |
+| 自动清理 | 实体 Remove 时 | 实体 Remove 时 | 实体 Remove 时 | 实体 Remove 时 |
+| 可暂停/恢复 | 不可 | 不可 | 不可 | 不可 |
+| 存档支持 | 无 | 无 | 无 | 无 |
+
+注意最后两行——`DoTaskInTime` 系列**不支持暂停/恢复**，也**不支持存档**。如果你需要这些功能，就该用 Timer 组件。
+
+### 2.11.6 Timer 组件——可暂停、可存档的定时器
+
+`Timer` 组件（`scripts/components/timer.lua`）是在 `DoTaskInTime` 之上构建的高级定时器系统。
+
+#### 基本使用
+
+```lua
+-- 确保实体有 timer 组件
+inst:AddComponent("timer")
+
+-- 启动一个 60 秒的定时器
+inst.components.timer:StartTimer("respawn_cooldown", 60)
+
+-- 监听定时器完成事件
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "respawn_cooldown" then
+        print("Cooldown is over!")
+        inst:Respawn()
+    end
+end)
+```
+
+#### API 详解
+
+```lua
+-- 启动定时器
+timer:StartTimer(name, time, paused, initialtime_override)
+-- name: 定时器名称（字符串，唯一标识）
+-- time: 持续时间（秒）
+-- paused: 是否以暂停状态启动
+-- initialtime_override: 覆盖"初始时间"（用于计算已过时间）
+
+-- 停止定时器（取消，不触发 timerdone 事件）
+timer:StopTimer(name)
+
+-- 暂停/恢复
+timer:PauseTimer(name)
+timer:ResumeTimer(name)
+
+-- 查询
+timer:TimerExists(name)        -- 定时器是否存在
+timer:IsPaused(name)           -- 是否暂停
+timer:GetTimeLeft(name)        -- 剩余时间（秒）
+timer:GetTimeElapsed(name)     -- 已经过的时间（秒）
+
+-- 修改剩余时间
+timer:SetTimeLeft(name, time)
+```
+
+#### Timer 的内部实现
+
+Timer 组件本质上是对 `DoTaskInTime` 的包装，加上了暂停/恢复和存档的能力：
+
+```lua
+-- scripts/components/timer.lua（核心逻辑）
+function Timer:StartTimer(name, time, paused)
+    self.timers[name] = {
+        timer = self.inst:DoTaskInTime(time, OnTimerDone, self, name),
+        timeleft = time,
+        end_time = GetTime() + time,
+        initial_time = time,
+        paused = false,
+    }
+    if paused then self:PauseTimer(name) end
+end
+
+-- 暂停：取消底层 DoTaskInTime，记录剩余时间
+function Timer:PauseTimer(name)
+    self:GetTimeLeft(name)        -- 先更新 timeleft
+    self.timers[name].paused = true
+    self.timers[name].timer:Cancel()
+    self.timers[name].timer = nil
+end
+
+-- 恢复：用剩余时间重新创建 DoTaskInTime
+function Timer:ResumeTimer(name)
+    self.timers[name].paused = false
+    self.timers[name].timer = self.inst:DoTaskInTime(
+        self.timers[name].timeleft, OnTimerDone, self, name
+    )
+    self.timers[name].end_time = GetTime() + self.timers[name].timeleft
+end
+```
+
+**暂停的本质**：取消底层的 `DoTaskInTime` 任务，把剩余时间保存到 `timeleft` 字段。恢复时用 `timeleft` 重新创建一个 `DoTaskInTime`。
+
+#### Timer 的存档支持
+
+Timer 组件自带 `OnSave` / `OnLoad`：
+
+```lua
+function Timer:OnSave()
+    local data = {}
+    for k, v in pairs(self.timers) do
+        data[k] = {
+            timeleft = self:GetTimeLeft(k),
+            paused = v.paused,
+            initial_time = v.initial_time,
+        }
+    end
+    return next(data) ~= nil and { timers = data } or nil
+end
+
+function Timer:OnLoad(data)
+    if data.timers ~= nil then
+        for k, v in pairs(data.timers) do
+            self:StopTimer(k)
+            self:StartTimer(k, v.timeleft, v.paused, v.initial_time)
+        end
+    end
+end
+```
+
+存档时保存每个定时器的剩余时间和暂停状态。读档时用保存的剩余时间重新启动定时器——**无缝恢复**。
+
+#### Timer 的 LongUpdate 支持
+
+当发生时间跳跃（跳夜、进洞穴等）时，Timer 组件也能正确处理：
+
+```lua
+function Timer:LongUpdate(dt)
+    for k, v in pairs(self.timers) do
+        self:SetTimeLeft(k, self:GetTimeLeft(k) - dt)
+    end
+end
+```
+
+如果一个 60 秒的定时器还剩 40 秒，而 `LongUpdate(dt=50)` 被调用，`SetTimeLeft` 会把剩余时间设为 `max(0, 40-50) = 0`，立刻触发完成。
+
+### 2.11.7 WorldSettingsTimer——世界级定时器
+
+`WorldSettingsTimer`（`scripts/components/worldsettingstimer.lua`）是 Timer 的增强版，专为世界级事件设计。
+
+与普通 Timer 的区别：
+- 定时器需要先 **`AddTimer`** 声明（设定最大时间、是否启用等），然后才能 `StartTimer`
+- 支持 **enabled/disabled** 状态（可通过世界设置控制）
+- 存档时保存的是**比例**（timeleft/maxtime）而非绝对时间，这样修改 maxtime 后能自动适配
+
+```lua
+-- 用于世界级定时器（如季节事件、Boss 刷新等）
+TheWorld.components.worldsettingstimer:AddTimer(
+    "deer_refresh",          -- 定时器名称
+    TUNING.DEER_REFRESH,     -- 最大时间
+    true,                    -- 是否启用
+    OnDeerRefresh            -- 回调函数（可选，替代 timerdone 事件）
+)
+
+TheWorld.components.worldsettingstimer:StartTimer("deer_refresh", TUNING.DEER_REFRESH)
+```
+
+### 2.11.8 实际案例对比——选择合适的方案
+
+#### 案例 1：攻击冷却（不需要存档）
+
+```lua
+-- 简单冷却：DoTaskInTime 就够了
+function Combat:DoAttack(target)
+    self.inst:AddTag("attack_cooldown")
+    self.inst:DoTaskInTime(self.min_attack_period, function(inst)
+        inst:RemoveTag("attack_cooldown")
+    end)
+end
+```
+
+#### 案例 2：孵蛋倒计时（需要存档 + 可暂停）
+
+```lua
+-- 需要跨存档保持 → Timer 组件
+inst:AddComponent("timer")
+inst.components.timer:StartTimer("hatch", TUNING.EGG_HATCH_TIME)
+
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "hatch" then
+        local baby = SpawnPrefab("smallbird")
+        baby.Transform:SetPosition(inst.Transform:GetWorldPosition())
+        inst:Remove()
+    end
+end)
+
+-- 冬天暂停孵蛋
+inst:WatchWorldState("season", function(inst, season)
+    if season == "winter" then
+        inst.components.timer:PauseTimer("hatch")
+    else
+        inst.components.timer:ResumeTimer("hatch")
+    end
+end)
+```
+
+#### 案例 3：持续光环效果（需要每帧/高频检测）
+
+```lua
+-- 高频检测 → DoPeriodicTask（不需要存档，因为效果是实时的）
+inst._aura_task = inst:DoPeriodicTask(0.5, function(inst)
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local nearby = TheSim:FindEntities(x, y, z, 8, {"player"})
+    for _, player in ipairs(nearby) do
+        if player.components.health then
+            player.components.health:DoDelta(1)  -- 每 0.5 秒恢复 1 血
+        end
+    end
+end)
+
+-- 卸装时取消
+inst:ListenForEvent("unequip", function()
+    if inst._aura_task then
+        inst._aura_task:Cancel()
+        inst._aura_task = nil
+    end
+end)
+```
+
+### 2.11.9 选择指南
+
+```
+需要定时执行一段代码？
+│
+├─ 只需执行一次？
+│   ├─ 不需要存档 → DoTaskInTime
+│   └─ 需要存档/暂停/恢复 → Timer:StartTimer
+│
+├─ 需要重复执行？
+│   ├─ 不需要存档 → DoPeriodicTask
+│   └─ 需要存档 → Timer + 在 timerdone 中重新 StartTimer
+│
+├─ 游戏暂停时也要运行？
+│   └─ DoStaticTaskInTime / DoStaticPeriodicTask
+│
+└─ 是世界级事件（可能被世界设置影响）？
+    └─ WorldSettingsTimer
+```
+
+---
+
+> **本节小结**
+> - `DoTaskInTime`：延迟执行一次，最简单直接，不支持暂停/存档
+> - `DoPeriodicTask`：周期执行，注意 `initialdelay` 参数控制首次执行时机
+> - `DoStaticXxx`：不受游戏暂停和时间缩放影响，适合 UI 和网络逻辑
+> - **Timer 组件**：在 DoTaskInTime 之上构建，支持暂停/恢复、查询剩余时间、自动存档恢复、LongUpdate
+> - Timer 完成时推送 `"timerdone"` 事件，通过 `data.name` 区分不同定时器
+> - **WorldSettingsTimer**：世界级定时器，支持 enabled/disabled 和比例存档
+> - 选择原则：简单场景用 DoTaskInTime/DoPeriodicTask，需要持久化或暂停控制用 Timer 组件
 
 ## 2.12 STRINGS 系统——游戏文本的组织结构与访问方式
 
