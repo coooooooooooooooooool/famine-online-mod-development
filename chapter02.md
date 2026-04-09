@@ -3706,7 +3706,480 @@ end)
 
 ## 2.10 核心全局对象：TheWorld、ThePlayer、TheSim、TheInput、TheNet
 
-（待编写）
+饥荒联机版的代码中散布着大量以 `The` 开头的全局对象——`TheWorld`、`ThePlayer`、`TheSim`……它们是游戏的"快捷入口"，掌握它们就等于掌握了操作游戏各个系统的钥匙。
+
+### 2.10.1 全局对象一览
+
+> **给新手的类比**：这些全局对象就像一座城市的"市政府部门电话簿"：
+> - `TheWorld`——市长办公室（整个世界的总管）
+> - `ThePlayer`——你自己（本地玩家）
+> - `TheSim`——基建部（底层引擎服务）
+> - `TheInput`——邮政局（处理所有输入）
+> - `TheNet`——通讯局（网络相关）
+> - `TheFrontEnd`——文化局（UI 和屏幕管理）
+> - `TheCamera`——电视台（视角控制）
+
+### 2.10.2 TheWorld——世界的根实体
+
+`TheWorld` 是游戏中最重要的全局对象——它是**世界本身**，一个特殊的 `EntityScript` 实例。
+
+**创建过程**：
+
+```lua
+-- scripts/prefabs/world.lua
+local function fn()
+    local inst = CreateEntity()
+
+    if TheWorld ~= nil then
+        print("You cannot spawn multiple worlds!")
+        return nil       -- 只允许存在一个世界
+    end
+
+    TheWorld = inst      -- 设置全局引用
+    inst.ismastersim = TheNet:GetIsMasterSimulation()
+    inst.ismastershard = inst.ismastersim and not TheShard:IsSecondary()
+
+    inst.entity:AddTransform()
+    inst.entity:AddMap()
+    -- ...
+    return inst
+end
+```
+
+**关键属性**：
+
+```lua
+TheWorld.ismastersim        -- 是否服务端（最常用的判断）
+TheWorld.ismastershard      -- 是否主分片服务端
+TheWorld.Map                -- 地图对象（地形查询、瓦片操作）
+TheWorld.topology           -- 地图拓扑数据（区域、道路、节点）
+TheWorld.meta               -- 存档元数据（种子、天数等）
+TheWorld.state              -- 世界状态数据（时间、季节、温度等）
+TheWorld.net                -- 网络实体（TheWorld 的 classified）
+TheWorld.shard              -- 分片网络实体
+```
+
+**TheWorld 的组件**（服务端）：
+
+```lua
+-- 仅在 ismastersim 时添加的组件（节选）
+TheWorld:AddComponent("playerspawner")           -- 玩家出生点管理
+TheWorld:AddComponent("timer")                   -- 全局定时器
+TheWorld:AddComponent("worldstate")              -- 世界状态（天/季节/温度等）
+TheWorld:AddComponent("walkableplatformmanager") -- 船平台管理
+TheWorld:AddComponent("yotd_raceprizemanager")   -- 龙舟比赛
+-- ... 以及大量地上/洞穴特有的组件
+```
+
+**常用操作**：
+
+```lua
+-- 获取当前季节
+local season = TheWorld.state.season        -- "autumn", "winter", "spring", "summer"
+
+-- 判断是否是白天
+if TheWorld.state.isday then ... end
+
+-- 获取当前天数
+local day = TheWorld.state.cycles + 1       -- cycles 从 0 开始
+
+-- 监听世界状态变化
+inst:WatchWorldState("isnight", function(inst, isnight)
+    if isnight then print("Night has fallen!") end
+end)
+
+-- 推送全局事件（服务端）
+TheWorld:PushEvent("ms_setseason", "winter")     -- 设置季节
+TheWorld:PushEvent("ms_advanceseason")           -- 推进季节
+TheWorld:PushEvent("ms_nextphase")               -- 推进到下一时段
+TheWorld:PushEvent("ms_save")                    -- 触发存档
+```
+
+### 2.10.3 ThePlayer——本地玩家
+
+`ThePlayer` 指向**当前客户端控制的玩家实体**。
+
+```lua
+-- 获取本地玩家的位置
+local x, y, z = ThePlayer.Transform:GetWorldPosition()
+
+-- 检查本地玩家的血量（通过 replica，因为可能在客户端）
+local hp = ThePlayer.replica.health:GetPercent()
+
+-- 判断本地玩家是否活着
+if ThePlayer:HasTag("playerghost") then
+    print("You're a ghost!")
+end
+```
+
+**重要注意事项**：
+
+```lua
+-- ❌ ThePlayer 在专用服务器（Dedicated Server）上是 nil！
+if ThePlayer ~= nil then
+    -- 安全地使用 ThePlayer
+end
+
+-- ❌ ThePlayer 是"我的"玩家，不是所有玩家
+-- 要遍历所有玩家，用 AllPlayers
+for _, player in ipairs(AllPlayers) do
+    print(player.name)
+end
+```
+
+`ThePlayer` 的赋值由引擎在网络归属（ownership）确定时设置。在 Lua 层面，无缝角色切换时也会更新：
+
+```lua
+-- scripts/prefabs/player_common.lua
+-- 无缝角色切换时更新 ThePlayer
+if ThePlayer.isseamlessswapsource then
+    ThePlayer = inst    -- 指向新角色
+end
+```
+
+### 2.10.4 TheSim——引擎服务
+
+`TheSim` 是 C++ 引擎暴露给 Lua 的核心接口，提供底层系统功能。
+
+**实体查找**（最常用）：
+
+```lua
+-- 在指定位置周围查找实体
+local ents = TheSim:FindEntities(x, y, z, radius, must_tags, cant_tags, oneof_tags)
+
+-- 示例：找到 10 格内所有可燃烧的东西
+local x, y, z = inst.Transform:GetWorldPosition()
+local burnables = TheSim:FindEntities(x, y, z, 10, {"_burnable"})
+```
+
+**时间相关**：
+
+```lua
+TheSim:GetTick()           -- 当前游戏 tick
+TheSim:GetTickTime()       -- 每 tick 的时间（1/30 秒）
+TheSim:GetStaticTick()     -- 静态 tick（不受暂停影响）
+```
+
+**渲染/屏幕**：
+
+```lua
+TheSim:GetScreenSize()     -- 屏幕分辨率
+TheSim:GetScreenPos(x,y,z) -- 世界坐标转屏幕坐标
+TheSim:GetLightAtPoint(x,y,z) -- 获取某点的光照强度
+```
+
+**资源管理**：
+
+```lua
+TheSim:LoadPrefabs(prefab_list)    -- 加载 prefab 资源
+TheSim:UnloadPrefabs(prefab_list)  -- 卸载 prefab 资源
+```
+
+**其他**：
+
+```lua
+TheSim:GetPersistentString(key, cb)  -- 读取持久化字符串
+TheSim:SetPersistentString(key, val) -- 写入持久化字符串
+TheSim:Quit()                         -- 退出游戏
+```
+
+### 2.10.5 TheInput——输入系统
+
+`TheInput` 定义在 `scripts/input.lua`，是 `Input` 类的全局实例。
+
+**获取鼠标/世界位置**：
+
+```lua
+-- 获取鼠标在世界中的位置
+local pos = TheInput:GetWorldPosition()
+local x, z = pos.x, pos.z
+
+-- 获取鼠标下的实体
+local ent = TheInput:GetWorldEntityUnderMouse()
+if ent then
+    print("Mouse is over: " .. tostring(ent.prefab))
+end
+
+-- 获取鼠标下的所有实体
+local all = TheInput:GetAllEntitiesUnderMouse()
+```
+
+**按键查询**：
+
+```lua
+-- 检查某个键是否按下
+if TheInput:IsKeyDown(KEY_SHIFT) then
+    print("Shift is held!")
+end
+
+if TheInput:IsMouseDown(MOUSEBUTTON_LEFT) then
+    print("Left mouse button is pressed!")
+end
+
+-- 检查控制器按键
+if TheInput:IsControlPressed(CONTROL_ATTACK) then
+    print("Attack button pressed!")
+end
+```
+
+**注册输入回调**：
+
+```lua
+-- 按键按下时触发
+TheInput:AddKeyDownHandler(KEY_F1, function()
+    print("F1 was pressed!")
+end)
+
+-- 按键抬起时触发
+TheInput:AddKeyUpHandler(KEY_F1, function()
+    print("F1 was released!")
+end)
+
+-- 鼠标按钮处理
+TheInput:AddMouseButtonHandler(function(button, down, x, y)
+    if button == MOUSEBUTTON_LEFT and down then
+        print("Left click at " .. x .. ", " .. y)
+    end
+end)
+
+-- 控制处理（兼容手柄）
+TheInput:AddControlHandler(CONTROL_ATTACK, function(down)
+    if down then print("Attack control activated!") end
+end)
+```
+
+### 2.10.6 TheNet——网络系统
+
+`TheNet` 是 C++ 网络层的接口，提供网络状态查询和操作。
+
+**环境判断**（最常用）：
+
+```lua
+TheNet:GetIsServer()              -- 当前进程是否是服务器
+TheNet:GetIsClient()              -- 当前进程是否是客户端
+TheNet:GetIsMasterSimulation()    -- 是否是权威模拟（= TheWorld.ismastersim）
+TheNet:IsDedicated()              -- 是否是专用服务器
+TheNet:GetServerIsClientHosted()  -- 是否是玩家主机（非专用服务器）
+TheNet:IsServerPaused()           -- 服务器是否暂停
+```
+
+**玩家信息**：
+
+```lua
+-- 获取所有在线玩家信息
+local clients = TheNet:GetClientTable()
+for _, client in ipairs(clients) do
+    print(client.name, client.userid, client.prefab)
+end
+
+-- 获取本地用户 ID
+local my_userid = TheNet:GetUserID()
+```
+
+**服务器设置**：
+
+```lua
+TheNet:GetPVPEnabled()            -- PVP 是否开启
+TheNet:GetServerGameMode()        -- 游戏模式名（"survival", "endless" 等）
+TheNet:GetDefaultMaxPlayers()     -- 最大玩家数
+```
+
+**全服公告**：
+
+```lua
+-- 发送全服公告（所有玩家都能看到）
+TheNet:Announce("A terrible creature has awakened!")
+```
+
+### 2.10.7 TheFrontEnd——UI 前端管理器
+
+`TheFrontEnd` 管理游戏的**屏幕栈**——所有 UI 界面都通过它来推入和弹出。
+
+```lua
+-- 定义在 scripts/frontend.lua
+FrontEnd = Class(function(self, name)
+    self.screenstack = {}
+    self.screenroot = Widget("screenroot")
+    -- ...
+end)
+
+-- 创建于 scripts/mainfunctions.lua
+TheFrontEnd = FrontEnd()
+```
+
+**常用操作**：
+
+```lua
+-- 推入一个新屏幕
+TheFrontEnd:PushScreen(MyScreen())
+
+-- 弹出当前屏幕
+TheFrontEnd:PopScreen()
+
+-- 获取当前活跃屏幕
+local screen = TheFrontEnd:GetActiveScreen()
+
+-- 淡入淡出
+TheFrontEnd:Fade(FADE_IN, 1)   -- 1 秒淡入
+TheFrontEnd:Fade(FADE_OUT, 1)  -- 1 秒淡出
+```
+
+### 2.10.8 TheCamera——相机
+
+`TheCamera` 控制游戏视角，是 `FollowCamera` 类的实例。
+
+```lua
+-- 定义在 scripts/cameras/followcamera.lua
+-- 创建于 scripts/main.lua
+TheCamera = FollowCamera()
+
+-- 设置跟随目标
+TheCamera:SetTarget(entity)
+
+-- 获取/设置相机距离
+local dist = TheCamera:GetDistance()
+TheCamera:SetDistance(30)
+
+-- 相机震动
+TheCamera:Shake(CAMERASHAKE.FULL, 0.5, 0.02, 0.5)
+```
+
+### 2.10.9 其他重要全局变量
+
+#### AllPlayers——所有在线玩家
+
+```lua
+-- 维护在 scripts/prefabs/player_common.lua
+-- 玩家创建时 table.insert(AllPlayers, inst)
+-- 玩家退出时 table.removearrayvalue(AllPlayers, inst)
+
+-- 遍历所有玩家
+for _, player in ipairs(AllPlayers) do
+    if not player:HasTag("playerghost") then
+        -- 对每个活着的玩家做些事
+    end
+end
+```
+
+#### Ents——全局实体表
+
+```lua
+-- 定义在 scripts/main.lua
+Ents = {}
+
+-- CreateEntity 时注册
+Ents[guid] = scr    -- guid → EntityScript
+
+-- OnRemoveEntity 时移除
+Ents[entityguid] = nil
+
+-- 通过 GUID 查找实体
+local entity = Ents[some_guid]
+
+-- 遍历世界中的所有实体（慎用——性能开销大！）
+for guid, ent in pairs(Ents) do
+    -- ...
+end
+```
+
+#### TUNING——游戏数值常量表
+
+```lua
+-- 定义在 scripts/tuning.lua
+-- 包含几乎所有可调节的游戏数值
+
+TUNING.WILSON_HEALTH        -- 威尔逊的血量上限（150）
+TUNING.WILSON_HUNGER         -- 饥饿值上限（150）
+TUNING.WILSON_SANITY         -- 精神值上限（200）
+TUNING.AXE_DAMAGE            -- 斧头伤害（27.2）
+TUNING.TOTAL_DAY_TIME        -- 一天的总时长（480 秒）
+TUNING.SEG_TIME              -- 一个时段的时长（30 秒）
+TUNING.SPIDER_HEALTH         -- 蜘蛛血量（100）
+-- ... 数千个数值
+
+-- Mod 中修改数值
+TUNING.WILSON_HEALTH = 200   -- 直接改
+-- 或使用 modifier 系统
+AddTuningModifier("WILSON_HEALTH", function(current) return current * 1.5 end)
+```
+
+#### STRINGS——文本/本地化字符串表
+
+```lua
+-- 定义在 scripts/strings.lua
+-- 游戏中所有文本的来源
+
+STRINGS.NAMES.AXE               -- "Axe"
+STRINGS.RECIPE_DESC.AXE         -- "Chop down trees for logs."
+STRINGS.CHARACTERS.WILSON.DESCRIBE.AXE  -- 威尔逊检查斧头的台词
+
+-- Mod 中添加/修改文本
+STRINGS.NAMES.MYMOD_ITEM = "My Custom Item"
+STRINGS.RECIPE_DESC.MYMOD_ITEM = "A very special item."
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYMOD_ITEM = "What a neat thing!"
+```
+
+#### GLOBAL——Mod 沙箱中的逃生口
+
+Mod 的 `modmain.lua` 运行在一个**沙箱环境**中，不能直接访问游戏的全局变量。`GLOBAL` 是指向真实全局表 `_G` 的引用：
+
+```lua
+-- scripts/mods.lua 中创建 Mod 环境时
+local env = {
+    GLOBAL = _G,           -- 指向真实全局表
+    TUNING = TUNING,       -- 直接传入
+    modname = modname,
+    -- ...
+}
+```
+
+在 `modmain.lua` 中使用：
+
+```lua
+-- 直接可用（Mod 环境已注入）
+local TUNING = TUNING    -- OK
+local STRINGS = STRINGS  -- 部分版本需要 GLOBAL.STRINGS
+
+-- 需要 GLOBAL 前缀的
+local TheWorld = GLOBAL.TheWorld
+local ThePlayer = GLOBAL.ThePlayer
+local AllPlayers = GLOBAL.AllPlayers
+
+-- 常见的写法——在文件顶部统一导入
+local _G = GLOBAL
+local TheWorld = _G.TheWorld
+local require = _G.require
+local SpawnPrefab = _G.SpawnPrefab
+```
+
+### 2.10.10 全局对象可用性速查
+
+| 全局对象 | 客户端 | 服务端 | 专用服务器 | 何时可用 |
+|---|---|---|---|---|
+| `TheWorld` | 有 | 有 | 有 | 世界创建后 |
+| `ThePlayer` | 有 | 有(主机) | **nil** | 玩家激活后 |
+| `TheSim` | 有 | 有 | 有 | 始终 |
+| `TheInput` | 有 | 有(主机) | 有 | 始终 |
+| `TheNet` | 有 | 有 | 有 | 始终 |
+| `TheFrontEnd` | 有 | 有(主机) | 有 | `Start()` 后 |
+| `TheCamera` | 有 | 有(主机) | 有 | `GlobalInit` 后 |
+| `AllPlayers` | 有 | 有 | 有 | 始终（可能为空） |
+| `Ents` | 有 | 有 | 有 | 始终 |
+| `TUNING` | 有 | 有 | 有 | `require("tuning")` 后 |
+| `STRINGS` | 有 | 有 | 有 | `require("strings")` 后 |
+
+---
+
+> **本节小结**
+> - `TheWorld`：世界根实体，携带 `ismastersim`、`Map`、`state`（天/季节/温度）等，是推送全局事件的中枢
+> - `ThePlayer`：本地玩家实体，在专用服务器上为 `nil`，使用前必须判空
+> - `TheSim`：引擎底层服务——`FindEntities`（实体查找）、Tick/Time、资源加载
+> - `TheInput`：输入系统——鼠标位置、按键状态、注册输入回调
+> - `TheNet`：网络系统——环境判断（isServer/isClient/isDedicated）、玩家列表、全服公告
+> - `TheFrontEnd`：UI 屏幕栈管理器——PushScreen/PopScreen/Fade
+> - `AllPlayers`：所有在线玩家数组，`Ents`：全局实体字典
+> - `TUNING`：游戏数值常量表，`STRINGS`：文本/本地化表
+> - `GLOBAL`：Mod 沙箱中通往真实全局表的入口（`GLOBAL = _G`）
 
 ## 2.11 定时任务详解：DoTaskInTime、DoPeriodicTask、Timer 组件
 
