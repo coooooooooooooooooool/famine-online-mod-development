@@ -853,7 +853,594 @@ inst.components.health.DoDelta(inst.components.health, -10)
 
 ## 1.4 元表与面向对象（Class 系统的基础）
 
-（待编写）
+Lua 本身没有"类"的概念，没有 `class` 关键字，也没有继承语法。但 Lua 提供了一个极其灵活的机制——**元表（metatable）**，让你可以自己"造"出面向对象系统。饥荒的整个游戏架构——实体、组件、状态图、行为树——全部建立在用元表实现的 `Class` 系统之上。
+
+### 1.4.1 什么是元表——给 table 装上"超能力"
+
+我们知道 table 是 Lua 唯一的复合数据结构。默认情况下，table 只能做最基本的操作：存取键值、遍历。但如果你给一个 table 设置了**元表**，就可以改变它的行为——比如让两个 table 相加、让 table 像函数一样被调用、或者在访问不存在的键时自动去别处查找。
+
+```lua
+-- 创建一个普通 table
+local t = {name = "axe"}
+
+-- 创建一个元表
+local mt = {}
+
+-- 把 mt 设为 t 的元表
+setmetatable(t, mt)
+
+-- 获取 t 的元表
+print(getmetatable(t) == mt)  -- true
+```
+
+元表本身也是一个普通的 table，但它里面可以放一些以双下划线 `__` 开头的特殊键，叫做**元方法（metamethod）**。Lua 在执行某些操作时会去元表里查找对应的元方法，如果找到了，就用它来处理。
+
+### 1.4.2 最重要的元方法——__index
+
+`__index` 是饥荒中使用最频繁的元方法，也是整个 Class 系统的基石。它的作用是：**当你访问 table 中不存在的键时，Lua 会去元表的 `__index` 里查找**。
+
+先看一个简单的例子理解原理：
+
+```lua
+local defaults = {
+    health = 100,
+    damage = 10,
+    speed = 5,
+}
+
+local mt = { __index = defaults }
+
+local warrior = setmetatable({damage = 25}, mt)
+
+print(warrior.damage)   -- 25（warrior 自己有这个键，直接返回）
+print(warrior.health)   -- 100（warrior 没有，去 defaults 里找，找到了）
+print(warrior.speed)    -- 5（同上）
+print(warrior.name)     -- nil（warrior 没有，defaults 也没有）
+```
+
+`warrior` 本身只定义了 `damage = 25`，但通过 `__index`，它可以"继承"到 `defaults` 里的 `health` 和 `speed`。这就是 Lua 实现继承的核心原理——**原型链**。
+
+`__index` 也可以是一个**函数**。饥荒的 `replica` 系统就是这么做的：
+
+```lua
+-- 来自 scripts/entityscript.lua
+local replica_mt =
+{
+    __index = function(t, k)
+        return rawget(t, "inst"):ValidateReplicaComponent(k, rawget(t, "_")[k])
+    end,
+}
+```
+
+当你访问 `inst.replica.health` 时，Lua 发现 `replica` 表里没有 `health` 这个键，于是调用 `__index` 函数。函数接收两个参数：`t`（被访问的表）和 `k`（被访问的键名）。这里它会先校验组件的合法性再返回。
+
+为什么要用函数而不是直接用另一个 table？因为 replica 组件是动态注册的，而且需要做额外的校验逻辑，简单的"去另一个 table 查找"满足不了需求。
+
+### 1.4.3 __newindex——拦截赋值操作
+
+`__newindex` 在你**给 table 中不存在的键赋值**时触发。饥荒用它来实现**属性监听器**——当某个属性的值发生变化时，自动同步到网络（客户端/服务端同步）。
+
+来看一个让你惊叹的实际用例——`health` 组件的定义：
+
+```lua
+-- 来自 scripts/components/health.lua
+local Health = Class(function(self, inst)
+    self.inst = inst
+    self.maxhealth = 100
+    self.minhealth = 0
+    self.currenthealth = self.maxhealth
+    self.invincible = false
+    -- ...
+end,
+nil,   -- 没有基类
+{      -- 第三个参数：属性监听器（props）
+    maxhealth = onmaxhealth,
+    currenthealth = oncurrenthealth,
+    takingfiredamage = ontakingfiredamage,
+    penalty = onpenalty,
+    canmurder = oncanmurder,
+    canheal = oncanheal,
+    invincible = oninvincible,
+})
+```
+
+看到那个第三个参数了吗？它是一个键值对表：键是属性名，值是一个回调函数。当你执行 `self.currenthealth = 50` 时，`__newindex` 元方法会拦截这个赋值，除了更新值之外，还会自动调用 `oncurrenthealth` 回调：
+
+```lua
+-- 来自 scripts/components/health.lua
+local function oncurrenthealth(self, currenthealth)
+    self.inst.replica.health:SetCurrent(currenthealth)    -- 同步到客户端
+    self.inst.replica.health:SetIsDead(currenthealth <= 0) -- 同步死亡状态
+    -- ...
+end
+```
+
+这样开发者只需要写 `self.currenthealth = 50` 这样自然的赋值语句，网络同步就自动完成了，不需要每次都手动调用同步函数。这就是元表的威力——**让复杂的逻辑隐藏在简单的语法背后**。
+
+底层的实现在 `class.lua` 中：
+
+```lua
+-- 来自 scripts/class.lua
+local function __newindex(t, k, v)
+    local p = rawget(t, "_")[k]  -- 查找是否有属性监听器
+    if p == nil then
+        rawset(t, k, v)          -- 没有监听器，正常赋值
+    else
+        local old = p[1]         -- 取出旧值
+        p[1] = v                 -- 存入新值
+        p[2](t, v, old)          -- 调用回调函数，传入 self, 新值, 旧值
+    end
+end
+```
+
+> **给新手的提示**：`rawget` 和 `rawset` 是 Lua 的原始操作，它们绕过元表直接读写 table。如果在 `__index` 或 `__newindex` 里又触发了元方法，就会无限递归，所以必须用 `rawget` / `rawset`。
+
+### 1.4.4 其他常用元方法——让 table 像数字一样运算
+
+除了 `__index` 和 `__newindex`，Lua 还提供了许多元方法。饥荒的 `Vector3` 类是展示这些元方法的最佳范例——它让三维坐标向量可以直接用 `+`、`-`、`*` 进行运算：
+
+```lua
+-- 来自 scripts/vector3.lua
+Vector3 = Class(function(self, x, y, z)
+    self.x, self.y, self.z = x or 0, y or 0, z or 0
+end)
+
+-- __add：让两个 Vector3 可以用 + 号相加
+function Vector3:__add(rhs)
+    return Vector3(self.x + rhs.x, self.y + rhs.y, self.z + rhs.z)
+end
+
+-- __sub：减法
+function Vector3:__sub(rhs)
+    return Vector3(self.x - rhs.x, self.y - rhs.y, self.z - rhs.z)
+end
+
+-- __mul：标量乘法
+function Vector3:__mul(rhs)
+    return Vector3(self.x * rhs, self.y * rhs, self.z * rhs)
+end
+
+-- __unm：取负号
+function Vector3:__unm()
+    return Vector3(-self.x, -self.y, -self.z)
+end
+
+-- __eq：判断两个向量是否相等
+function Vector3:__eq(rhs)
+    return self.x == rhs.x and self.y == rhs.y and self.z == rhs.z
+end
+
+-- __tostring：print 时的输出格式
+function Vector3:__tostring()
+    return string.format("(%2.2f, %2.2f, %2.2f)", self.x, self.y, self.z)
+end
+```
+
+有了这些元方法，你就可以像操作数字一样操作向量：
+
+```lua
+local pos1 = Vector3(10, 0, 20)
+local pos2 = Vector3(5, 0, 8)
+
+local sum = pos1 + pos2        -- Vector3(15, 0, 28)
+local diff = pos1 - pos2       -- Vector3(5, 0, 12)
+local scaled = pos1 * 2        -- Vector3(20, 0, 40)
+local neg = -pos1              -- Vector3(-10, 0, -20)
+
+print(pos1)                    -- (10.00, 0.00, 20.00)
+print(pos1 == pos2)            -- false
+```
+
+这在游戏开发中极其实用——你需要大量做坐标运算（求距离、求方向、偏移位置等），元方法让代码简洁得多。
+
+以下是 Lua 中常用元方法的完整列表：
+
+| 元方法 | 触发时机 | 饥荒中的典型用途 |
+|--------|---------|-----------------|
+| `__index` | 访问不存在的键 | 实现继承（Class 的核心）|
+| `__newindex` | 给不存在的键赋值 | 属性监听器（网络同步）|
+| `__tostring` | `tostring()` 或 `print()` | 调试输出（EntityScript、Vector3）|
+| `__add` | `+` 运算 | 向量加法 |
+| `__sub` | `-` 运算（二元）| 向量减法 |
+| `__mul` | `*` 运算 | 向量缩放 |
+| `__div` | `/` 运算 | 向量除法 |
+| `__unm` | `-` 运算（一元取负）| 向量取反 |
+| `__eq` | `==` 比较 | 向量/位置比较 |
+| `__call` | 像函数一样调用 table | `Class()` 创建实例 |
+| `__len` | `#` 取长度 | 自定义长度 |
+
+### 1.4.5 用元表实现"继承"——从零理解原理
+
+在深入饥荒的 Class 系统之前，让我们先从零手写一个最简单的面向对象系统，理解元表是怎么实现继承的：
+
+```lua
+-- 第一步：定义一个"类"
+local Animal = {}
+Animal.__index = Animal    -- 关键：让实例在找不到方法时，去 Animal 里找
+
+function Animal.new(name, sound)
+    local self = {}
+    setmetatable(self, Animal)  -- 将 Animal 设为实例的元表
+    self.name = name
+    self.sound = sound
+    return self
+end
+
+function Animal:speak()
+    print(self.name .. " says " .. self.sound)
+end
+
+-- 第二步：创建实例
+local dog = Animal.new("Dog", "Woof")
+dog:speak()  -- Dog says Woof
+```
+
+这里的关键是 `Animal.__index = Animal`。当你调用 `dog:speak()` 时：
+1. Lua 在 `dog` 表里找 `speak`——没找到
+2. Lua 查看 `dog` 的元表（`Animal`），发现 `__index` 指向 `Animal` 自身
+3. Lua 在 `Animal` 里找到了 `speak`，调用它
+
+这就是原型继承——实例 `dog` 通过元表"继承"了 `Animal` 的所有方法。
+
+**继承的实现**——让一个类继承另一个类：
+
+```lua
+-- 第三步：定义子类
+local Dog = {}
+for k, v in pairs(Animal) do  -- 把 Animal 的方法复制到 Dog
+    Dog[k] = v
+end
+Dog.__index = Dog
+Dog._base = Animal  -- 记录父类
+
+function Dog.new(name)
+    local self = Animal.new(name, "Woof")  -- 调用父类构造函数
+    setmetatable(self, Dog)                -- 改为用 Dog 作元表
+    return self
+end
+
+function Dog:fetch(item)
+    print(self.name .. " fetches " .. item)
+end
+
+local rex = Dog.new("Rex")
+rex:speak()          -- Rex says Woof（继承自 Animal）
+rex:fetch("stick")   -- Rex fetches stick（Dog 自己的方法）
+```
+
+是不是觉得每次手写这些很麻烦？这就是为什么饥荒封装了 `Class` 函数。
+
+### 1.4.6 饥荒的 Class 函数——剥开源码看本质
+
+现在让我们看饥荒的 `Class` 函数是怎么实现的。核心代码在 `scripts/class.lua` 中：
+
+```lua
+-- 来自 scripts/class.lua（简化版，突出核心逻辑）
+function Class(base, _ctor, props)
+    local c = {}    -- 新类的原型表
+    
+    -- 如果只传了一个函数，说明没有基类
+    if not _ctor and type(base) == 'function' then
+        _ctor = base
+        base = nil
+    -- 如果传了基类（一个 table），把基类的方法复制过来
+    elseif type(base) == 'table' then
+        for i, v in pairs(base) do
+            c[i] = v             -- 浅拷贝基类的所有方法
+        end
+        c._base = base           -- 记住基类，用于 is_a 查找
+    end
+
+    -- 实例在找不到方法时，去类的原型表 c 里找
+    c.__index = c
+
+    -- 创建一个元表 mt，让 c 可以被"调用"（像函数一样）
+    local mt = {}
+    mt.__call = function(class_tbl, ...)
+        local obj = {}               -- 创建新实例
+        setmetatable(obj, c)         -- 设置元表为类原型
+        if c._ctor then
+            c._ctor(obj, ...)        -- 调用构造函数
+        end
+        return obj
+    end
+
+    c._ctor = _ctor                  -- 保存构造函数
+    c.is_a = _is_a                   -- 类型检查方法
+    
+    setmetatable(c, mt)              -- 让类本身可以被"调用"
+    return c
+end
+```
+
+这段代码做了四件事：
+
+1. **创建原型表 `c`**：这是类的"模板"，所有方法都定义在这里
+2. **复制基类方法**：如果有基类，把基类的方法全部浅拷贝到 `c`，实现继承
+3. **设置 `__index`**：让实例找不到方法时去 `c` 里查找
+4. **设置 `__call`**：让类可以像函数一样被调用来创建实例
+
+当你写 `Health(inst)` 时，实际上是在调用 `mt.__call`，它创建一个新 table、设置元表、调用构造函数，然后返回这个新实例。
+
+### 1.4.7 Class 的三种使用模式
+
+理解了原理后，来看饥荒中 `Class` 的三种实际使用方式。
+
+**模式一：无基类——最常见的组件定义**
+
+绝大多数组件都使用这种模式，只传一个构造函数：
+
+```lua
+-- 来自 scripts/components/combat.lua
+local Combat = Class(function(self, inst)
+    self.inst = inst
+    self.target = nil
+    self.defaultdamage = 0
+    self.damagemultiplier = 1
+    -- ...
+end)
+
+-- 方法定义在类上（实例通过 __index 找到）
+function Combat:SetDefaultDamage(damage)
+    self.defaultdamage = damage
+end
+
+function Combat:GetDamage()
+    return self.defaultdamage * self.damagemultiplier
+end
+```
+
+这里 `Class(function(self, inst) ... end)` 只传了一个参数（函数），没有基类。`Class` 内部检测到第一个参数是函数，就把它当做构造函数。
+
+**模式二：带基类——继承现有类**
+
+当你需要扩展一个已有的类时，传两个参数：
+
+```lua
+-- 来自 scripts/components/aoeweapon_leap.lua
+local AOEWeapon_Base = require("components/aoeweapon_base")
+
+local AOEWeapon_Leap = Class(AOEWeapon_Base, function(self, inst)
+    AOEWeapon_Base._ctor(self, inst)   -- 调用父类构造函数
+    self.aoeradius = 4
+    self.physicspadding = 3
+    inst:AddTag("aoeweapon_leap")
+end)
+```
+
+注意这里**必须手动调用 `AOEWeapon_Base._ctor(self, inst)`**——饥荒的 Class 系统不会自动调用父类构造函数。这和 Java/Python 等语言不同，需要特别注意。
+
+行为树中更能看到继承链的威力：
+
+```lua
+-- 来自 scripts/behaviourtree.lua
+-- 基类：所有行为树节点的父类
+BehaviourNode = Class(function(self, name, children)
+    self.name = name or ""
+    self.children = children
+    self.status = READY
+end)
+
+-- 子类：装饰器节点，继承自 BehaviourNode
+DecoratorNode = Class(BehaviourNode, function(self, name, child)
+    BehaviourNode._ctor(self, name or "Decorator", {child})
+end)
+
+-- 子类：条件节点，也继承自 BehaviourNode
+ConditionNode = Class(BehaviourNode, function(self, fn, name)
+    BehaviourNode._ctor(self, name or "Condition")
+    self.fn = fn
+end)
+```
+
+`DecoratorNode` 和 `ConditionNode` 都继承了 `BehaviourNode` 的所有方法（如 `Visit`、`Reset` 等），同时可以添加或重写自己的方法。
+
+**模式三：带属性监听器（props）——联网组件**
+
+这是最高级的用法，传三个参数：
+
+```lua
+-- 来自 scripts/components/health.lua
+local Health = Class(function(self, inst)
+    self.inst = inst
+    self.maxhealth = 100
+    self.currenthealth = self.maxhealth
+    -- ...
+end,
+nil,     -- 第二个参数 nil 表示没有基类
+{        -- 第三个参数：属性监听器
+    maxhealth = onmaxhealth,
+    currenthealth = oncurrenthealth,
+    takingfiredamage = ontakingfiredamage,
+    penalty = onpenalty,
+})
+```
+
+有了属性监听器后，每次 `self.currenthealth = 50` 都会自动触发 `oncurrenthealth` 回调。这个机制主要用于网络同步——服务端修改一个值时，需要自动把变化通知到客户端。
+
+> **给初学者的提示**：如果你只是做简单的 Mod，基本只用到模式一（无基类）。模式二在你需要扩展已有组件时用到。模式三几乎只在引擎核心代码里出现，做 Mod 时很少需要自己用。
+
+### 1.4.8 is_a——类型检查
+
+`Class` 系统提供了 `is_a` 方法来检查一个对象是否属于某个类（或其子类）。这类似于 Java 中的 `instanceof` 或 Python 中的 `isinstance`。
+
+```lua
+-- 来自 scripts/stategraph.lua —— 检查传入的是否真的是 ActionHandler
+for k, v in pairs(actionhandlers) do
+    assert(v:is_a(ActionHandler), "Non-action handler added in actionhandler table!")
+    self.actionhandlers[v.action] = v
+end
+```
+
+`is_a` 的实现其实很简单——沿着元表链往上查找：
+
+```lua
+-- 来自 scripts/class.lua
+local function _is_a(self, klass)
+    local m = getmetatable(self)
+    while m do
+        if m == klass then return true end
+        m = m._base                         -- 沿继承链向上查找
+    end
+    return false
+end
+```
+
+它会从当前对象的元表开始，一层层往上查找 `_base`（父类），直到找到匹配的类或到达继承链顶端。
+
+在饥荒的行为树中经常用 `is_a` 做类型区分：
+
+```lua
+-- 来自 scripts/behaviourtree.lua —— 只有非 ConditionNode 才需要睡眠计时
+if self.status == RUNNING and not self.children and not self:is_a(ConditionNode) then
+    -- ...
+end
+```
+
+在动作选择器中区分目标是实体还是坐标：
+
+```lua
+-- 来自 scripts/components/playeractionpicker.lua
+if target:is_a(EntityScript) then
+    -- 目标是一个实体（比如一棵树、一个怪物）
+elseif target:is_a(Vector3) then
+    -- 目标是一个坐标点（比如地面某个位置）
+end
+```
+
+### 1.4.9 __tostring——调试你的类
+
+定义 `__tostring` 元方法后，`print()` 和 `tostring()` 会使用你定义的格式输出对象，而不是默认的 `table: 0x...`。这对调试非常有帮助。
+
+```lua
+-- 来自 scripts/entityscript.lua
+function EntityScript:__tostring()
+    return string.format("%d - %s%s", self.GUID, self.prefab or "", self.inlimbo and "(LIMBO)" or "")
+end
+-- 打印一个实体时会显示：1234 - axe 或 5678 - wilson(LIMBO)
+
+-- 来自 scripts/stategraph.lua
+function StateGraph:__tostring()
+    return "Stategraph : " .. self.name
+end
+-- 打印状态图时会显示：Stategraph : wilson
+```
+
+在你自己的 Mod 中，也建议给自定义类加上 `__tostring`，方便调试时快速看出对象的内容。
+
+### 1.4.10 __call——让 table 像函数一样调用
+
+`__call` 让你可以对一个 table 使用函数调用的语法 `()`。饥荒的 `Class` 函数正是用它来实现"调用类名创建实例"的效果：
+
+```lua
+-- class.lua 中给每个类设置了 __call
+mt.__call = function(class_tbl, ...)
+    local obj = {}
+    setmetatable(obj, c)
+    if c._ctor then
+        c._ctor(obj, ...)
+    end
+    return obj
+end
+```
+
+所以当你写 `Health(inst)` 时：
+1. `Health` 本身是一个 table（类原型）
+2. Lua 发现你在对一个 table 使用 `()`，于是查找元表的 `__call`
+3. `__call` 创建一个新的空 table，设置元表，调用构造函数
+4. 返回新创建的实例
+
+这就是为什么 `Vector3(10, 0, 20)` 看起来像在调用构造函数，实际上是元表在幕后工作。
+
+### 1.4.11 元表的查找链——理解方法调用的完整过程
+
+把前面的知识串起来，看看当你在饥荒中写 `inst.components.health:DoDelta(-10)` 时，Lua 到底做了什么：
+
+```
+1. inst.components         → 在 inst 表中找到 components 表
+2. .health                 → 在 components 表中找到 health 实例
+3. :DoDelta(-10)           → 等价于 health.DoDelta(health, -10)
+   3a. 在 health 实例中找 DoDelta → 没找到
+   3b. 查看 health 的元表（Health 类原型）
+   3c. 在 Health 类原型中找到 DoDelta → 调用它
+```
+
+如果 `Health` 继承了某个基类，而 `DoDelta` 定义在基类中，查找会继续：
+
+```
+   3c. 在 Health 类原型中找 DoDelta → 没找到
+   3d. 查看 Health 原型的 __index → 指向自身，但通过 _base 可追溯
+       （实际上，Class 在创建时已经把基类的方法拷贝到了 c 中，
+        所以通常不需要多级查找）
+```
+
+> **给老鸟的提示**：饥荒的 `Class` 系统在继承时使用的是**浅拷贝**而非原型链查找。也就是说，`Class(Base, ctor)` 会在创建时把 `Base` 的所有字段拷贝到新类的原型表中。这意味着：
+> - 查找速度更快（不需要遍历链）
+> - 但如果你后来往 `Base` 中添加了新方法，已经创建的子类不会自动获得它
+> - 这和 JavaScript 的原型链不同，更接近"混入（mixin）"模式
+
+### 1.4.12 实战：用 Class 写一个简单组件
+
+把这一节学到的知识汇总，写一个完整的自定义组件：
+
+```lua
+-- 文件：scripts/components/mycomponent.lua
+
+local MyComponent = Class(function(self, inst)
+    self.inst = inst
+    self.value = 0
+    self.max_value = 100
+end)
+
+function MyComponent:SetValue(val)
+    self.value = math.clamp(val, 0, self.max_value)
+    self.inst:PushEvent("myvaluechanged", { value = self.value })
+end
+
+function MyComponent:GetPercent()
+    return self.value / self.max_value
+end
+
+function MyComponent:DoDelta(delta)
+    self:SetValue(self.value + delta)
+end
+
+function MyComponent:OnSave()
+    return { value = self.value }
+end
+
+function MyComponent:OnLoad(data)
+    if data and data.value then
+        self:SetValue(data.value)
+    end
+end
+
+function MyComponent:GetDebugString()
+    return string.format("value: %2.2f / %2.2f (%2.0f%%)",
+        self.value, self.max_value, self:GetPercent() * 100)
+end
+
+return MyComponent
+```
+
+这个组件遵循了饥荒组件的标准模式：
+- 用 `Class(function(self, inst) ... end)` 定义
+- 构造函数初始化所有字段
+- 方法用冒号语法定义（`function MyComponent:Method()`）
+- 提供 `OnSave` / `OnLoad` 实现存档
+- 提供 `GetDebugString` 方便调试
+- 最后 `return MyComponent` 导出
+
+---
+
+> **本节小结**
+> - 元表通过特殊的元方法（`__index`、`__newindex`、`__call` 等）赋予 table 超越普通操作的能力
+> - `__index` 是实现继承的核心——实例找不到方法时，沿着元表链去类原型中查找
+> - `__newindex` 用于拦截赋值，饥荒用它实现属性监听和网络同步
+> - 饥荒的 `Class` 函数封装了元表操作，提供三种模式：无基类、有基类（继承）、带属性监听器
+> - `is_a` 沿继承链检查类型，类似其他语言的 `instanceof`
+> - `Vector3` 是元方法运算符重载的完美范例——让向量可以像数字一样 `+`、`-`、`*`
+> - 做 Mod 时最常用的是"无基类"模式，掌握 `Class(function(self, inst) ... end)` 即可应对大部分场景
 
 ## 1.5 模块系统与 require
 
