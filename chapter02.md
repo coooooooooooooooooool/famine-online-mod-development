@@ -5407,4 +5407,539 @@ end
 
 ## 2.14 游戏模式：Survival / Endless / Wilderness / Lavaarena / Forge 的差异
 
-（待编写）
+所有游戏模式定义在 `scripts/gamemodes.lua` 的 `GAME_MODES` 表中：
+
+```lua
+-- scripts/gamemodes.lua
+GAME_MODES =
+{
+    survival =
+    {
+        text = "",
+        description = "",
+        level_type = LEVELTYPE.SURVIVAL,
+        mod_game_mode = false,
+        spawn_mode = "fixed",           -- 固定出生点（传送门旁）
+        resource_renewal = false,        -- 不自动刷新资源
+        ghost_sanity_drain = true,       -- 幽灵降低活人精神值
+        ghost_enabled = true,            -- 死后变幽灵
+        portal_rez = false,              -- 传送门不能复活
+        reset_time = { time = 120, loadingtime = 180 },  -- 全灭后倒计时重置
+        invalid_recipes = nil,
+    },
+    lavaarena =
+    {
+        internal = true,
+        level_type = LEVELTYPE.LAVAARENA,
+        ghost_enabled = false,
+        revivable_corpse = true,         -- 死后变尸体，队友可复活
+        spectator_corpse = true,         -- 死后可旁观
+        no_crafting = true,              -- 禁用制作
+        no_hunger = true,                -- 禁用饥饿
+        no_sanity = true,                -- 禁用精神
+        no_minimap = true,               -- 禁用小地图
+        no_air_attack = true,            -- 禁用空中攻击
+        override_item_slots = 0,         -- 没有物品栏格子
+        drop_everything_on_despawn = true,
+        lobbywaitforallplayers = true,
+        -- ...
+    },
+    quagmire =
+    {
+        internal = true,
+        level_type = LEVELTYPE.QUAGMIRE,
+        max_players = 3,
+        override_item_slots = 4,
+        no_hunger = true,
+        no_eating = true,
+        no_sanity = true,
+        no_temperature = true,
+        -- ...
+    },
+}
+```
+
+> **给新手的解释**：你可以把 `GAME_MODES` 想象成一张"规则表"。每种模式就是一套不同的规则——有的允许变幽灵，有的直接踢出，有的禁止制作等等。游戏启动时读取当前模式的规则表，然后按规则运行。
+
+### 2.14.2 三种常规模式的对比
+
+#### 重要历史背景
+
+在当前版本中，`wilderness`（荒野模式）和 `endless`（无尽模式）已被**废弃**——它们的定义在源码中被注释掉了，源码中有明确处理：
+
+```lua
+-- scripts/gamemodes.lua
+local function GameModeError(game_mode)
+    if game_mode == "wilderness" or game_mode == "endless" then
+        -- wilderness 和 endless 是废弃的游戏模式
+        -- 这里是为了处理专用服务器的向后兼容
+        return GAME_MODES.survival
+    end
+    -- ...
+end
+```
+
+以前这三种模式的差异通过 `GAME_MODES` 表的不同属性区分。现在这些差异被**迁移到了世界设置（World Settings）系统**中——玩家可以在创建世界时自由组合这些选项，而不再受限于固定的模式包。
+
+#### 原有三模式对比表
+
+虽然 `wilderness` 和 `endless` 已废弃，但它们代表的功能仍然存在，只是变成了可配置选项。以下是原有三种模式的差异：
+
+| 特性 | Survival（生存） | Endless（无尽） | Wilderness（荒野） |
+|---|---|---|---|
+| **出生点** | 固定（传送门旁） | 固定 | 随机散布 |
+| **死后状态** | 变幽灵 | 变幽灵 | 直接移除 |
+| **幽灵降精神** | 是 | 否 | 否（无幽灵） |
+| **传送门复活** | 否 | 是 | 否 |
+| **资源自动刷新** | 否 | 是 | 是 |
+| **全灭重置** | 120秒倒计时 | 否 | 否 |
+| **禁用配方** | 无 | 无 | 肉体雕像 |
+
+#### 这些属性在源码中的实现
+
+**出生点模式**——`spawn_mode`：
+
+```lua
+-- scripts/components/playerspawner.lua
+if _mode == "scatter" then
+    -- 荒野模式：随机选一个出生点
+    local nexti = math.min(math.floor(easing.inQuart(math.random(), 1, #_openpts, 1)), #_openpts)
+    nextpoint = _openpts[nexti]
+    table.remove(_openpts, nexti)
+    table.insert(_usedpts, nextpoint)
+else  -- 默认 "fixed"
+    -- 生存/无尽模式：所有人在传送门旁出生
+    if _masterpt == nil then
+        print("No master spawn point")
+        _masterpt = _openpts[1]
+    end
+    nextpoint = _masterpt
+end
+```
+
+**幽灵系统**——`ghost_enabled`：
+
+```lua
+-- scripts/prefabs/player_common_extensions.lua
+local function RemoveDeadPlayer(inst, spawnskeleton)
+    -- 生成骸骨或墓碑
+    if spawnskeleton and inst.skeleton_prefab ~= nil then
+        SpawnDeathProduct(inst)
+        SpawnPrefab("die_fx").Transform:SetPosition(x, y, z)
+    end
+
+    -- 关键判断：如果幽灵被禁用，玩家死后直接被移除
+    if not GetGhostEnabled() and not GetGameModeProperty("revivable_corpse") then
+        -- 释放跟随者（切斯特等）的物品
+        local followers = inst.components.leader.followers
+        for k, v in pairs(followers) do
+            if k.components.inventory ~= nil then
+                k.components.inventory:DropEverything()
+            end
+        end
+    end
+
+    inst:OnDespawn()
+    DeleteUserSession(inst)
+    inst:Remove()   -- 直接删除玩家实体
+end
+```
+
+**幽灵降精神**——`ghost_sanity_drain`：
+
+```lua
+-- scripts/components/sanity.lua
+if GetGhostSanityDrain() and not self.player_ghost_immune_sources:Get() then
+    local num_ghosts = TheWorld.shard.components.shard_players:GetNumGhosts()
+    local num_alive = TheWorld.shard.components.shard_players:GetNumAlive()
+    -- 活人越多，抵消越强
+    local group_resist = num_alive > num_ghosts and 1 - num_ghosts / num_alive or 0
+    self.ghost_drain_mult = math.min(num_ghosts, TUNING.MAX_SANITY_GHOST_PLAYER_DRAIN_MULT)
+                            * (1 - group_resist * group_resist)
+else
+    self.ghost_drain_mult = 0
+end
+```
+
+**传送门复活**——`portal_rez`：
+
+```lua
+-- scripts/prefabs/multiplayer_portal.lua
+local function OnGetPortalRez(inst, portalrez)
+    if portalrez then
+        inst:AddComponent("hauntable")
+        inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+        inst:AddTag("resurrector")   -- 标记为复活器
+    elseif inst.components.hauntable then
+        inst:RemoveComponent("hauntable")
+        inst:RemoveTag("resurrector")
+    end
+end
+```
+
+幽灵"作祟"传送门时，传送门充当复活器。这就是无尽模式中幽灵可以在传送门旁复活的实现。
+
+**全灭重置倒计时**——`reset_time`：
+
+```lua
+-- scripts/components/worldreset.lua
+local OnPlayerCounts = _ismastershard and function(src, data)
+    if data.ghosts < data.total then
+        -- 还有活人，取消倒计时
+        CancelCountdown()
+    elseif data.total <= 0 then
+        -- 没有玩家在线
+        if _cancelwhenempty then
+            CancelCountdown()
+        end
+    elseif _instant then
+        -- 立即重置
+        WorldReset()
+    elseif _countdown:value() <= 0 then
+        -- 所有人都是幽灵，启动倒计时
+        TheNet:SetIsWorldResetting(true)
+        local countdown = _wasempty and _countdownloadingmax or _countdownmax
+        _countdown:set(countdown < 255 and countdown or 255)
+    end
+end or nil
+```
+
+**资源自动刷新**——`resource_renewal`：
+
+```lua
+-- scripts/components/forestresourcespawner.lua
+local function OnEnableResourceRenewal(inst, enable)
+    if _enabled ~= enable then
+        _enabled = enable
+        if enable then
+            Start()   -- 开始定时刷新树木、石头等
+        else
+            Stop()
+        end
+    end
+end
+
+inst:ListenForEvent("ms_enableresourcerenewal", OnEnableResourceRenewal)
+```
+
+### 2.14.3 现在的世界设置系统
+
+现在这些属性不再由游戏模式硬性绑定，而是通过**世界设置覆盖**系统在创建世界时配置：
+
+```lua
+-- scripts/worldsettings_overrides.lua（post 阶段覆盖）
+spawn_mode = function(difficulty)
+    TheWorld:PushEvent("ms_setworldsetting", {setting = "spawn_mode", value = difficulty})
+    TheWorld:PushEvent("ms_setspawnmode", difficulty)
+end,
+
+basicresource_regrowth = function(difficulty)
+    if difficulty == "default" then difficulty = "none" end
+    difficulty = difficulty == "always"
+    TheWorld:PushEvent("ms_setworldsetting", {setting = "resource_renewal", value = difficulty})
+    TheWorld:PushEvent("ms_enableresourcerenewal", difficulty)
+end,
+
+ghostsanitydrain = function(difficulty)
+    if difficulty == "default" then difficulty = "always" end
+    difficulty = difficulty == "always"
+    TheWorld:PushEvent("ms_setworldsetting", {setting = "ghost_sanity_drain", value = difficulty})
+end,
+
+ghostenabled = function(difficulty)
+    if difficulty == "default" then difficulty = "always" end
+    difficulty = difficulty == "always"
+    TheWorld:PushEvent("ms_setworldsetting", {setting = "ghost_enabled", value = difficulty})
+end,
+
+portalresurection = function(difficulty)
+    if difficulty == "default" then difficulty = "none" end
+    difficulty = difficulty == "always"
+    TheWorld:PushEvent("ms_setworldsetting", {setting = "portal_rez", value = difficulty})
+    TheWorld:PushEvent("ms_onportalrez", difficulty)
+end,
+
+resettime = function(difficulty)
+    local reset_time
+    if difficulty == "none" then
+        reset_time = nil
+    elseif difficulty == "slow" then
+        reset_time = { time = 240, loadingtime = 360 }
+    elseif difficulty == "default" then
+        reset_time = { time = 120, loadingtime = 180 }
+    elseif difficulty == "fast" then
+        reset_time = { time = 60, loadingtime = 90 }
+    elseif difficulty == "always" then
+        reset_time = { instant = true }
+    end
+    TheWorld:PushEvent("ms_setworldsetting", {setting = "reset_time", value = reset_time})
+    TheWorld:PushEvent("ms_setworldresettime", reset_time)
+end,
+```
+
+这些世界设置最终存储在 `worldsettings` 组件中：
+
+```lua
+-- scripts/components/worldsettings.lua
+local WorldSettings = Class(function(self, inst)
+    self.inst = inst
+    self.settings = {}
+    inst:ListenForEvent("ms_setworldsetting", OnSetWorldSetting)
+end)
+
+function WorldSettings:GetSetting(setting)
+    return self.settings[setting]
+end
+```
+
+#### 查询优先级
+
+当代码查询某个游戏属性时，**世界设置优先于游戏模式默认值**：
+
+```lua
+-- scripts/gamemodes.lua
+function GetGameModeProperty(property)
+    -- 优先查世界设置
+    local setting = GetWorldSetting(property, nil)
+    if setting ~= nil then
+        return setting
+    end
+    -- 回退到游戏模式默认值
+    return GetGameMode(TheNet:GetServerGameMode())[property]
+end
+```
+
+这意味着玩家现在可以创建一个"有传送门复活 + 有幽灵降精神 + 有全灭重置"的自定义组合——这在旧系统中是不可能的。
+
+### 2.14.4 事件模式：Lavaarena（熔炉）和 Quagmire（暴食）
+
+这两个是 Klei 官方的限时活动模式，虽然已经关闭，但代码仍在源码中。它们展示了游戏模式如何彻底改变游戏体验。
+
+#### Lavaarena（熔炉/熔炉大乱斗）
+
+熔炉是一个竞技场式的 PvE 模式，其 `GAME_MODES` 配置关闭了大量核心系统：
+
+```
+no_crafting = true      → 禁用制作系统
+no_hunger = true        → 饥饿值暂停
+no_sanity = true        → 精神值忽略
+no_minimap = true       → 禁用小地图
+no_air_attack = true    → 禁用空中攻击
+override_item_slots = 0 → 物品栏清空
+revivable_corpse = true → 死后变尸体可被复活
+spectator_corpse = true → 死后可旁观
+```
+
+这些属性在 `player_common.lua` 中被逐一检查：
+
+```lua
+-- scripts/prefabs/player_common.lua
+if GetGameModeProperty("no_hunger") then
+    inst.components.hunger:Pause()            -- 饥饿暂停
+end
+
+inst.components.sanity.ignore = GetGameModeProperty("no_sanity")  -- 精神忽略
+
+if not GetGameModeProperty("no_eating") then
+    inst:AddComponent("eater")                -- 不加 eater = 不能吃东西
+end
+
+if GetGameModeProperty("revivable_corpse") then
+    inst:AddComponent("revivablecorpse")      -- 可复活的尸体
+end
+
+if GetGameModeProperty("spectator_corpse") then
+    inst:AddComponent("spectatorcorpse")      -- 死后旁观
+end
+
+if not GetGameModeProperty("no_crafting") then
+    self.craftingmenu:Show()                  -- 制作菜单可见性
+end
+```
+
+熔炉还有专属的镜头设置：
+
+```lua
+cameraoverridefn = function(camera)
+    camera.mindist = 20
+    camera.mindistpitch = 32
+    camera.maxdist = 55
+    camera.maxdistpitch = 60
+    camera.distancetarget = 32
+end,
+```
+
+#### Quagmire（暴食）
+
+暴食是一个烹饪主题的模式，它的独特属性：
+
+```
+max_players = 3             → 限制最多 3 人
+override_item_slots = 4     → 物品栏只有 4 格
+no_hunger = true            → 禁用饥饿
+no_eating = true            → 禁用进食（食物是拿来献祭的）
+no_sanity = true            → 禁用精神
+no_temperature = true       → 禁用温度
+non_item_equips = true      → 非物品装备
+disable_transplanting = true → 禁止移植
+disable_bird_mercy_items = true → 禁止鸟笼产出
+```
+
+```lua
+-- scripts/prefabs/player_common.lua
+if GetGameModeProperty("no_temperature") then
+    inst.components.temperature:SetTemp(TUNING.STARTING_TEMP)  -- 温度锁定
+end
+```
+
+### 2.14.5 LEVELTYPE——世界类型
+
+每种游戏模式绑定一个 `LEVELTYPE`，影响世界生成的预设：
+
+```lua
+-- scripts/constants.lua
+LEVELTYPE = {
+    SURVIVAL = "SURVIVAL",
+    CAVE = "CAVE",
+    ADVENTURE = "ADVENTURE",
+    LAVAARENA = "LAVAARENA",
+    QUAGMIRE = "QUAGMIRE",
+}
+```
+
+`LEVELTYPE` 决定了世界使用哪套地图生成配置：
+
+- `SURVIVAL`——标准的森林/洞穴世界
+- `LAVAARENA`——竞技场地图
+- `QUAGMIRE`——暴食专用地图
+
+### 2.14.6 Mod 中的自定义游戏模式
+
+通过 `modinfo.lua` 可以注册自定义游戏模式：
+
+```lua
+-- modinfo.lua
+game_modes =
+{
+    {
+        name = "mymod_arena",
+        label = "My Arena Mode",
+        description = "A custom arena experience",
+        settings =
+        {
+            ghost_enabled = false,
+            ghost_sanity_drain = false,
+            portal_rez = false,
+            no_crafting = true,
+            no_hunger = true,
+            -- 可以使用 gamemodes.lua 中的所有属性
+        }
+    },
+}
+```
+
+引擎加载 Mod 时，会把这些数据注册到 `GAME_MODES` 表：
+
+```lua
+-- scripts/modindex.lua
+if info.game_modes then
+    for _, mode in pairs(info.game_modes) do
+        local gm = AddGameMode(mode.name, mode.label)
+        gm.description = mode.description or ""
+        if mode.settings then
+            for option, value in pairs(mode.settings) do
+                gm[option] = value   -- 逐一设置属性
+            end
+        end
+    end
+end
+
+-- scripts/gamemodes.lua
+function AddGameMode(game_mode, game_mode_text)
+    GAME_MODES[game_mode] = {
+        modded_mode = true,
+        text = game_mode_text,
+        description = "",
+        level_type = LEVELTYPE.SURVIVAL,
+        mod_game_mode = true,
+        spawn_mode = "fixed",
+        resource_renewal = false,
+        ghost_sanity_drain = false,
+        ghost_enabled = true,
+        portal_rez = false,
+        reset_time = nil,
+        invalid_recipes = {},
+    }
+    return GAME_MODES[game_mode]
+end
+```
+
+注意：`AddGameMode` 创建的模式默认值和 `survival` 不同（如 `ghost_sanity_drain` 默认 false），所以要确保你明确设置所有需要的属性。
+
+> **注意**：`modutil.lua` 中的 `env.AddGameMode` 已被废弃，打印警告信息让开发者改用 `modinfo.lua` 的声明式方式。
+
+### 2.14.7 在 Mod 代码中检测和适配游戏模式
+
+```lua
+-- 在 modmain.lua 或组件中
+
+-- 获取当前游戏模式名称
+local game_mode = TheNet:GetServerGameMode()
+
+-- 检查具体属性（推荐方式，因为世界设置可能覆盖模式默认值）
+if GetGameModeProperty("no_hunger") then
+    -- 当前模式禁用了饥饿
+end
+
+if GetGhostEnabled() then
+    -- 当前模式启用了幽灵
+end
+
+if GetPortalRez() then
+    -- 传送门复活已启用
+end
+
+if GetSpawnMode() == "scatter" then
+    -- 随机出生点模式
+end
+
+-- 检查是否为 Mod 创建的自定义模式
+if GetIsModGameMode(game_mode) then
+    -- 这是一个 Mod 注册的模式
+end
+
+-- 检查配方在当前模式下是否有效
+if IsRecipeValidInGameMode(game_mode, "resurrectionstatue") then
+    -- 肉体雕像在此模式下可用
+end
+```
+
+> **重要建议**：不要用 `game_mode == "survival"` 这种硬编码字符串判断，而应该用 `GetGameModeProperty` 检查具体属性。这样你的 Mod 才能正确适配自定义世界设置和其他 Mod 创建的模式。
+
+### 2.14.8 全景图：游戏模式属性的作用路径
+
+```
+创建世界 → worldsettings_overrides.lua 把玩家选的选项推送为世界设置
+         → worldsettings 组件存储设置值
+         → GetGameModeProperty(property) 查询时：
+              1. 先查 worldsettings（玩家在创建世界时的选择）
+              2. 再查 GAME_MODES[当前模式]（模式默认值）
+         → 各系统读取属性做分支：
+              - playerspawner → spawn_mode → "fixed" / "scatter"
+              - player_common → no_hunger / no_sanity / ghost_enabled
+              - multiplayer_portal → portal_rez → 是否添加 resurrector tag
+              - worldreset → reset_time → 全灭后是否倒计时
+              - sanity → ghost_sanity_drain → 幽灵是否降精神
+              - forestresourcespawner → resource_renewal → 资源是否刷新
+              - controls/playerhud → no_crafting → 制作菜单是否可见
+```
+
+---
+
+> **本节小结**
+> - `GAME_MODES` 表定义了所有游戏模式的属性集合：出生方式、死亡机制、系统开关等
+> - `wilderness` 和 `endless` 已废弃，其功能被拆分为独立的**世界设置选项**
+> - 查询属性时，`GetGameModeProperty` 会优先使用世界设置值，再回退到模式默认值
+> - 事件模式（Lavaarena、Quagmire）展示了如何通过模式属性彻底改变游戏体验
+> - Mod 可以通过 `modinfo.lua` 的 `game_modes` 注册自定义模式，也可以用 `GetGameModeProperty` 适配不同模式
+> - **最佳实践**：检查具体属性而非模式名称，以兼容世界设置和自定义模式
