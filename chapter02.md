@@ -310,7 +310,390 @@ mods/my_cool_mod/
 
 ## 2.2 游戏启动流程：main.lua → gamelogic.lua → mainfunctions.lua
 
-（待编写）
+
+理解游戏的启动流程，就像了解一台机器是怎么开机的——知道了每一步做了什么，你就知道你的 Mod 代码在什么时机被加载、能访问到哪些资源。这对于排查"为什么我的 Mod 报错了"或"为什么某个变量是 nil"至关重要。
+
+### 2.2.1 启动的大局观——从 C++ 到 Lua
+
+饥荒联机版是一个 C++ 引擎 + Lua 脚本的混合架构。C++ 引擎负责底层的渲染、物理、网络、音频等；Lua 负责几乎所有的游戏逻辑。启动流程可以简化为：
+
+```
+C++ 引擎启动
+  │
+  ├── 初始化渲染、物理、网络等底层系统
+  ├── 暴露 C API 给 Lua（TheSim、TheNet、TheInput 等）
+  │
+  └── 加载并执行 scripts/main.lua  ← 这是 Lua 世界的入口
+       │
+       ├── 第一阶段：基础设施搭建
+       ├── 第二阶段：Mod 加载与 Prefab 注册
+       ├── 第三阶段：前端（主菜单）启动
+       │
+       └── 玩家点击"开始游戏"
+            │
+            └── gamelogic.lua 接管
+                 ├── 加载/生成世界
+                 ├── 注册 Prefab 到引擎
+                 └── 进入游戏主循环（update.lua）
+```
+
+### 2.2.2 main.lua——Lua 世界的创世纪
+
+`main.lua` 是饥荒 Lua 层的**绝对入口**——C++ 引擎启动后执行的第一个 Lua 文件。它的工作像是在盖楼之前打地基。
+
+**第一步：配置模块搜索路径**
+
+```lua
+-- 来自 scripts/main.lua 第 1-2 行
+package.path = "scripts\\?.lua;scriptlibs\\?.lua"
+package.assetpath = {}
+table.insert(package.assetpath, {path = ""})
+```
+
+这决定了 `require` 去哪里找文件。所有后续的 `require` 调用都依赖这个配置。
+
+**第二步：安装自定义加载器**
+
+```lua
+-- 来自 scripts/main.lua（简化）
+local loadfn = function(modulename)
+    local modulepath = string.gsub(modulename, "[%.\\]", "/")
+    for path in string.gmatch(package.path, "([^;]+)") do
+        local filename = string.gsub(path, "%?", modulepath)
+        local result = kleiloadlua(filename)
+        if result then return result end
+    end
+end
+table.insert(package.loaders, 2, loadfn)
+```
+
+饥荒用自己的 `kleiloadlua` 替代了 Lua 标准的文件加载方式（因为游戏资源可能在压缩包中）。
+
+**第三步：按顺序加载核心模块**
+
+这是 `main.lua` 最长的部分——大量的 `require` 调用，按照精心设计的顺序加载。顺序很重要，因为后面的模块可能依赖前面的：
+
+```lua
+-- 来自 scripts/main.lua —— 核心加载顺序
+
+-- 第一批：基础工具
+require("strict")          -- 严格模式：访问未声明的全局变量会报错
+require("debugprint")      -- 调试输出
+require("config")          -- 游戏配置
+require("vector3")         -- Vector3 类（全局注册）
+require("mainfunctions")   -- 核心函数（SpawnPrefab、LoadPrefabFile 等）
+
+-- 第二批：核心系统
+require("mods")            -- Mod 管理系统
+require("tuning")          -- 全局数值表
+require("strings")         -- 所有游戏文本
+require("constants")       -- 全局常量
+require("class")           -- Class 系统
+require("util")            -- 工具函数
+
+-- 第三批：游戏框架
+require("actions")         -- 所有交互动作
+require("scheduler")       -- 协程调度器
+require("stategraph")      -- 状态图基类
+require("behaviourtree")   -- 行为树基类
+require("prefabs")         -- Prefab 和 Asset 类
+require("entityscript")    -- EntityScript 基类
+
+-- 第四批：数据与配置
+require("recipes")         -- 合成配方
+require("prefablist")      -- prefab 文件名列表
+require("networking")      -- 网络工具
+require("update")          -- 帧更新函数
+```
+
+> **给 Mod 开发者的重要提示**：这个加载顺序解释了为什么你在 `modmain.lua` 里可以使用 `Class`、`TUNING`、`STRINGS` 等——因为它们在 Mod 加载之前就已经被 `main.lua` 注册好了。
+
+**第四步：声明全局变量**
+
+`main.lua` 声明了大量的全局变量，这些是游戏运行时最重要的"共享状态"：
+
+```lua
+-- 来自 scripts/main.lua
+Prefabs = {}             -- 所有已注册的 prefab
+Ents = {}                -- 当前世界中的所有实体
+AwakeEnts = {}           -- 所有醒着的（活跃的）实体
+UpdatingEnts = {}        -- 需要每帧更新的实体
+
+-- 全局单例对象（初始化为 nil，后续启动时赋值）
+global("TheWorld")       -- 当前世界实体
+global("ThePlayer")      -- 本地玩家实体
+global("TheFrontEnd")    -- 前端 UI 管理器
+global("TheCamera")      -- 摄像机
+global("AllPlayers")     -- 所有玩家列表
+AllPlayers = {}
+```
+
+**第五步：Mod 安全启动**
+
+在加载完所有核心模块后，`main.lua` 最后调用 `ModSafeStartup()`：
+
+```lua
+-- 来自 scripts/main.lua
+local function ModSafeStartup()
+    -- 加载所有 Mod
+    ModManager:LoadMods()
+
+    -- 重新应用翻译（Mod 可能添加了新字符串）
+    TranslateStringTable(STRINGS)
+
+    -- 注册核心 prefab
+    LoadPrefabFile("prefabs/global")
+    LoadPrefabFile("prefabs/event_deps")
+
+    -- 初始化各种全局数据系统
+    TheRecipeBook = require("quagmire_recipebook")()
+    TheCookbook = require("cookbookdata")()
+    ThePlantRegistry = require("plantregistrydata")()
+    TheSkillTree = require("skilltreedata")()
+
+    -- 创建全局实体和管理器
+    TheGlobalInstance = CreateEntity("TheGlobalInstance")
+    TheCamera = FollowCamera()
+    ShadowManager = TheGlobalInstance.entity:AddShadowManager()
+    -- ...
+end
+
+-- Mod 的加载流程
+if not MODS_ENABLED then
+    ModSafeStartup()
+else
+    KnownModIndex:Load(function()
+        KnownModIndex:BeginStartupSequence(function()
+            ModSafeStartup()
+        end)
+    end)
+end
+```
+
+这里有个重要的设计：Mod 的加载被包在 `ModSafeStartup` 中，如果 Mod 导致启动崩溃，下次可以禁用所有 Mod 重试。
+
+### 2.2.3 Mod 的加载时机——你的代码何时执行
+
+Mod 的加载发生在 `ModManager:LoadMods()` 中，时间线是这样的：
+
+```
+main.lua 开始执行
+  ├── 加载 class.lua、tuning.lua 等核心模块
+  ├── 声明全局变量
+  │
+  ├── ModSafeStartup()
+  │     ├── ModManager:LoadMods()
+  │     │     ├── 遍历所有启用的 Mod
+  │     │     ├── 对每个 Mod：
+  │     │     │     ├── 把 Mod 的 scripts/ 加入 package.path
+  │     │     │     ├── 执行 modworldgenmain.lua（世界生成相关）
+  │     │     │     └── 执行 modmain.lua ← 你的 Mod 代码在这里执行
+  │     │     └── 注册所有 Mod 的 Prefab
+  │     │
+  │     ├── 注册核心 Prefab（global, event_deps）
+  │     └── 初始化全局系统
+  │
+  └── 启动前端（主菜单）
+```
+
+这意味着：
+- 你的 `modmain.lua` 执行时，`Class`、`TUNING`、`STRINGS`、`ACTIONS` 等已经可用
+- 但 `TheWorld`、`ThePlayer` 还是 `nil`——因为世界还没有被创建
+- 你在 `modmain.lua` 中注册的 `AddPrefabPostInit` 等回调，会在后续加载 prefab 时被调用
+
+### 2.2.4 gamelogic.lua——从菜单到游戏世界
+
+当玩家在主菜单点击"开始游戏"或"加入服务器"时，`gamelogic.lua` 接管控制权。它负责**加载或生成世界、注册所有 prefab、进入游戏**。
+
+核心流程如下：
+
+```lua
+-- 来自 scripts/gamelogic.lua（简化后的核心逻辑）
+
+-- 遍历 prefablist.lua 中的所有 prefab 文件名，逐个加载
+for i, file in ipairs(PREFABFILES) do
+    LoadPrefabFile("prefabs/" .. file)
+end
+
+-- 让 Mod 也注册它们的 prefab
+ModManager:RegisterPrefabs()
+```
+
+`LoadPrefabFile` 在 `mainfunctions.lua` 中定义（1.5.5 已讲过），它加载 prefab 文件、执行构建函数、注册到引擎。
+
+`gamelogic.lua` 还会区分两种场景：
+- **前端（Frontend）**：主菜单、设置界面、服务器列表
+- **后端（Backend）**：实际的游戏世界
+
+```lua
+-- 来自 scripts/gamelogic.lua
+if Settings.current_asset_set == "FRONTEND" then
+    -- 加载前端资源
+    TheSim:LoadPrefabs(FRONTEND_PREFABS)
+else
+    -- 加载后端（游戏世界）资源
+    TheSim:LoadPrefabs(BACKEND_PREFABS)
+    TheSim:LoadPrefabs(RECIPE_PREFABS)
+end
+```
+
+### 2.2.5 mainfunctions.lua——核心工具函数
+
+`mainfunctions.lua` 并不是一个"启动阶段"，而是一个**工具库**，定义了启动和运行过程中反复使用的核心函数。它很早就被 `main.lua` require 了。
+
+最重要的几个函数：
+
+**`SpawnPrefab(name)`——生成实体**
+
+```lua
+-- 这是游戏中使用最频繁的函数之一
+local axe = SpawnPrefab("axe")           -- 生成一把斧头
+axe.Transform:SetPosition(10, 0, 20)     -- 放到坐标 (10, 0, 20)
+```
+
+**`LoadPrefabFile(filename)`——加载 prefab 文件**
+
+```lua
+-- 在启动时被大量调用
+function LoadPrefabFile(filename)
+    local fn = loadfile(filename)
+    local ret = {fn()}   -- 执行文件，收集返回的 Prefab
+    for i, val in ipairs(ret) do
+        if val:is_a(Prefab) then
+            RegisterSinglePrefab(val)
+        end
+    end
+end
+```
+
+**`RegisterPrefabs(...)`——注册 prefab 到引擎**
+
+把 Lua 层的 Prefab 对象注册到 C++ 引擎，这样引擎才能在需要时实例化它们。
+
+### 2.2.6 update.lua——游戏的心跳
+
+一旦进入游戏世界，`update.lua` 中定义的更新函数就开始被引擎**每帧调用**。饥荒的帧率是 30 FPS（即每秒 30 tick），每一帧做以下事情：
+
+```lua
+-- 来自 scripts/update.lua —— 主更新函数（简化）
+function Update(dt)
+    local tick = TheSim:GetTick()
+
+    -- 1. 执行调度器（协程和定时任务）
+    for i = last_tick_seen + 1, tick do
+        RunScheduler(i)
+    end
+
+    -- 2. 更新所有需要每帧更新的组件
+    for k, v in pairs(UpdatingEnts) do
+        if v.updatecomponents then
+            for cmp in pairs(v.updatecomponents) do
+                if cmp.OnUpdate then
+                    cmp:OnUpdate(dt)
+                end
+            end
+        end
+    end
+
+    -- 3. 更新所有状态图
+    for i = last_tick_seen + 1, tick do
+        SGManager:Update(i)
+    end
+
+    -- 4. 更新所有 AI
+    for i = last_tick_seen + 1, tick do
+        BrainManager:Update(i)
+    end
+
+    last_tick_seen = tick
+end
+```
+
+每一帧的执行顺序：
+
+```
+引擎帧循环（C++ 侧，30 FPS）
+  │
+  ├── WallUpdate(dt)          ← 总是执行（即使暂停时）
+  │     ├── HandleRPCQueue()  ← 处理网络远程调用
+  │     └── 前端 UI 更新
+  │
+  └── Update(dt)              ← 仅在游戏未暂停时执行
+        ├── RunScheduler()    ← 协程和定时任务
+        ├── 组件 OnUpdate     ← 所有活跃组件的帧更新
+        ├── SGManager:Update  ← 状态图更新
+        └── BrainManager:Update ← AI 更新
+```
+
+还有一个 `WallUpdate`，它在**服务器暂停时也会运行**（用于处理网络包和 UI），而 `Update` 只在未暂停时运行。
+
+> **给新手的提示**：你在做 Mod 时，大部分时间不需要关心更新循环的细节。组件的 `OnUpdate` 会在你调用 `inst:StartUpdatingComponent(self)` 后自动被加入循环，调用 `inst:StopUpdatingComponent(self)` 后自动移除。
+
+### 2.2.7 从头到尾的完整时间线
+
+把所有环节串起来，这是饥荒从启动到进入游戏的完整时间线：
+
+```
+1.【引擎启动】C++ 引擎初始化
+
+2.【main.lua】Lua 世界初始化
+   ├── 配置路径和加载器
+   ├── 加载核心模块（class, vector3, entityscript, scheduler...）
+   ├── 加载数据（tuning, strings, recipes, constants...）
+   ├── 声明全局变量（Ents, Prefabs, TheWorld=nil, ThePlayer=nil...）
+   ├── 加载 Mod（ModManager:LoadMods → 执行每个 modmain.lua）
+   ├── 注册核心 Prefab
+   └── 启动前端（显示主菜单）
+
+3.【主菜单阶段】玩家在 UI 中操作
+   ├── gamelogic.lua 加载前端资源
+   └── 玩家选择"创建世界"或"加入服务器"
+
+4.【gamelogic.lua】加载游戏世界
+   ├── 加载所有 prefab 文件（遍历 PREFABFILES）
+   ├── Mod 的 prefab 也在此注册
+   ├── 加载或生成世界地图
+   ├── 创建 TheWorld 实体
+   └── 生成玩家角色（ThePlayer）
+
+5.【游戏运行中】update.lua 每帧驱动
+   ├── 调度器：协程、定时任务
+   ├── 组件更新：每帧逻辑
+   ├── 状态图：动画状态机
+   └── AI：行为树决策
+
+6.【离开游戏】返回主菜单或退出
+   ├── 保存世界数据
+   ├── 清理实体和资源
+   └── 回到步骤 3 或关闭
+```
+
+### 2.2.8 对 Mod 开发者的实际意义
+
+理解启动流程后，你能回答以下常见问题：
+
+**Q：为什么在 modmain.lua 里访问 TheWorld 是 nil？**
+A：因为 modmain.lua 在 main.lua 的 `ModSafeStartup()` 中执行，此时世界还没有创建。你需要在 `AddPrefabPostInit` 或 `AddGamePostInit` 等回调中才能访问 TheWorld。
+
+**Q：为什么我修改了 TUNING 的值但没生效？**
+A：检查你的修改时机。如果某个组件在初始化时读取了 TUNING 值并缓存了，你在之后修改 TUNING 不会影响已缓存的值。解决方案：使用 `AddPrefabPostInit` 在 prefab 创建后直接修改组件的值。
+
+**Q：我的 Mod 加了一个新 prefab，但游戏里找不到？**
+A：确认你在 modmain.lua 中声明了 `PrefabFiles = {"my_prefab_name"}`，并且文件在 `scripts/prefabs/my_prefab_name.lua`。`PrefabFiles` 列表中的名字不需要路径前缀和 `.lua` 后缀。
+
+**Q：多个 Mod 的加载顺序是什么？**
+A：Mod 按照 `modinfo.lua` 中的 `priority` 值排序加载。priority 越高越先加载。如果你的 Mod 需要在另一个 Mod 之后运行，设置更低的 priority。
+
+---
+
+> **本节小结**
+> - 饥荒是 C++ 引擎 + Lua 脚本的混合架构，所有游戏逻辑在 Lua 中
+> - `main.lua` 是 Lua 的入口，按精确顺序加载核心模块、声明全局变量、加载 Mod
+> - Mod 的 `modmain.lua` 在 `main.lua` 的 `ModSafeStartup` 阶段执行，此时核心模块可用但世界未创建
+> - `gamelogic.lua` 在玩家进入游戏时接管，加载所有 prefab 并创建世界
+> - `mainfunctions.lua` 提供核心工具函数（`SpawnPrefab`、`LoadPrefabFile` 等）
+> - `update.lua` 定义了每帧更新函数，驱动调度器、组件、状态图和 AI
+> - 了解时间线能帮助你正确使用 Mod API——知道什么时候哪些东西可用
 
 ## 2.3 class.lua——饥荒的面向对象系统实现
 
