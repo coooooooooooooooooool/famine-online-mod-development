@@ -3352,7 +3352,357 @@ end
 
 ## 2.9 Shard 系统——多世界（地上/洞穴）通信
 
-（待编写）
+在饥荒联机版中，"地上"和"洞穴"不仅是两个地图——它们是**两个独立运行的服务器进程**。Shard（分片）系统就是管理这两个（或更多）世界之间通信和同步的架构。
+
+### 2.9.1 什么是 Shard
+
+> **给新手的类比**：想象一个大型购物中心有两栋楼——A 栋（地上世界）和 B 栋（洞穴世界）。
+> - 每栋楼有自己的**保安团队**（独立的服务器进程），各自管理内部事务
+> - 两栋楼之间通过**对讲机**（Shard 网络）互相通报情况——"有个顾客从 A 栋走到了 B 栋"
+> - A 栋是**总部**（Master Shard），负责全局决策——几点关门、是否放假
+> - B 栋是**分部**（Secondary Shard），执行总部的决策，但内部事务自己处理
+
+在技术上：
+- **Shard**（分片）= 一个独立的游戏世界进程
+- **Master Shard**（主分片）= 地上世界，负责全局协调
+- **Secondary Shard**（次级分片）= 洞穴世界（或其他额外世界）
+
+```
+┌─────────────────────────────┐    ┌─────────────────────────────┐
+│       Master Shard           │    │     Secondary Shard          │
+│       （地上世界）             │    │     （洞穴世界）              │
+│                              │    │                              │
+│  ● 全局时钟/季节的权威       │    │  ● 从主分片同步时钟/季节     │
+│  ● 玩家总数统计              │◄──►│  ● 独立运行自己的游戏逻辑    │
+│  ● 回滚/重置决策权           │    │  ● 接受主分片的全局指令      │
+│  ● 投票结果裁决              │    │                              │
+│  ● TheWorld.ismastershard    │    │  ● TheShard:IsSecondary()    │
+└─────────────────────────────┘    └─────────────────────────────┘
+          ▲                                    ▲
+          │         Shard RPC / 网络通信         │
+          └────────────────────────────────────┘
+```
+
+### 2.9.2 三个关键判断变量
+
+在代码中区分当前运行环境，需要三个变量配合使用：
+
+```lua
+-- scripts/prefabs/world.lua
+inst.ismastersim = TheNet:GetIsMasterSimulation()
+inst.ismastershard = inst.ismastersim and not TheShard:IsSecondary()
+```
+
+| 变量 | 含义 | 地上世界 | 洞穴世界 | 客户端 |
+|---|---|---|---|---|
+| `TheWorld.ismastersim` | 是否是服务端 | true | true | false |
+| `TheShard:IsSecondary()` | 是否是次级分片 | false | true | - |
+| `TheWorld.ismastershard` | 是否是主分片的服务端 | true | false | false |
+
+```lua
+-- 判断运行环境
+if TheWorld.ismastershard then
+    -- 只在地上世界的服务端执行（全局决策）
+end
+
+if TheWorld.ismastersim and not TheWorld.ismastershard then
+    -- 只在洞穴世界的服务端执行
+end
+
+if TheWorld.ismastersim then
+    -- 在任何世界的服务端执行
+end
+```
+
+### 2.9.3 分片网络实体——Shard 的"中枢神经"
+
+每个世界在启动时都会创建一个特殊的 **shard_network** 实体，作为跨世界通信的中枢：
+
+```lua
+-- scripts/prefabs/shard_network.lua（简化版）
+local function fn()
+    local inst = CreateEntity()
+
+    TheWorld.shard = inst    -- 挂到全局访问点
+
+    inst.entity:AddShardNetwork()   -- C++ 层的分片网络组件
+
+    -- 挂载一系列跨世界同步组件
+    inst:AddComponent("shard_clock")       -- 时钟同步
+    inst:AddComponent("shard_seasons")     -- 季节同步
+    inst:AddComponent("shard_sinkholes")   -- 地震/蚁狮联动
+    inst:AddComponent("shard_players")     -- 玩家人数统计
+    inst:AddComponent("shard_worldreset")  -- 世界重置同步
+    inst:AddComponent("shard_worldvoter")  -- 投票同步
+    inst:AddComponent("shard_autosaver")   -- 自动存档同步
+
+    return inst
+end
+```
+
+这些 `shard_*` 组件各自负责一种跨世界数据的同步。
+
+### 2.9.4 时钟和季节同步——主分片说了算
+
+洞穴里也有白天黑夜、也有四季变换。但谁来决定"现在是第几天"？答案是**主分片**。
+
+`shard_clock` 组件的工作方式：
+
+```lua
+-- 主分片：把时钟数据写入 net 变量
+-- 次级分片：监听 net 变量变化，同步本地时钟
+
+-- 在主分片上
+if TheWorld.ismastershard then
+    -- 时钟变化时 → 更新 net 变量 → 自动同步到所有分片
+    inst:ListenForEvent("clocktick", function(...)
+        -- 更新 net_xxx 变量
+    end, TheWorld)
+end
+
+-- 在次级分片上
+if not TheWorld.ismastershard then
+    -- 监听 net 变量的 dirty 事件
+    inst:ListenForEvent("clockdirty", function(...)
+        -- 把接收到的时钟数据应用到本地世界
+        TheWorld:PushEvent("ms_setclocksegs", ...)
+    end)
+end
+```
+
+季节同步（`shard_seasons`）也是同样的模式：主分片写、次级分片读。
+
+### 2.9.5 玩家跨世界迁移——进洞穴的全过程
+
+当玩家走进洞穴入口时，发生了什么？
+
+```
+1. 玩家激活传送门
+   └→ worldmigrator:Activate(doer)
+
+2. 推送迁移事件
+   └→ TheWorld:PushEvent("ms_playerdespawnandmigrate", {
+        player = doer,
+        portalid = self.id,
+        worldid = self.linkedWorld   -- 目标分片 ID
+      })
+
+3. 序列化玩家数据（物品栏、状态等）
+   └→ SerializeUserSession(player)
+   └→ player.migration = {
+        worldid = 当前分片 ID,
+        portalid = 传送门 ID,
+        sessionid = 会话标识
+      }
+
+4. 从当前世界移除玩家
+   └→ player:Remove()
+
+5. C++ 层启动迁移
+   └→ TheShard:StartMigration(userid, worldid)
+   └→ 通知目标分片"有玩家来了"
+
+6. 目标分片接收并生成玩家
+   └→ playerspawner:SpawnAtLocation()
+   └→ 检查 player.migration 信息
+   └→ 找到目标传送门位置
+   └→ 反序列化玩家数据
+   └→ 玩家出现在目标世界的传送门旁
+```
+
+关键代码（`worldmigrator.lua`）：
+
+```lua
+function WorldMigrator:Activate(doer)
+    if self.linkedWorld == nil then
+        return false, "NODESTINATION"
+    end
+
+    if doer:HasTag("player") then
+        TheWorld:PushEvent("ms_playerdespawnandmigrate", {
+            player = doer,
+            portalid = self.id,
+            worldid = self.linkedWorld,
+        })
+        return true
+    end
+end
+```
+
+到达目标世界后（`playerspawner.lua`）：
+
+```lua
+function self:SpawnAtLocation(inst, player, x, y, z, isloading)
+    if player.migration ~= nil then
+        -- 从迁移数据中获取目标位置
+        if player.migration.worldid ~= TheShard:GetShardId() then
+            x, y, z = GetMigrationPortalLocation(player, player.migration)
+        end
+        player.migration = nil
+    end
+    -- 在 (x, y, z) 位置生成玩家
+end
+```
+
+### 2.9.6 跨分片 RPC——世界之间的"对讲机"
+
+两个分片之间通过 **Shard RPC** 通信：
+
+```lua
+-- 发送 RPC 到指定分片
+SendRPCToShard(SHARD_RPC.SyncWorldSettings, target_shardid, data)
+
+-- 发送到所有已连接分片
+SendRPCToShard(SHARD_RPC.SyncWorldStateTag, nil, namespace, tag, enabled)
+```
+
+接收端通过 `HandleShardRPC` 函数把消息放入队列，每帧处理：
+
+```lua
+-- scripts/networkclientrpc.lua
+function HandleShardRPC(sender, tick, code, data)
+    local fn = SHARD_RPC_HANDLERS[code]
+    if fn ~= nil then
+        table.insert(RPC_Shard_Queue, { fn, sender, data, tick })
+    end
+end
+```
+
+内置的 Shard RPC 类型包括：
+
+| RPC | 用途 |
+|---|---|
+| `SyncWorldSettings` | 同步世界生成设置 |
+| `ResyncWorldSettings` | 请求重新同步设置 |
+| `SyncWorldStateTag` | 同步世界状态标签 |
+| `SyncBossDefeated` | 同步 Boss 击杀状态 |
+| `ShardTransactionSteps` | 跨分片事务（物品传输等） |
+| `ReskinWorldMigrator` | 传送门外观同步 |
+
+**Mod 也可以发送自定义的 Shard RPC**：
+
+```lua
+-- 注册 Mod 的 Shard RPC（在 modmain.lua 中）
+AddShardModRPCHandler("mymod", "sync_data", function(shardid, data)
+    -- 收到另一个分片发来的数据
+    print("Received from shard " .. shardid .. ": " .. data)
+end)
+
+-- 发送
+SendModRPCToShard(GetShardModRPC("mymod", "sync_data"), target_shard, my_data)
+```
+
+### 2.9.7 分片连接状态
+
+分片之间的连接不是永久的——洞穴可能启动较慢，或者中途崩溃。`shardnetworking.lua` 管理连接状态：
+
+```lua
+-- scripts/constants.lua
+REMOTESHARDSTATE = {
+    OFFLINE = 0,   -- 分片离线
+    READY = 1,     -- 分片就绪
+}
+
+SHARDID = {
+    INVALID = "0",
+    MASTER = "1",  -- 主分片固定 ID
+}
+```
+
+```lua
+-- 检查某个世界是否可用
+function Shard_IsWorldAvailable(world_id)
+    return world_id ~= nil and (
+        ShardConnected[world_id] ~= nil or
+        world_id == TheShard:GetShardId()  -- 自己永远可用
+    )
+end
+```
+
+当分片连接/断开时，会触发 `Shard_UpdateWorldState`，更新传送门的可用状态（你可能在游戏中见过传送门变灰——那就是对应的洞穴分片断开了）。
+
+### 2.9.8 TheShard——C++ 层的全局对象
+
+`TheShard` 是引擎暴露给 Lua 的全局对象（类似 `TheNet`、`TheSim`），提供分片管理的底层 API：
+
+| 方法 | 说明 |
+|---|---|
+| `TheShard:GetShardId()` | 获取当前分片的 ID |
+| `TheShard:IsMaster()` | 当前分片是否是 Master |
+| `TheShard:IsSecondary()` | 当前分片是否是次级 |
+| `TheShard:StartMigration(userid, worldid)` | 启动玩家迁移 |
+| `TheShard:IsMigrating(userid)` | 某玩家是否正在迁移中 |
+| `TheShard:GetSecondaryShardPlayerCounts(flags)` | 获取次级分片的玩家数量 |
+
+注意：`TheShard:IsMigrating(userid)` **只在主分片上可靠**——次级分片可能还没收到迁移通知。
+
+### 2.9.9 全局决策为什么只在主分片
+
+有些操作必须全局唯一——比如世界回滚、重置、投票裁决。如果两个分片各自做决策，会导致不一致。
+
+```lua
+-- scripts/networking.lua
+function WorldRollbackFromSim(count)
+    -- 只有主分片能执行回滚
+    if TheWorld ~= nil and TheWorld.ismastershard then
+        print("Received world rollback request")
+        DoReset()
+    end
+end
+
+-- scripts/shardnetworking.lua
+function Shard_WorldSave()
+    if TheWorld ~= nil and TheWorld.ismastershard then
+        TheWorld:PushEvent("ms_save")   -- 只有主分片触发全局存档
+    end
+end
+```
+
+### 2.9.10 Mod 开发中的 Shard 注意事项
+
+#### 注意代码在哪个世界运行
+
+```lua
+-- 如果你的 Mod 逻辑只应该在地上世界运行
+if TheWorld.ismastershard then
+    -- 地上世界独有的逻辑
+end
+
+-- 如果两个世界都需要运行，但行为不同
+if TheWorld:HasTag("cave") then
+    -- 洞穴世界的逻辑
+else
+    -- 地上世界的逻辑
+end
+```
+
+#### 跨世界传递数据
+
+```lua
+-- 方法 1：通过 Shard RPC（即时通信）
+AddShardModRPCHandler("mymod", "notify", function(shardid, message)
+    print("Message from shard " .. shardid .. ": " .. message)
+end)
+
+-- 方法 2：通过玩家迁移数据（跟随玩家传递）
+-- 玩家身上的组件数据会随 OnSave/OnLoad 迁移
+```
+
+#### 不要假设只有两个世界
+
+虽然原版只有地上+洞穴两个世界，但 Mod 可以添加更多世界。你的代码应该用 `TheShard:GetShardId()` 和 `Shard_IsWorldAvailable` 而不是硬编码"地上/洞穴"。
+
+---
+
+> **本节小结**
+> - Shard（分片）= 一个独立的游戏世界进程。默认有地上（Master）和洞穴（Secondary）两个
+> - `TheWorld.ismastershard`：是否是主分片服务端。全局唯一决策（回滚、存档、投票）只在主分片执行
+> - `shard_network` 实体是跨世界通信的中枢，挂载 `shard_clock`、`shard_seasons`、`shard_players` 等同步组件
+> - 时钟/季节同步：主分片写 net 变量 → 次级分片读取并应用
+> - 玩家迁移流程：激活传送门 → 序列化存档 → Remove → C++ 层 StartMigration → 目标分片生成玩家
+> - Shard RPC 是世界之间的通信机制。Mod 可以用 `AddShardModRPCHandler` / `SendModRPCToShard` 发送自定义消息
+> - `TheShard` 是 C++ 全局对象，提供分片管理底层 API
+> - Mod 开发注意：不要假设只有两个世界，用 API 而不是硬编码
 
 ## 2.10 核心全局对象：TheWorld、ThePlayer、TheSim、TheInput、TheNet
 
