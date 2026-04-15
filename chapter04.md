@@ -3235,7 +3235,476 @@ end)
 
 ## 4.6 性能问题的初步定位
 
-（待编写）
+### 本节导读
+
+你的 Mod 功能完美，但游戏变得卡顿——帧率下降、操作延迟、服务器卡顿。性能问题是 Mod 开发中最隐蔽的问题类型，因为它通常不会报错，只是让游戏"慢下来"。
+
+> **新手**可以从「理解游戏循环和帧率」开始，知道什么操作会拖慢游戏；**进阶读者**可以学习如何测量性能、识别常见的性能瓶颈；**老手**可以深入了解引擎的更新调度机制和高级优化策略。
+
+---
+
+### 4.6.1 快速入门：游戏循环与帧率
+
+饥荒联机版的仿真以**每秒 30 帧**（30 FPS）运行。每一帧（称为一个 tick）的时长在 `scripts/constants.lua` 中定义：
+
+```lua
+FRAMES = 1/30   -- 每帧约 0.0333 秒
+```
+
+这意味着你的所有 Mod 代码（加上游戏本身的代码）必须在 **33 毫秒**内完成一帧的所有计算。如果某一帧的计算超过了这个时间，游戏就会"掉帧"——玩家会感到卡顿。
+
+**性能问题的本质**：你的代码在每帧中消耗了太多时间。
+
+---
+
+### 4.6.2 新手必知：最常见的性能杀手
+
+#### 杀手 1：每帧全图搜索
+
+```lua
+-- 危险代码！每帧搜索全图所有实体
+inst:DoPeriodicTask(0, function()
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local ents = TheSim:FindEntities(x, y, z, 9999)  -- 搜索半径 9999！
+    for _, v in pairs(ents) do
+        if v.prefab == "flower" then
+            -- 做某些事...
+        end
+    end
+end)
+```
+
+**为什么这么慢？** `FindEntities` 返回指定半径内的所有实体。半径 9999 基本覆盖整个地图——如果地图上有几千个实体，每帧遍历一遍的成本是巨大的。
+
+**修复方法**：
+1. **缩小搜索半径**：你的逻辑真的需要全图搜索吗？大多数时候 20~50 的半径就够了
+2. **使用标签过滤**：`FindEntities` 支持标签参数，利用引擎预索引大幅减少返回数量
+3. **降低搜索频率**：不要每帧搜索，改为每几秒搜索一次
+
+```lua
+-- 优化后
+inst:DoPeriodicTask(2, function()  -- 每 2 秒搜索一次（而非每帧）
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local ents = TheSim:FindEntities(x, y, z, 30, {"flower"})  -- 半径 30，标签过滤
+    for _, v in pairs(ents) do
+        -- 做某些事...
+    end
+end)
+```
+
+#### 杀手 2：`DoPeriodicTask(0)` 滥用
+
+`DoPeriodicTask(0)` 表示"每帧执行一次"。如果回调函数不够轻量，这会严重拖慢游戏：
+
+```lua
+-- 不好的写法
+inst:DoPeriodicTask(0, function()
+    -- 重量级计算...
+end)
+```
+
+问你自己：**真的需要每帧执行吗？** 大多数逻辑（检查状态、搜索实体、更新数值）用 `DoPeriodicTask(1)` 甚至 `DoPeriodicTask(5)` 就足够了。
+
+`scripts/components/updatelooper.lua` 的注释直接指出了这一点：
+
+```lua
+-- V2C: component for adding generic onupdate loops to entities
+--      since we found out that DoPeriodicTask(0) doesn't trigger precisely every frame
+```
+
+如果你确实需要每帧更新，应该使用 `updatelooper` 组件而非 `DoPeriodicTask(0)`——前者是引擎级的更新管线，性能更好。
+
+#### 杀手 3：频繁创建/销毁实体
+
+```lua
+-- 不好的写法
+inst:DoPeriodicTask(1, function()
+    local fx = SpawnPrefab("sparks")
+    fx.Transform:SetPosition(inst.Transform:GetWorldPosition())
+    fx:DoTaskInTime(0.5, function() fx:Remove() end)
+end)
+```
+
+每次 `SpawnPrefab` 都涉及实体创建、组件初始化、网络同步。频繁创建/销毁实体是很重的操作。
+
+**优化方法**：使用对象池（复用实体），或者降低生成频率。
+
+#### 杀手 4：大量字符串拼接
+
+```lua
+-- 不好的写法
+local s = ""
+for i = 1, 10000 do
+    s = s .. tostring(i)  -- 每次拼接都创建新字符串
+end
+```
+
+Lua 的字符串是不可变的——每次 `..` 都会创建一个新字符串对象。在循环中频繁拼接会产生大量临时字符串，给垃圾回收带来压力。
+
+**优化方法**：使用 `table.concat`：
+
+```lua
+local parts = {}
+for i = 1, 10000 do
+    parts[i] = tostring(i)
+end
+local s = table.concat(parts)
+```
+
+---
+
+### 4.6.3 进阶：理解游戏的更新调度
+
+饥荒的游戏循环有两个平行的更新通道，定义在 `scripts/update.lua` 中：
+
+#### WallUpdate —— 墙钟时间更新
+
+```lua
+-- scripts/update.lua 第 33 行
+function WallUpdate(dt)
+    -- RPC 队列处理
+    HandleRPCQueue()
+    HandleUserCmdQueue()
+
+    -- 墙钟更新组件
+    for k, v in pairs(WallUpdatingEnts) do
+        if v.wallupdatecomponents then
+            for cmp in pairs(v.wallupdatecomponents) do
+                if cmp.OnWallUpdate then
+                    cmp:OnWallUpdate(dt)
+                end
+            end
+        end
+    end
+
+    -- UI 更新、输入处理、摄像机等...
+end
+```
+
+`WallUpdate` 始终运行，即使游戏暂停也会执行。它处理 UI、输入、动画等与"真实时间"相关的内容。
+
+#### Update —— 仿真更新
+
+```lua
+-- scripts/update.lua 第 255 行起
+function Update(dt)
+    -- 更新组件
+    for k, v in pairs(UpdatingEnts) do
+        if v.updatecomponents then
+            for cmp, cmpname in pairs(v.updatecomponents) do
+                cmp:OnUpdate(dt)
+            end
+        end
+    end
+
+    -- 更新调度器（协程任务）
+    scheduler:Update()
+
+    -- 更新状态机和 AI
+    SGManager:Update(tick)
+    BrainManager:Update(tick)
+end
+```
+
+`Update` 只在仿真运行时执行。它处理游戏逻辑——组件更新、AI 决策、状态机切换等。
+
+**为什么分两个更新？** 因为"游戏世界的时间"和"现实中的时间"是不同的。当游戏暂停时，游戏世界停止但 UI 需要继续响应；当服务器卡顿时，一帧的 `dt` 可能不是标准的 `1/30` 秒。
+
+#### 实体的更新注册
+
+一个组件要参与每帧更新，需要显式注册（`scripts/entityscript.lua` 第 438 行起）：
+
+```lua
+function EntityScript:StartUpdatingComponent(cmp, do_static_update)
+    if not self.updatecomponents then
+        self.updatecomponents = {}
+        NewUpdatingEnts[self.GUID] = self
+        num_updating_ents = num_updating_ents + 1
+    end
+    self.updatecomponents[cmp] = cmpname or "component"
+end
+```
+
+**性能影响**：只有调用了 `StartUpdatingComponent` 的组件才会每帧执行 `OnUpdate`。如果你的组件不需要每帧更新（大多数情况下不需要），就不要注册——这能显著减少每帧的计算量。
+
+---
+
+### 4.6.4 进阶：实体休眠机制——引擎级性能优化
+
+饥荒有一个优雅的性能优化机制——**实体休眠**。当实体离开玩家的视野范围（活跃区域）时，引擎会触发 `OnEntitySleep`（`scripts/mainfunctions.lua` 第 670-696 行）：
+
+```lua
+function OnEntitySleep(guid)
+    local inst = Ents[guid]
+    if inst then
+        inst:PushEvent("entitysleep")
+
+        if inst.OnEntitySleep then
+            inst:OnEntitySleep()
+        end
+
+        inst:_DisableBrain_Internal()    -- 停止 AI
+
+        if inst.sg then
+            SGManager:Hibernate(inst.sg) -- 冬眠状态机
+        end
+
+        if inst.emitter then
+            EmitterManager:Hibernate(inst.emitter) -- 停止粒子
+        end
+
+        for k,v in pairs(inst.components) do
+            if v.OnEntitySleep then
+                v:OnEntitySleep()          -- 通知所有组件
+            end
+        end
+    end
+end
+```
+
+**休眠时会发生什么**：
+1. AI（Brain）被禁用——蜘蛛不会在远处计算寻路
+2. 状态机（StateGraph）进入冬眠——不消耗状态机更新时间
+3. 粒子发射器停止——不渲染远处的特效
+4. 各组件收到通知可以自行停止——如停止周期性检查
+
+当玩家靠近实体时，`OnEntityWake` 被触发，一切恢复。
+
+**对 Mod 开发者的启示**：如果你的 Mod 给实体添加了持续性计算（比如周期任务），应该在 `entitysleep` 和 `entitywake` 事件中正确地暂停/恢复它们：
+
+```lua
+local function start_checking(inst)
+    if inst._check_task == nil then
+        inst._check_task = inst:DoPeriodicTask(2, check_fn)
+    end
+end
+
+local function stop_checking(inst)
+    if inst._check_task ~= nil then
+        inst._check_task:Cancel()
+        inst._check_task = nil
+    end
+end
+
+inst:ListenForEvent("entitysleep", stop_checking)
+inst:ListenForEvent("entitywake", start_checking)
+```
+
+---
+
+### 4.6.5 进阶：性能测量方法
+
+#### 方法 1：手动计时
+
+最简单的方式——测量一段代码的执行时间：
+
+```lua
+local start = os.clock()
+-- 你要测量的代码...
+local elapsed = os.clock() - start
+print(string.format("[MyMod] 耗时: %.4f 秒", elapsed))
+```
+
+如果输出显示 `0.01` 秒以上，这段代码就值得优化（因为一帧只有 `0.033` 秒）。
+
+#### 方法 2：帧率监控
+
+在游戏内通过控制台统计每帧耗时：
+
+```lua
+-- 在控制台中执行
+local frame_times = {}
+TheWorld:DoPeriodicTask(0, function()
+    table.insert(frame_times, os.clock())
+    if #frame_times > 100 then
+        local total = frame_times[#frame_times] - frame_times[1]
+        print(string.format("最近 100 帧平均帧时: %.4f 秒 (%.1f FPS)",
+            total / 99, 99 / total))
+        frame_times = {}
+    end
+end)
+```
+
+#### 方法 3：引擎内置的 Profiler
+
+游戏引擎有内置的性能分析器——`TheSim:ProfilerPush` / `TheSim:ProfilerPop`。在 `update.lua` 中可以看到它被大量使用：
+
+```lua
+TheSim:ProfilerPush("updating wall components")
+-- 更新代码...
+TheSim:ProfilerPop()
+```
+
+虽然 Mod 开发者通常无法直接查看 Profiler 的输出，但了解它的存在有助于理解引擎是如何划分性能开销的。
+
+#### 方法 4：实体计数
+
+世界中的实体数量是影响性能的关键因素。在控制台中：
+
+```lua
+c_countprefabs()
+-- 输出所有 prefab 类型及数量
+print("总实体数:", GetTableSize(Ents))
+```
+
+如果你的 Mod 生成了大量实体（几百个以上），性能就可能受到影响。
+
+#### 方法 5：内存追踪
+
+`scripts/util.lua` 提供了内存追踪工具：
+
+```lua
+function TrackMem()
+    collectgarbage()
+    collectgarbage("stop")
+    TheSim:SetMemoryTracking(true)
+end
+
+function DumpMem()
+    TheSim:DumpMemoryStats()
+    mem_report()
+    collectgarbage("restart")
+    TheSim:SetMemoryTracking(false)
+end
+```
+
+在控制台中先调 `TrackMem()` 开始追踪，一段时间后调 `DumpMem()` 查看内存使用情况。
+
+---
+
+### 4.6.6 老手进阶：常见优化策略
+
+#### 策略 1：缓存频繁访问的值
+
+```lua
+-- 不好的写法（每次访问都通过元表查找）
+for i = 1, 100 do
+    local x, y, z = inst.Transform:GetWorldPosition()
+    -- 使用 x, y, z...
+end
+
+-- 优化写法（缓存引用）
+local transform = inst.Transform
+local GetWorldPosition = transform.GetWorldPosition
+for i = 1, 100 do
+    local x, y, z = GetWorldPosition(transform)
+end
+```
+
+#### 策略 2：使用标签替代组件检查
+
+```lua
+-- 慢（需要遍历 components 表）
+if inst.components.health ~= nil then
+
+-- 快（标签是引擎级的位操作检查）
+if inst:HasTag("health") then
+```
+
+标签检查在引擎层实现，比 Lua 表查找快得多。这就是为什么 `FindEntities` 的标签过滤参数如此重要。
+
+#### 策略 3：合理使用 `DoPeriodicTask` 的间隔
+
+| 场景 | 建议间隔 |
+|------|---------|
+| UI 动画/平滑效果 | 0（每帧，但使用 updatelooper） |
+| 近距离交互检测 | 0.5~1 秒 |
+| 远距离搜索/状态检查 | 2~5 秒 |
+| 全图统计/清理 | 10~30 秒 |
+
+#### 策略 4：避免在循环中创建临时表
+
+```lua
+-- 不好的写法
+for i = 1, 1000 do
+    local pos = Vector3(x, y, z)  -- 每次创建新对象
+end
+
+-- 优化写法
+local pos = Vector3(0, 0, 0)
+for i = 1, 1000 do
+    pos.x, pos.y, pos.z = x, y, z  -- 复用对象
+end
+```
+
+#### 策略 5：`FindEntities` 的标签参数用法
+
+`TheSim:FindEntities` 支持三个标签过滤参数：
+
+```lua
+local ents = TheSim:FindEntities(x, y, z, radius,
+    must_tags,       -- 必须有的标签（AND）
+    cant_tags,       -- 不能有的标签（NOT）
+    must_one_tags    -- 至少有其中一个标签（OR）
+)
+```
+
+**这些过滤在引擎 C++ 层执行**，比在 Lua 中遍历过滤快得多：
+
+```lua
+-- 慢
+local ents = TheSim:FindEntities(x, y, z, 50)
+for _, v in pairs(ents) do
+    if v:HasTag("monster") and not v:HasTag("player") then
+        -- ...
+    end
+end
+
+-- 快
+local ents = TheSim:FindEntities(x, y, z, 50, {"monster"}, {"player"})
+for _, v in pairs(ents) do
+    -- 已经过滤好了，直接使用
+end
+```
+
+#### 策略 6：利用事件驱动替代轮询
+
+```lua
+-- 轮询写法（消耗性能）
+inst:DoPeriodicTask(1, function()
+    if inst.components.health:GetPercent() < 0.5 then
+        DoSomething()
+    end
+end)
+
+-- 事件驱动写法（零轮询开销）
+inst:ListenForEvent("healthdelta", function(inst, data)
+    if inst.components.health:GetPercent() < 0.5 then
+        DoSomething()
+    end
+end)
+```
+
+事件驱动只在状态**真正变化**时执行代码，而轮询无论是否变化都在消耗计算资源。
+
+---
+
+### 4.6.7 实用速查：性能优化检查清单
+
+| 检查项 | 问题 | 优化方向 |
+|--------|------|---------|
+| `FindEntities` 半径 > 100 | 搜索范围过大 | 缩小半径，加标签过滤 |
+| `DoPeriodicTask(0)` | 每帧执行 | 增大间隔，或改用 updatelooper |
+| 循环中 `SpawnPrefab` | 频繁创建实体 | 对象池或降低频率 |
+| 大量字符串 `..` 拼接 | GC 压力 | 改用 `table.concat` |
+| 没有响应 `entitysleep` | 屏幕外仍在计算 | 加休眠/唤醒处理 |
+| 每帧遍历 `Ents` 全局表 | 遍历所有实体 | 缓存或缩小范围 |
+| 循环中创建 Vector3 | 临时对象过多 | 复用对象 |
+| 组件检查代替标签检查 | Lua 表查找 vs 位操作 | 用 `HasTag` 替代 |
+| 轮询检查状态 | 无谓的周期计算 | 改用事件监听 |
+
+---
+
+### 4.6.8 小结
+
+- 饥荒以 **30 FPS** 运行，每帧只有 **33ms** 的计算预算
+- **最常见的性能杀手**：全图搜索、DoPeriodicTask(0)、频繁创建/销毁实体、大量字符串拼接
+- 游戏有两个更新通道：**WallUpdate**（墙钟时间，始终运行）和 **Update**（仿真时间，暂停时停止）
+- **实体休眠机制**是引擎级的优化——你的 Mod 应该配合它暂停/恢复计算
+- **测量是优化的第一步**——先用 `os.clock()` 定位瓶颈，再针对性优化
+- **核心优化策略**：缩小搜索范围、降低更新频率、缓存频繁访问、标签替代组件检查、事件驱动替代轮询
+
+> **下一节预告**：4.7 节我们将讨论 Mod 冲突的快速排查方法——当多个 Mod 同时运行时，如何找出导致问题的那一个。
 
 ## 4.7 Mod 冲突的快速排查方法
 
