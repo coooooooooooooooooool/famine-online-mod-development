@@ -694,7 +694,675 @@ Shutdown()
 
 ## 4.2 控制台调试：c_spawn、c_give、c_select()、c_find() 等常用命令
 
-（待编写）
+### 本节导读
+
+游戏内控制台是 Mod 开发者的「实时调试器」——你可以在游戏运行时生成物品、查看实体状态、修改数值、甚至直接执行任意 Lua 代码。比起看日志的「事后分析」，控制台让你能**即时观察和干预**游戏状态。
+
+> **新手**可以从「怎么打开控制台、怎么用常用命令」开始；**进阶读者**可以了解命令的实现原理、`c_select` 的工作流程、以及本地执行与远程执行的区别；**老手**可以直接跳到「深入引擎」部分，了解控制台的底层执行管线、自动补全机制、以及如何编写自定义控制台命令。
+
+---
+
+### 4.2.1 快速入门：打开控制台并执行第一条命令
+
+**打开方式**：在游戏中按 **`~`**（波浪号）键，屏幕下方会弹出一个输入框，这就是控制台。
+
+按下 `~` 后，你会看到：
+- 底部的文本输入区域
+- 左侧可能显示 **`REMOTE`**（蓝色）或 **`LOCAL`**（红色）标签
+- 按 `Ctrl+Shift` 可在远程/本地模式间切换
+
+**第一条命令——生成一个物品**：
+
+```lua
+c_spawn("log", 5)
+```
+
+按回车，你的鼠标位置会出现 5 根木头。恭喜，你已经学会使用控制台了！
+
+> **新手注意**：如果你在玩联机版并且是**主机**，控制台默认是 `REMOTE` 模式（命令发到服务端执行）。如果你只是**加入**别人的服务器，只有管理员才能使用远程模式。
+
+---
+
+### 4.2.2 新手必备：最常用的控制台命令速查
+
+#### 生成与获取
+
+| 命令 | 作用 | 示例 |
+|------|------|------|
+| `c_spawn("prefab", n)` | 在鼠标位置生成 n 个预制体 | `c_spawn("spear")` 生成一把长矛 |
+| `c_give("prefab", n)` | 直接放入背包 n 个 | `c_give("cutgrass", 40)` 给 40 个割草 |
+| `c_equip("prefab")` | 给一个并自动装备 | `c_equip("armorwood")` 装备木甲 |
+
+**为什么有 `c_spawn` 和 `c_give` 两个？** 看源码就能理解。`c_spawn` 调用 `DebugSpawn` 在世界中创建实体（生成在鼠标位置），而 `c_give` 创建后还会调用 `inventory:GiveItem(inst)` 把实体放进背包：
+
+```lua
+-- c_give 的核心逻辑（scripts/consolecommands.lua 第 479-500 行）
+function c_give(prefab, count, dontselect)
+    local MainCharacter = ConsoleCommandPlayer()
+    prefab = string.lower(prefab)
+    if MainCharacter ~= nil then
+        local first_inst = nil
+        for i = 1, count or 1 do
+            local inst = DebugSpawn(prefab)
+            if inst ~= nil then
+                if first_inst == nil then first_inst = inst end
+                MainCharacter.components.inventory:GiveItem(inst)
+                if not dontselect then
+                    SetDebugEntity(inst)
+                end
+            end
+        end
+        return first_inst
+    end
+end
+```
+
+#### 选择与查找
+
+| 命令 | 作用 | 示例 |
+|------|------|------|
+| `c_select()` | 选中鼠标下的实体 | 把鼠标指向一棵树，输入 `c_select()` |
+| `c_sel()` | 获取当前选中的实体 | 选中后用 `c_sel()` 引用它 |
+| `c_find("prefab")` | 找到最近的某种预制体 | `c_find("beefalo")` 找到最近的牛 |
+| `c_findnext("prefab")` | 依次遍历所有同名预制体 | 连续调用可逐个查看 |
+| `c_list("prefab")` | 列出所有同名预制体的位置 | `c_list("pigman")` 列出所有猪人 |
+| `c_listtag("tag")` | 列出所有带指定标签的实体 | `c_listtag("monster")` |
+
+**`c_select()` 和 `c_sel()` 的区别**：`c_select()` 是"选中操作"——它获取鼠标下的实体并设为调试目标；`c_sel()` 是"读取操作"——它只是返回当前已选中的实体。看源码一目了然：
+
+```lua
+-- scripts/consolecommands.lua 第 299-310 行
+function c_sel()
+    return GetDebugEntity()
+end
+
+function c_select(inst)
+    if not inst then
+        inst = ConsoleWorldEntityUnderMouse()
+    end
+    print("Selected "..tostring(inst or "<nil>") )
+    SetDebugEntity(inst)
+    return inst
+end
+```
+
+**选中后能做什么？** 这是控制台调试最强大的地方——选中一个实体后，你可以对它执行任意操作：
+
+```lua
+c_select()                          -- 选中鼠标下的实体
+c_sel().components.health:Kill()    -- 杀死它
+c_sel().components.health:SetPercent(1) -- 或者满血
+c_sel():Remove()                    -- 直接删除
+```
+
+#### 玩家状态
+
+| 命令 | 作用 | 示例 |
+|------|------|------|
+| `c_sethealth(n)` | 设置血量（0~1 比例） | `c_sethealth(1)` 满血 |
+| `c_sethunger(n)` | 设置饱食度 | `c_sethunger(1)` 吃饱 |
+| `c_setsanity(n)` | 设置精神值 | `c_setsanity(1)` 满脑力 |
+| `c_godmode()` | 切换无敌模式 | 再次输入取消 |
+| `c_supergodmode()` | 无敌 + 补满所有状态 | 开发测试神器 |
+| `c_speedmult(n)` | 设置移动速度倍率 | `c_speedmult(4)` 四倍速 |
+
+这些设置状态的命令都依赖 `ConsoleCommandPlayer()` 来确定目标玩家：
+
+```lua
+-- scripts/consolecommands.lua 第 2-4 行
+function ConsoleCommandPlayer()
+    return (c_sel() ~= nil and c_sel():HasTag("player") and c_sel()) or ThePlayer or AllPlayers[1]
+end
+```
+
+**这个优先级很重要**：
+1. 如果你通过 `c_select()` 选中了一个**玩家**实体，命令会作用于**被选中的玩家**
+2. 否则作用于 `ThePlayer`（你自己）
+3. 再否则作用于 `AllPlayers[1]`（第一个玩家）
+
+这意味着你可以先 `c_select()` 点击别人的角色，再 `c_sethealth(1)` 给别人加血。
+
+#### 服务器管理
+
+| 命令 | 作用 | 示例 |
+|------|------|------|
+| `c_save()` | 手动存档 | |
+| `c_rollback(n)` | 回滚 n 天 | `c_rollback(1)` 回滚一天 |
+| `c_reset()` | 回滚到最近存档 | 等价于 `c_rollback(0)` |
+| `c_regenerateworld()` | 重新生成世界 | 不可撤销！ |
+| `c_shutdown()` | 关闭服务器 | 默认会先存档 |
+| `c_announce("msg")` | 全服公告 | `c_announce("5分钟后重启")` |
+
+---
+
+### 4.2.3 进阶：理解控制台的执行管线
+
+控制台看起来只是"输入命令→执行"，但背后有一套完整的管线。理解它有助于你搞清楚：**命令在哪里执行？为什么有些命令只在服务端生效？**
+
+#### 控制台 UI：`ConsoleScreen`
+
+当你按 `~` 打开控制台时，游戏推入一个 `ConsoleScreen` 界面（`scripts/screens/consolescreen.lua`）。当你按回车时，执行流程如下：
+
+```lua
+-- scripts/screens/consolescreen.lua 第 160-174 行
+function ConsoleScreen:Run()
+    local fnstr = self.console_edit:GetString()
+
+    if fnstr ~= "" then
+        ConsoleScreenSettings:AddLastExecutedCommand(fnstr, self.toggle_remote_execute)
+    end
+
+    if self.toggle_remote_execute and TheNet:GetIsClient() and (TheNet:GetIsServerAdmin() or IsConsole()) then
+        local x, y, z = TheSim:ProjectScreenPos(TheSim:GetPosition())
+        TheNet:SendRemoteExecute(fnstr, x, z)
+    else
+        ExecuteConsoleCommand(fnstr)
+    end
+end
+```
+
+**两条执行路径**：
+
+1. **本地执行**（`LOCAL` 模式）：直接调用 `ExecuteConsoleCommand(fnstr)`，命令在**当前进程**的 Lua 环境中执行
+2. **远程执行**（`REMOTE` 模式）：调用 `TheNet:SendRemoteExecute(fnstr, x, z)`，命令字符串被发到**服务端**执行
+
+#### `ExecuteConsoleCommand` 的工作方式
+
+```lua
+-- scripts/mainfunctions.lua 第 2129-2146 行
+function ExecuteConsoleCommand(fnstr, guid, x, z)
+    local saved_ThePlayer
+    if guid ~= nil then
+        saved_ThePlayer = ThePlayer
+        ThePlayer = guid ~= nil and Ents[guid] or nil
+    end
+    TheInput.overridepos = x ~= nil and z ~= nil and Vector3(x, 0, z) or nil
+
+    local status, r = pcall(loadstring(fnstr))
+    if not status then
+        nolineprint(r)
+    end
+
+    if guid ~= nil then
+        ThePlayer = saved_ThePlayer
+    end
+    TheInput.overridepos = nil
+end
+```
+
+**为什么需要 `overridepos`？** 这是为远程执行设计的。当客户端发送远程命令时，会附带客户端当前的鼠标世界坐标 `(x, z)`。服务端收到后，通过 `TheInput.overridepos` 临时伪造鼠标位置——这样 `c_spawn` 之类需要"鼠标位置"的命令就能在正确的位置生成物品。
+
+**为什么用 `pcall` + `loadstring`？** `loadstring` 把你输入的字符串编译成 Lua 函数，`pcall` 保护性调用这个函数。如果你的命令有语法错误或运行时错误，`pcall` 会捕获异常并通过 `nolineprint` 输出错误信息，而不会导致游戏崩溃。
+
+#### 本地 vs 远程：哪些命令需要远程？
+
+看 `c_save` 的实现就能理解这个设计模式：
+
+```lua
+function c_save()
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+        c_remote("c_save()")  -- 不是服务端？转发到服务端
+        return
+    end
+
+    if TheWorld ~= nil and TheWorld.ismastersim then
+        TheWorld:PushEvent("ms_save")  -- 在服务端执行真正的存档
+    end
+end
+```
+
+**模式**：先检查 `TheWorld.ismastersim`——如果当前不是主模拟（服务端），就用 `c_remote()` 把命令发到服务端。这个模式在 `c_reset`、`c_shutdown`、`c_godmode`、`c_regenerateworld` 等命令中反复出现。
+
+`c_remote` 本身非常简单：
+
+```lua
+function c_remote( fnstr )
+    local x, y, z = TheSim:ProjectScreenPos(TheSim:GetPosition())
+    TheNet:SendRemoteExecute(fnstr, x, z)
+end
+```
+
+**简而言之**：涉及游戏世界状态修改的命令必须在服务端执行（存档、回滚、生成实体等），涉及 UI 或客户端本地状态的命令可以在本地执行。
+
+#### 权限控制
+
+不是任何人都能远程执行命令的。在 `ConsoleScreen:ToggleRemoteExecute` 中：
+
+```lua
+local is_valid_time_to_use_remote = TheNet:GetIsClient() and (TheNet:GetIsServerAdmin() or IsConsole())
+```
+
+只有**服务器管理员**（`GetIsServerAdmin()`）或**主机**（`IsConsole()`）才能使用远程执行模式。普通玩家打开控制台只能执行本地命令——这就是为什么普通玩家不能在别人的服务器上作弊。
+
+---
+
+### 4.2.4 进阶：深入理解关键命令的实现
+
+#### `c_spawn` —— 生成实体
+
+```lua
+-- scripts/consolecommands.lua 第 208-225 行
+function c_spawn(prefab, count, dontselect)
+    count = count or 1
+    local inst = nil
+
+    prefab = string.lower(prefab)
+
+    for i = 1, count do
+        inst = DebugSpawn(prefab)
+        if inst and inst.components.skinner ~= nil and IsRestrictedCharacter(prefab) then
+            inst.components.skinner:SetSkinMode("normal_skin")
+        end
+    end
+    if not dontselect then
+        SetDebugEntity(inst)
+    end
+    SuUsed("c_spawn_"..prefab, true)
+    return inst
+end
+```
+
+几个值得注意的细节：
+
+1. **`string.lower(prefab)`**：prefab 名称会被强制转为小写——所以 `c_spawn("Log")` 和 `c_spawn("log")` 是一样的
+2. **`DebugSpawn`**：这不是 `SpawnPrefab`，而是一个封装函数，会在鼠标位置（`ConsoleWorldPosition()`）生成实体
+3. **`SetDebugEntity(inst)`**：默认会选中最后生成的实体——这意味着生成后你可以立刻用 `c_sel()` 引用它
+4. **`SuUsed`**：这是一个作弊使用记录函数，用来标记玩家使用了控制台命令（在某些成就系统中可能禁用对应成就）
+5. **返回值**：`c_spawn` 会**返回**最后生成的实体，你可以在控制台中直接链式调用：`c_spawn("spear").components.finiteuses:SetPercent(0.1)`
+
+#### `c_find` 与 `c_findnext` —— 查找实体
+
+`c_find` 找到**最近**的一个同名实体：
+
+```lua
+function c_find(prefab, radius, inst)
+    inst = ListingOrConsolePlayer(inst)
+    radius = radius or 9001     -- 默认搜索范围：9001（基本覆盖整个地图）
+
+    local trans = inst.Transform
+    local found = nil
+    local founddistsq = nil
+
+    local x,y,z = trans:GetWorldPosition()
+    local ents = TheSim:FindEntities(x,y,z, radius)
+    for k,v in pairs(ents) do
+        if v ~= inst and v.prefab == prefab then
+            if not founddistsq or inst:GetDistanceSqToInst(v) < founddistsq then
+                found = v
+                founddistsq = inst:GetDistanceSqToInst(v)
+            end
+        end
+    end
+    return found
+end
+```
+
+**为什么用 `GetDistanceSqToInst` 而不是 `GetDistanceToInst`？** 因为计算距离平方比计算距离本身快（省去了开方运算）。在需要比较大小时，比较距离平方和比较距离是等价的——这是游戏开发中常见的性能优化技巧。
+
+`c_findnext` 更复杂——它维护了一个 `lastfound` 变量（上次找到的实体 GUID），每次调用时跳过已找到的，实现**逐个遍历**：
+
+```lua
+function c_findnext(prefab, radius, inst)
+    -- ...
+    for k,v in pairs(ents) do
+        if v ~= inst and v.prefab == prefab then
+            total = total+1
+            -- 找 GUID 比 lastfound 大的最小实体
+            if v.GUID > lastfound and (foundlowestid == nil or v.GUID < foundlowestid) then
+                idx = total
+                found = v
+                foundlowestid = v.GUID
+            end
+            -- 同时记录 GUID 最小的实体（用于循环回绕）
+            if not reallowestid or v.GUID < reallowestid then
+                reallowest = v
+                reallowestid = v.GUID
+            end
+        end
+    end
+    if not found then
+        found = reallowest  -- 遍历到头了，回到 GUID 最小的
+    end
+    -- ...
+end
+```
+
+**实用技巧**：`c_findnext` 配合 `c_goto` 可以快速巡视地图上的所有同类实体——`c_goto(c_findnext("pighouse"))` 会依次传送到每个猪人房。
+
+#### `c_godmode` 与 `c_supergodmode`
+
+`c_godmode` 的实现揭示了一个有趣的设计——它不只是切换无敌，遇到鬼魂玩家还会自动复活：
+
+```lua
+function c_godmode(player)
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+        c_remote("c_godmode()")
+        return
+    end
+
+    player = ListingOrConsolePlayer(player)
+    if player ~= nil then
+        if player:HasTag("playerghost") then
+            player:PushEvent("respawnfromghost")
+            print("Reviving "..player.name.." from ghost.")
+            return
+        elseif player:HasTag("corpse") then
+            player:PushEvent("respawnfromcorpse")
+            print("Reviving "..player.name.." from corpse.")
+            return
+        elseif player.components.health ~= nil then
+            local godmode = player.components.health.invincible
+            player.components.health:SetInvincible(not godmode)
+            print("God mode: "..tostring(not godmode))
+        end
+    end
+end
+```
+
+`c_supergodmode` 在此基础上还会调用：
+
+```lua
+c_sethealth(1)
+c_setsanity(1)
+c_sethunger(1)
+c_settemperature(25)
+c_setmoisture(0)
+```
+
+**注意**：`c_supergodmode` 调用的 `c_sethealth` 等函数使用 `ConsoleCommandPlayer()` 来确定目标。如果你之前 `c_select` 了另一个玩家，状态修改可能会作用到那个玩家身上。这是一个容易踩的坑。
+
+#### `c_dump` —— 转储实体信息
+
+```lua
+function c_dump()
+    local ent = GetDebugEntity()
+    if not ent then
+        ent = ConsoleWorldEntityUnderMouse()
+    end
+    DumpEntity(ent)
+end
+```
+
+`c_dump` 会打印实体的所有组件、标签、变量等详细信息——这是检查实体状态的终极工具。配合 `c_select()` 使用效果最佳。
+
+---
+
+### 4.2.5 进阶：控制台中的实用组合技
+
+#### 组合一：精确生成并配置
+
+```lua
+-- 生成一把武器并设置耐久为 10%
+local spear = c_spawn("spear")
+spear.components.finiteuses:SetPercent(0.1)
+```
+
+控制台支持多行逻辑（通过 `local` 变量或利用返回值），不过每次回车只能执行一行。更实用的做法是：
+
+```lua
+c_spawn("spear").components.finiteuses:SetPercent(0.1)
+```
+
+#### 组合二：查找并传送
+
+```lua
+c_goto(c_find("chester"))    -- 传送到切斯特身边
+c_goto(c_findnext("pigking")) -- 传送到猪王
+```
+
+#### 组合三：批量检查实体
+
+```lua
+c_countprefabs()   -- 列出世界中所有 prefab 的数量
+c_list("spider")   -- 列出所有蜘蛛的位置
+c_listtag("tree")  -- 列出所有带 "tree" 标签的实体
+```
+
+#### 组合四：选中后操作
+
+```lua
+c_select()                                     -- 选中鼠标下的实体
+c_sel().components.health:SetPercent(0.5)       -- 设为半血
+c_sel().components.combat:GetAttacked(ThePlayer, 100) -- 让它受到100点伤害
+c_sel():PushEvent("death")                     -- 直接触发死亡事件
+c_sel():Remove()                               -- 从世界中删除
+```
+
+#### 组合五：修改世界状态
+
+```lua
+c_dumpworldstate()      -- 查看当前世界状态
+c_simphase("night")     -- 立刻切换到夜晚
+TheWorld:PushEvent("ms_advanceseason")  -- 跳过当前季节（需远程模式）
+TheWorld:PushEvent("ms_setseason", "winter") -- 设置为冬天
+```
+
+#### 组合六：针对其他玩家操作
+
+```lua
+c_listplayers()                -- 查看所有在线玩家
+-- 输出形如：*[1] (KU_xxxxx) PlayerName <wilson>
+-- * 号表示管理员
+
+c_find("wilson", nil, UserToPlayer("KU_xxxxx"))  -- 以特定玩家为中心搜索
+```
+
+---
+
+### 4.2.6 老手进阶：控制台的底层机制
+
+#### 自动补全系统
+
+控制台支持 Tab 自动补全。当你输入 `c_sp` 按 Tab 时，会自动补全为 `c_spawn`。这个功能在 `ConsoleScreen:DoInit` 中初始化：
+
+```lua
+-- scripts/screens/consolescreen.lua DoInit 中
+if prediction_command_c == nil then
+    prediction_command_c = {}
+    for k, v in pairs(_G) do
+        if type(k) == "string" and k:sub(1, 2) == "c_" and (type(v) == "function" or type(v) == "number") then
+            prediction_command_c[#prediction_command_c + 1] = k
+        end
+    end
+    table.sort(prediction_command_c)
+end
+```
+
+**这意味着什么？** 如果你在 `modmain.lua` 中定义了以 `c_` 开头的全局函数，它会**自动出现在控制台的补全列表中**！这是编写自定义调试命令的基础。
+
+#### 编写自定义控制台命令
+
+只需在 `modmain.lua` 中定义 `c_` 开头的全局函数：
+
+```lua
+-- 在 modmain.lua 中
+function c_mymod_test()
+    local player = ConsoleCommandPlayer()
+    if player then
+        print("当前玩家:", player.name)
+        print("位置:", player.Transform:GetWorldPosition())
+        print("血量:", player.components.health:GetPercent())
+    end
+end
+
+function c_mymod_killall(prefab)
+    local x, y, z = ConsoleCommandPlayer().Transform:GetWorldPosition()
+    local ents = TheSim:FindEntities(x, y, z, 50)
+    local count = 0
+    for _, v in pairs(ents) do
+        if v.prefab == prefab and v.components.health then
+            v.components.health:Kill()
+            count = count + 1
+        end
+    end
+    print("已击杀 " .. count .. " 个 " .. prefab)
+end
+```
+
+然后在控制台中输入 `c_mymod_test()` 或 `c_mymod_killall("spider")` 即可。
+
+> **命名建议**：自定义命令建议使用 `c_<modname>_<command>` 格式（如 `c_mymod_debug`），避免与其他 Mod 或未来的官方命令冲突。
+
+#### `SetDebugEntity` 的底层实现
+
+控制台选中系统的核心是 `SetDebugEntity`（定义在 `scripts/mainfunctions.lua` 第 650-660 行）：
+
+```lua
+function SetDebugEntity(inst)
+    if debug_entity ~= nil and debug_entity:IsValid() then
+        debug_entity.entity:SetSelected(false)   -- 取消旧实体的选中高亮
+    end
+    if inst ~= nil and inst:IsValid() then
+        debug_entity = inst
+        inst.entity:SetSelected(true)            -- 新实体显示选中高亮
+    else
+        debug_entity = nil
+    end
+end
+```
+
+`entity:SetSelected(true)` 会在引擎层给实体添加**可见的选中高亮**（黄色轮廓），这就是你 `c_select()` 后能在游戏中看到实体被高亮的原因。`debug_entity` 是模块局部变量，通过 `GetDebugEntity()` 和 `SetDebugEntity()` 对外暴露。
+
+#### `ConsoleWorldEntityUnderMouse` 的工作原理
+
+```lua
+function ConsoleWorldEntityUnderMouse()
+    if TheInput.overridepos == nil then
+        return TheInput:GetWorldEntityUnderMouse()  -- 正常情况：读取鼠标下的实体
+    else
+        -- 远程执行情况：用 overridepos 模拟的坐标查找附近实体
+        local x, y, z = TheInput.overridepos:Get()
+        local ents = TheSim:FindEntities(x, y, z, 1)
+        for i, v in ipairs(ents) do
+            if v.entity:IsVisible() then
+                return v
+            end
+        end
+    end
+end
+```
+
+**两种情况**：
+- **本地执行**：直接调用 `TheInput:GetWorldEntityUnderMouse()`，这个函数读取当前帧鼠标所在位置的实体（基于引擎的碰撞检测）
+- **远程执行**：鼠标位置是客户端发过来的坐标，通过 `TheSim:FindEntities` 在该坐标附近 1 单位半径内搜索可见实体
+
+#### 控制台命令执行的完整时序
+
+```
+玩家按 ~ → PushScreen(ConsoleScreen)
+  ↓
+输入命令文本，按 Enter
+  ↓
+ConsoleScreen:OnTextEntered()
+  ↓
+DoTaskInTime(0, DoRun)  ← 延迟一帧，避免输入状态冲突
+  ↓
+ConsoleScreen:Run()
+  ├─ 保存到命令历史
+  ├─ [REMOTE 模式] TheNet:SendRemoteExecute(fnstr, x, z)
+  │     → 网络传输到服务端
+  │     → 服务端 ExecuteConsoleCommand(fnstr, guid, x, z)
+  │         → 临时设置 ThePlayer 和 overridepos
+  │         → pcall(loadstring(fnstr))
+  │         → 恢复原始状态
+  └─ [LOCAL 模式] ExecuteConsoleCommand(fnstr)
+        → pcall(loadstring(fnstr))
+        → 错误时 nolineprint(r) 输出到控制台
+  ↓
+ConsoleScreen:Close()
+  ↓
+ConsoleScreenSettings:Save()  ← 保存命令历史到磁盘
+```
+
+#### `d_` 前缀的调试命令
+
+除了 `c_` 命令，游戏还有一套 `d_` 前缀的开发者调试命令（定义在 `scripts/debugcommands.lua`）。但这些命令只在 `CHEATS_ENABLED` 为 `true` 时才会加载：
+
+```lua
+-- scripts/main.lua 第 534-536 行
+if CHEATS_ENABLED then
+    require "debugcommands"
+end
+```
+
+`d_` 命令通常更底层，比如 `d_spawnlist`（批量生成一组预制体）、`d_anim`（操作实体动画）等。对于普通 Mod 开发者来说，`c_` 命令已经足够了。
+
+---
+
+### 4.2.7 实用速查：控制台命令分类表
+
+#### 生成与物品
+
+| 命令 | 说明 |
+|------|------|
+| `c_spawn("prefab", n)` | 在鼠标位置生成 |
+| `c_give("prefab", n)` | 放入背包 |
+| `c_equip("prefab")` | 给予并装备 |
+| `c_countprefabs()` | 统计世界中所有 prefab 类型及数量 |
+
+#### 查找与定位
+
+| 命令 | 说明 |
+|------|------|
+| `c_select()` | 选中鼠标下的实体 |
+| `c_sel()` | 返回当前选中实体 |
+| `c_find("prefab", radius)` | 查找最近的 prefab |
+| `c_findnext("prefab")` | 依次遍历同名 prefab |
+| `c_list("prefab")` | 列出所有同名 prefab 位置 |
+| `c_listtag("tag")` | 列出所有带指定 tag 的实体 |
+| `c_goto(inst)` | 传送到指定实体 |
+| `c_gonext("prefab")` | 传送到下一个同名实体 |
+| `c_inst(guid)` | 通过 GUID 获取实体引用 |
+
+#### 玩家状态
+
+| 命令 | 说明 |
+|------|------|
+| `c_sethealth(n)` | 设置血量百分比 (0~1) |
+| `c_sethunger(n)` | 设置饱食度百分比 |
+| `c_setsanity(n)` | 设置精神值百分比 |
+| `c_settemperature(n)` | 设置体温（数值） |
+| `c_setmoisture(n)` | 设置湿度百分比 |
+| `c_godmode()` | 切换无敌 |
+| `c_supergodmode()` | 无敌 + 补满状态 |
+| `c_speedmult(n)` | 移动速度倍率 |
+
+#### 服务器管理
+
+| 命令 | 说明 |
+|------|------|
+| `c_save()` | 存档 |
+| `c_rollback(n)` | 回滚 n 天 |
+| `c_reset()` | 回滚到最近存档 |
+| `c_regenerateworld()` | 重新生成世界 |
+| `c_shutdown(save)` | 关服（默认存档） |
+| `c_announce("msg")` | 全服公告 |
+| `c_listplayers()` | 列出在线玩家 |
+| `c_listallplayers()` | 列出 AllPlayers 表 |
+| `c_despawn(player)` | 踢回角色选择 |
+
+#### 信息查看
+
+| 命令 | 说明 |
+|------|------|
+| `c_dump()` | 转储选中实体详细信息 |
+| `c_dumpseasons()` | 打印季节信息 |
+| `c_dumpworldstate()` | 打印世界状态 |
+| `c_tile()` | 查看光标下的地皮类型 |
+| `c_remote("lua代码")` | 远程执行 Lua 代码 |
+
+---
+
+### 4.2.8 小结
+
+- **控制台**（按 `~` 打开）是实时调试利器，支持执行任意 Lua 代码
+- **`c_spawn` / `c_give`** 用于生成物品，**`c_select` / `c_sel`** 用于选中和操作实体
+- **REMOTE / LOCAL** 模式决定命令在服务端还是客户端执行——涉及世界状态的命令必须在服务端执行
+- **控制台命令本质上就是全局 Lua 函数**——你可以在 Mod 中定义 `c_` 开头的函数来创建自定义命令
+- **`ConsoleCommandPlayer()`** 决定了命令作用的目标玩家——先看 `c_sel()`，再看 `ThePlayer`，最后看 `AllPlayers[1]`
+- **`SetDebugEntity` / `GetDebugEntity`** 是选中系统的核心——选中后可以对实体做任意操作
+
+> **下一节预告**：4.3 节我们将学习 `print` 调试法与 `debugtools.lua`，这是在 Mod 代码中主动输出调试信息的方法——和控制台的"外部干预"互补，`print` 调试让你能从代码内部追踪执行流程。
 
 ## 4.3 print 调试法与 debugtools.lua
 
