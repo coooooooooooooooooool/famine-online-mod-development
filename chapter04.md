@@ -2740,7 +2740,498 @@ end
 
 ## 4.5 网络相关 bug 的调试思路（客户端 vs 服务端）
 
-（待编写）
+### 本节导读
+
+饥荒联机版 Mod 开发中最令人头疼的 bug 类型，非网络相关莫属。你的 Mod 在单机测试（主机模式）完美运行，一到联机就各种不正常——动画不同步、数值不更新、操作无响应。这些问题的根源都在于**客户端与服务端的代码执行差异**。
+
+> **新手**可以从「理解客户端和服务端的区别」开始；**进阶读者**可以学习 NetVar、replica、classified 的数据同步机制；**老手**可以深入 Mod RPC 系统和高级调试技巧。
+
+---
+
+### 4.5.1 快速入门：为什么联机版比单机版难？
+
+在单机版中，所有代码都在一个进程中运行。但在联机版中，游戏被拆成了两部分：
+
+```
+┌─────────────┐              ┌─────────────┐
+│   服务端     │  ◄─ 网络 ─►  │   客户端     │
+│  (权威模拟)  │              │  (表现层)    │
+│             │              │             │
+│ - 伤害计算   │              │ - 动画播放   │
+│ - AI 决策    │              │ - 音效播放   │
+│ - 物品生成   │              │ - UI 显示    │
+│ - 世界状态   │              │ - 输入处理   │
+└─────────────┘              └─────────────┘
+```
+
+**核心规则**：
+- **服务端**掌握所有权威数据——血量、物品、位置都以服务端为准
+- **客户端**只负责展示——它看到的数据是服务端同步过来的
+- 两边运行的**Lua 代码是相同的**，但通过 `TheWorld.ismastersim` 走不同的代码分支
+
+**这意味着什么？** 你的 Mod 代码会在两个进程中各执行一次。如果你不区分服务端和客户端，同一段代码可能会：
+- 在服务端执行成功，在客户端崩溃（因为某些组件只存在于服务端）
+- 在两端都执行，导致效果翻倍
+- 只在客户端执行，服务端看不到任何变化
+
+---
+
+### 4.5.2 新手必知：prefab 中的 ismastersim 模式
+
+几乎所有官方 Prefab 都遵循一个固定模式。以一个简化的 Prefab 为例：
+
+```lua
+local function fn()
+    local inst = CreateEntity()
+
+    -- ============ 两端都执行的代码 ============
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()      -- 标记这个实体需要网络同步
+
+    -- 设置动画、标签等（两端都需要）
+    inst.AnimState:SetBank("myitem")
+    inst.AnimState:SetBuild("myitem")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst.entity:SetPristine()     -- 标记初始化完成
+    if not TheWorld.ismastersim then
+        return inst               -- 客户端到此为止，直接返回
+    end
+
+    -- ============ 只在服务端执行的代码 ============
+    inst:AddComponent("inspectable")
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("health")
+    inst.components.health:SetMaxHealth(100)
+
+    return inst
+end
+```
+
+**关键分界线**：`entity:SetPristine()` + `if not TheWorld.ismastersim then return inst end`
+
+- `SetPristine()` 之前的代码**两端都执行**——主要是网络变量声明、动画、标签
+- `SetPristine()` 之后的代码**只在服务端执行**——主要是添加组件、设置组件参数
+
+**为什么要这么分？** 因为组件（`components.health` 等）包含权威游戏逻辑，只应在服务端运行。客户端通过 `replica`（副本）来获取只读的状态信息。
+
+> **新手最常犯的错误**：在 `AddPrefabPostInit` 中直接操作 `components` 而不检查 `ismastersim`，导致客户端崩溃。
+
+---
+
+### 4.5.3 进阶：理解数据同步的三层架构
+
+饥荒联机版的数据同步采用三层架构：**组件（Component）→ Classified → Replica**
+
+```
+服务端:                              客户端:
+┌──────────────┐                    ┌──────────────┐
+│ components.  │                    │  replica.    │
+│   health     │ ─── set() ──►     │   health     │
+│ (完整逻辑)    │   net_ushortint   │ (只读接口)    │
+└──────┬───────┘    classified      └──────┬───────┘
+       │                                    │
+       ▼                                    ▼
+  SetMaxHealth()                      Max() → 读 classified
+  DoDelta()                          GetPercent() → 读 classified
+  Kill()                             IsDead() → 读 tag
+```
+
+#### 第一层：Component（组件）—— 服务端独占
+
+`components.health` 只在 `TheWorld.ismastersim` 为 `true` 时存在。它包含完整的游戏逻辑——受伤、死亡、回血等计算全在这里。
+
+#### 第二层：Classified（分类实体）—— 网络变量载体
+
+`player_classified` 是一个特殊的实体，上面挂满了 `net_*` 类型的网络变量。服务端通过 `net_xxx:set(value)` 写入值，引擎自动同步到客户端。
+
+在 `scripts/netvars.lua` 中定义了所有可用的网络变量类型：
+
+```lua
+--  net_bool                1-bit boolean
+--  net_tinybyte            3-bit unsigned integer   [0..7]
+--  net_smallbyte           6-bit unsigned integer   [0..63]
+--  net_byte                8-bit unsigned integer   [0..255]
+--  net_shortint            16-bit signed integer    [-32767..32767]
+--  net_ushortint           16-bit unsigned integer  [0..65535]
+--  net_int                 32-bit signed integer
+--  net_uint                32-bit unsigned integer
+--  net_float               32-bit float
+--  net_hash                32-bit hash of string
+--  net_string              variable length string
+--  net_entity              entity instance
+```
+
+**关键规则**（来自 `netvars.lua` 注释）：
+
+> netvars must exist and be declared identically on server and clients for each entity, otherwise entity deserialization will fail. Note that this means if a MOD uses netvars, then server and clients must all have the same MOD active.
+
+翻译：**网络变量必须在服务端和客户端以完全相同的方式声明，否则实体反序列化会失败。如果 Mod 使用了 NetVar，那么服务端和客户端必须都启用这个 Mod。**
+
+#### 第三层：Replica（副本）—— 客户端只读接口
+
+`health_replica.lua` 是客户端读取血量数据的门面。它的每个方法都遵循一个固定模式：
+
+```lua
+-- scripts/components/health_replica.lua 第 90-98 行
+function Health:GetPercent()
+    if self.inst.components.health ~= nil then
+        -- 服务端：直接从组件读
+        return self.inst.components.health:GetPercent()
+    elseif self.classified ~= nil then
+        -- 客户端：从 classified 的网络变量读
+        return self.classified.currenthealth:value() / self.classified.maxhealth:value()
+    else
+        -- 都没有：返回默认值
+        return 1
+    end
+end
+```
+
+**三条路径**：
+1. `components.health` 存在（服务端）→ 直接读权威数据
+2. `classified` 存在（客户端）→ 从网络变量读同步数据
+3. 都不存在 → 返回安全默认值
+
+**为什么不让客户端直接访问 `components.health`？** 因为 `components.health` 包含完整的游戏逻辑代码（DoDelta、Kill 等），如果客户端也执行这些逻辑，就会和服务端产生不一致。Replica 只暴露"读"接口，确保客户端只能查看、不能修改。
+
+---
+
+### 4.5.4 进阶：NetVar 的读写与 dirty 事件
+
+#### 基本读写
+
+```lua
+-- 服务端写（会自动同步到客户端）
+my_netvar:set(42)
+
+-- 两端读
+local val = my_netvar:value()
+
+-- 本地写（不同步，不触发 dirty 事件）
+my_netvar:set_local(42)
+```
+
+`set()` 和 `set_local()` 的区别至关重要：
+
+- **`set(x)`**：在服务端调用，值会通过网络同步到客户端。如果值真的改变了，会触发 dirty 事件
+- **`set_local(x)`**：在任何端调用，只修改本地值，不同步，不触发 dirty。用途是客户端本地预测（比如平滑插值计时器）
+- **`value()`**：读取当前值，两端都可用
+
+#### dirty 事件：客户端如何知道值变了
+
+当服务端 `set()` 改变了值，客户端收到新值后会触发一个**dirty 事件**。这个事件名在声明 NetVar 时指定：
+
+```lua
+-- 声明（在 SetPristine 之前，两端都执行）
+inst.my_netvar = net_byte(inst.GUID, "mymod.myvar", "myvardirty")
+-- 第三个参数 "myvardirty" 就是 dirty 事件名
+
+-- 客户端监听（在 SetPristine 之后，客户端分支中）
+inst:ListenForEvent("myvardirty", function(inst)
+    -- 值变了！更新 UI 或播放动画
+    local new_value = inst.my_netvar:value()
+    print("新值:", new_value)
+end)
+```
+
+#### `net_event`：一次性脉冲触发
+
+有些场景不需要同步"值"，而是同步"事件"——比如"播放一个音效"、"显示一个特效"。`net_event` 就是为此设计的：
+
+```lua
+-- scripts/netvars.lua 第 85-92 行
+net_event = Class(function(self, guid, event)
+    self._bool = net_bool(guid, event, event)
+end)
+
+function net_event:push()
+    self._bool:set_local(true)
+    self._bool:set(true)
+end
+```
+
+它本质上是一个 `net_bool`，`:push()` 时先 `set_local(true)` 再 `set(true)`。客户端监听 dirty 事件来响应。
+
+---
+
+### 4.5.5 进阶：Mod RPC —— 客户端向服务端发消息
+
+NetVar 是服务端 → 客户端的**单向同步**。当客户端需要**请求**服务端做某件事时（比如"我点击了自定义按钮"），就需要用 **RPC（Remote Procedure Call）**。
+
+#### 注册 RPC Handler
+
+```lua
+-- 在 modmain.lua 中（两端都会执行）
+AddModRPCHandler("mymod", "do_something", function(player, param1, param2)
+    -- 这个函数只在服务端执行
+    print("收到来自", player.name, "的请求:", param1, param2)
+    -- 执行服务端逻辑...
+end)
+```
+
+底层实现在 `scripts/networkclientrpc.lua` 第 1663-1678 行：
+
+```lua
+function AddModRPCHandler(namespace, name, fn)
+    if MOD_RPC[namespace] == nil then
+        MOD_RPC[namespace] = {}
+        MOD_RPC_HANDLERS[namespace] = {}
+        -- ...
+    end
+
+    table.insert(MOD_RPC_HANDLERS[namespace], fn)
+    MOD_RPC[namespace][name] = { namespace = namespace, id = #MOD_RPC_HANDLERS[namespace] }
+
+    -- 每注册一个 Mod RPC，限流配额会增加
+    RPC_QUEUE_RATE_LIMIT = RPC_QUEUE_RATE_LIMIT + RPC_QUEUE_RATE_LIMIT_PER_MOD
+end
+```
+
+#### 客户端发送 RPC
+
+```lua
+-- 在客户端代码中
+SendModRPCToServer(MOD_RPC["mymod"]["do_something"], "hello", 42)
+```
+
+#### 三种 RPC 方向
+
+| 函数 | 方向 | 用途 |
+|------|------|------|
+| `SendModRPCToServer` | 客户端 → 服务端 | 客户端请求服务端执行操作 |
+| `SendModRPCToClient` | 服务端 → 客户端 | 服务端通知特定客户端（较少用） |
+| `SendModRPCToShard` | 分片 → 分片 | 跨世界通信（主世界↔洞穴） |
+
+---
+
+### 4.5.6 进阶：常见网络 bug 及诊断
+
+#### Bug 1："功能在主机上正常，加入的客户端看不到效果"
+
+**症状**：主机玩家看到自定义特效/UI，其他玩家看不到。
+
+**原因**：你只在服务端修改了状态，没有通过 NetVar 同步到客户端。
+
+**诊断**：
+1. 检查相关代码是否在 `ismastersim` 分支中
+2. 如果是，检查是否有对应的 NetVar 把变化同步给客户端
+3. 如果只是视觉效果（动画、粒子），应该同时在客户端触发
+
+**修复模板**：
+```lua
+-- 服务端修改逻辑
+if TheWorld.ismastersim then
+    inst.my_value = 42
+    inst.my_netvar:set(42)   -- 同步给客户端
+end
+
+-- 客户端响应（两端都监听 dirty 事件）
+inst:ListenForEvent("mydirty", function(inst)
+    local val = inst.my_netvar:value()
+    -- 更新 UI/动画...
+end)
+```
+
+#### Bug 2："客户端崩溃：attempt to index a nil value"
+
+**症状**：主机正常，客户端加入后崩溃。
+
+**原因**：代码试图在客户端访问只有服务端才有的 `components`。
+
+**诊断**：
+1. 看日志中崩溃的行号
+2. 检查那行代码是否访问了 `inst.components.xxx`
+3. 检查是否缺少 `if not TheWorld.ismastersim then return end`
+
+**典型错误**：
+```lua
+AddPrefabPostInit("wilson", function(inst)
+    -- 缺少 ismastersim 检查！
+    inst.components.health:SetMaxHealth(200)  -- 客户端没有 health 组件 → 崩溃
+end)
+```
+
+#### Bug 3："操作没反应"——客户端请求丢失
+
+**症状**：点击自定义按钮后什么都不发生。
+
+**原因**：客户端的操作没有通过 RPC 发到服务端。
+
+**诊断**：
+1. 在 RPC handler 中加 `print` 确认是否被调用
+2. 检查 `AddModRPCHandler` 和 `SendModRPCToServer` 的 namespace/name 是否一致
+3. 检查 `server_log` 中是否有 `"Rate limiting RPCs"` 限流提示
+
+#### Bug 4：RPC 限流
+
+**症状**：功能偶尔不响应，`server_log` 中出现 `"Rate limiting RPCs from"`。
+
+**原因**：Mod 发送 RPC 的频率超过了限流阈值。
+
+**解决**：降低发送频率。如果需要频繁同步数据，改用 NetVar 而非 RPC。
+
+#### Bug 5："主机上测试正常"的陷阱
+
+**症状**：本地开服测试一切正常，别人加入后出问题。
+
+**原因**：主机玩家同时是服务端和客户端，`TheWorld.ismastersim` 为 `true`。很多 bug 只在纯客户端（`ismastersim` 为 `false`）上才暴露。
+
+**诊断方法**：
+1. **开两个客户端测试**：用一台电脑开服，另一台（或同一台的另一个实例）加入
+2. **在代码中打印 `ismastersim`**：`print("ismastersim:", TheWorld.ismastersim)` 确认代码在哪端执行
+3. **同时查看两份日志**：`server_log.txt` 和 `client_log.txt`
+
+---
+
+### 4.5.7 老手进阶：Replica 扩展与 Classified 自定义
+
+#### 为你的 Mod 添加自定义 Replica
+
+如果你的 Mod 添加了自定义组件，并且需要在客户端访问某些数据，你需要创建 replica：
+
+**步骤 1：注册可复制组件**
+
+```lua
+-- modmain.lua
+AddReplicableComponent("mycomponent")
+```
+
+这会调用 `scripts/entityreplica.lua` 第 98-100 行的函数：
+
+```lua
+function AddReplicableComponent(name)
+    REPLICATABLE_COMPONENTS[name] = true
+end
+```
+
+**步骤 2：创建 replica 文件**
+
+创建 `scripts/components/mycomponent_replica.lua`：
+
+```lua
+local MyComponent = Class(function(self, inst)
+    self.inst = inst
+    if TheWorld.ismastersim then
+        self.classified = inst.mymod_classified
+    elseif self.classified == nil and inst.mymod_classified ~= nil then
+        self:AttachClassified(inst.mymod_classified)
+    end
+end)
+
+function MyComponent:AttachClassified(classified)
+    self.classified = classified
+    self.ondetachclassified = function() self:DetachClassified() end
+    self.inst:ListenForEvent("onremove", self.ondetachclassified, classified)
+end
+
+function MyComponent:DetachClassified()
+    self.classified = nil
+    self.ondetachclassified = nil
+end
+
+function MyComponent:GetMyValue()
+    if self.inst.components.mycomponent then
+        return self.inst.components.mycomponent.myvalue
+    elseif self.classified then
+        return self.classified.myvalue:value()
+    end
+    return 0
+end
+
+return MyComponent
+```
+
+**步骤 3：创建 classified prefab**
+
+创建一个 classified 实体，在上面声明 NetVar：
+
+```lua
+local function fn()
+    local inst = CreateEntity()
+    inst.entity:AddTransform()
+    inst.entity:AddNetwork()
+    inst:AddTag("CLASSIFIED")
+
+    inst.myvalue = net_byte(inst.GUID, "mymod.myvalue", "myvaluedirty")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    -- 服务端初始化...
+    return inst
+end
+
+return Prefab("mymod_classified", fn)
+```
+
+#### 调试网络变量同步
+
+在开发自定义 NetVar 同步时，可以用以下调试方法：
+
+```lua
+-- 在服务端 set 时打印
+print(string.format("[MyMod][Server] Setting netvar to %d", value))
+inst.my_netvar:set(value)
+
+-- 在客户端 dirty 回调中打印
+inst:ListenForEvent("mydirty", function(inst)
+    print(string.format("[MyMod][Client] Received dirty, value = %d", inst.my_netvar:value()))
+end)
+```
+
+通过对比 `server_log` 和 `client_log` 中的打印，可以确认同步是否正常。
+
+---
+
+### 4.5.8 实用速查：网络调试检查清单
+
+当你的 Mod 出现网络相关问题时，按以下清单逐项检查：
+
+**基础检查**：
+
+- [ ] 所有修改游戏状态的代码是否在 `ismastersim` 分支中？
+- [ ] 所有访问 `components.xxx` 的代码是否在 `ismastersim` 分支中？
+- [ ] 客户端是否只通过 `replica` 或 `Tag` 读取数据？
+- [ ] `SetPristine()` 之前的代码是否两端一致（包括 NetVar 声明）？
+
+**NetVar 检查**：
+
+- [ ] 服务端和客户端的 NetVar 声明是否完全一致（类型、顺序、名称）？
+- [ ] 服务端是否在数据变化时调用了 `set()`？
+- [ ] 客户端是否监听了对应的 dirty 事件？
+- [ ] 使用的 NetVar 类型是否足够大（net_byte 最大 255，超出会溢出）？
+
+**RPC 检查**：
+
+- [ ] `AddModRPCHandler` 的 namespace 和 name 是否与 `SendModRPCToServer` 的一致？
+- [ ] RPC handler 是否在两端都注册了（在 `modmain.lua` 中，不在 ismastersim 分支中）？
+- [ ] RPC 发送频率是否过高（检查日志中的 Rate limiting 提示）？
+- [ ] 是否所有需要这个 Mod 的玩家都安装了相同版本？
+
+**测试方法**：
+
+- [ ] 使用两个客户端测试（不要只在主机上测试）
+- [ ] 同时查看 `server_log.txt` 和 `client_log.txt`
+- [ ] 在代码关键位置打印 `TheWorld.ismastersim` 的值
+- [ ] 确认 Mod 配置中 `all_clients_require_mod = true`（如果使用了 NetVar/RPC）
+
+---
+
+### 4.5.9 小结
+
+- 饥荒联机版是**客户端-服务端架构**——你的代码在两个进程中各执行一次
+- **`TheWorld.ismastersim`** 是区分服务端/客户端的核心标志
+- 数据同步采用**三层架构**：Component（服务端权威）→ Classified（NetVar 传输）→ Replica（客户端只读）
+- **NetVar** 用于服务端 → 客户端的状态同步，**RPC** 用于客户端 → 服务端的请求
+- **最常见的网络 bug** 是在客户端访问了只有服务端才有的 `components`
+- **测试时必须用两个客户端**——只在主机上测试会遗漏大量网络 bug
+- 同时查看 `server_log.txt` 和 `client_log.txt` 是定位网络问题的关键
+
+> **下一节预告**：4.6 节我们将讨论性能问题的初步定位——当你的 Mod 导致游戏卡顿时，如何找到性能瓶颈。
 
 ## 4.6 性能问题的初步定位
 
