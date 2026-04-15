@@ -1366,11 +1366,1377 @@ end
 
 ## 4.3 print 调试法与 debugtools.lua
 
-（待编写）
+### 本节导读
+
+如果说日志文件是"事后验尸"、控制台是"外部干预"，那么 `print` 调试法就是"内部监控"——你在代码中埋下 `print` 语句，让程序在运行时主动告诉你发生了什么。这是最古老、最朴素，但也最实用的调试方法。
+
+> **新手**可以从「如何在 Mod 中 print」开始，掌握基本的打印调试技巧；**进阶读者**可以学习 `dumptable`、条件打印、性能友好的打印策略；**老手**可以深入 `debugtools.lua` 的完整工具箱——`dprint`、`Dbg`、`DumpEntity` 等引擎级调试手段。
+
+---
+
+### 4.3.1 快速入门：在 Mod 中使用 print
+
+最简单的调试方式——在你的 `modmain.lua` 中写一行 `print`：
+
+```lua
+print("我的 Mod 已加载！")
+```
+
+运行游戏后，打开 `server_log.txt`（如果你是主机/服务端）或 `client_log.txt`（客户端），搜索"我的 Mod"就能看到这行输出。
+
+**进一步——打印变量值**：
+
+```lua
+local myvar = 42
+print("myvar 的值是:", myvar)
+-- 输出：myvar 的值是:	42
+```
+
+**打印多个值**：`print` 支持多个参数，它们之间会用 Tab 分隔：
+
+```lua
+print("玩家:", player.name, "血量:", player.components.health:GetPercent())
+-- 输出：玩家:	Wilson	血量:	0.75
+```
+
+**打印表**：直接 `print` 一个表只会输出地址，不会显示内容：
+
+```lua
+local t = {a = 1, b = 2}
+print(t)
+-- 输出：table: 0x12345678（不是你想要的内容）
+```
+
+要查看表的内容，需要用 `dumptable`（下文详述）或手动遍历。
+
+> **新手记住这个规则**：`print` 输出最终会写入日志文件（4.1 节已详细解释原理）。在 Mod 发布时，记得删除或注释掉调试用的 `print`，否则日志文件会被你的输出淹没。
+
+---
+
+### 4.3.2 进阶：print 的最佳实践
+
+#### 实践一：加前缀，方便搜索
+
+日志中充斥着游戏本身和其他 Mod 的输出。为了快速找到你的 Mod 的信息，给所有 `print` 加一个**独特前缀**：
+
+```lua
+-- 在 modmain.lua 开头定义一个辅助函数
+local MOD_NAME = "[MyMod]"
+local function myprint(...)
+    print(MOD_NAME, ...)
+end
+
+-- 使用
+myprint("初始化完成")
+myprint("注册了", 3, "个 prefab")
+-- 日志中搜索 "[MyMod]" 即可过滤出你的 Mod 的所有输出
+```
+
+#### 实践二：条件打印，控制信息量
+
+开发期间需要大量打印，但发布后不想看到这些信息。一个常见做法是设置开关：
+
+```lua
+local DEBUG_MODE = GetModConfigData("debug_mode") or false
+
+local function dlog(...)
+    if DEBUG_MODE then
+        print("[MyMod][DEBUG]", ...)
+    end
+end
+
+-- 使用
+dlog("OnUpdate 被调用了, dt =", dt)        -- 只在开启 debug_mode 时输出
+print("[MyMod] Mod loaded successfully")      -- 始终输出（重要信息）
+```
+
+你甚至可以在 `modinfo.lua` 中添加一个配置选项，让用户自己决定是否开启调试输出：
+
+```lua
+configuration_options = {
+    {
+        name = "debug_mode",
+        label = "调试模式",
+        options = {
+            {description = "关闭", data = false},
+            {description = "开启", data = true},
+        },
+        default = false,
+    },
+}
+```
+
+#### 实践三：打印调用栈，追踪"谁调用了我"
+
+当你不确定一个函数是怎么被调用的，可以打印调用栈：
+
+```lua
+print("此函数被调用了！调用栈:")
+print(debugstack())
+```
+
+`debugstack()` 是 `scripts/debugtools.lua` 提供的全局函数。它的实现比 `debug.traceback()` 更详细：
+
+```lua
+-- scripts/debugtools.lua 第 40-69 行
+function debugstack(start, top, bottom)
+    if not bottom then bottom = 10 end
+    if not top then top = 12 end
+    start = (start or 1) + 1
+
+    local count = max(2, start)
+    while getinfo(count) do
+        count = count + 1
+    end
+    count = count - start
+
+    if top + bottom >= count then
+        top = count
+        bottom = nil
+    end
+
+    local s = {"stack traceback:"}
+    for i = 1, top, 1 do
+        s[#s + 1] = formatinfo(getinfo(start + i - 1))
+    end
+    if bottom then
+        s[#s + 1] = "\t..."
+        for i = bottom , 1, -1 do
+            s[#s + 1] = formatinfo(getinfo(count - i + 1))
+        end
+    end
+
+    return concat(s, "\n")
+end
+```
+
+每一层的输出格式是：`文件名:行号 in (类型) 函数名 (what) <起始行-结束行>`。比标准 `debug.traceback()` 多了函数定义的行范围，方便你直接跳到源码。
+
+还有一个更精简的版本——`debugstack_oneline(n)`，只返回第 n 层的调用信息：
+
+```lua
+function debugstack_oneline(linenum)
+    local num = linenum or 3
+    return formatinfo(getinfo(num))
+end
+```
+
+游戏内部大量使用它来附带"这行代码在哪被触发的"信息，比如 `AddComponent` 中检测到重复组件时就会用它。
+
+#### 实践四：打印时附带上下文
+
+不要只打印值，要打印**上下文**——"在哪里、什么时候、对什么对象"：
+
+```lua
+-- 不好的 print
+print(inst.prefab)          -- 输出：spear（然后呢？在哪？什么状态？）
+
+-- 好的 print
+print(string.format("[MyMod] OnEquip: %s equipped by %s at (%.1f, %.1f)",
+    inst.prefab,
+    owner.name or "unknown",
+    inst.Transform:GetWorldPosition()))
+-- 输出：[MyMod] OnEquip: spear equipped by Wilson at (120.3, -45.7)
+```
+
+#### 实践五：`string.format` 比拼接更清晰
+
+```lua
+-- 拼接方式（容易出错，遇到 nil 会崩溃）
+print("血量: " .. player.components.health:GetPercent() .. " / " .. player.components.health.maxhealth)
+
+-- string.format 方式（更安全、更清晰）
+print(string.format("血量: %.1f%% (%d/%d)",
+    player.components.health:GetPercent() * 100,
+    player.components.health.currenthealth,
+    player.components.health.maxhealth))
+```
+
+> **进阶提示**：`..` 拼接在遇到 `nil` 值时会直接崩溃（`attempt to concatenate a nil value`），而 `tostring(nil)` 会安全地返回字符串 `"nil"`。在不确定变量是否为 `nil` 时，用 `tostring()` 包一下。
+
+---
+
+### 4.3.3 进阶：dumptable —— 打印表的终极工具
+
+饥荒中几乎所有数据结构都是 Lua 表。`debugtools.lua` 提供了 `dumptable` 函数来递归打印表的内容：
+
+```lua
+-- scripts/debugtools.lua 第 113-159 行
+function dumptable(obj, indent, recurse_levels, visit_table, is_terse)
+    local is_top_level = visit_table == nil
+    if visit_table == nil then
+        visit_table = {}
+    end
+
+    indent = indent or 1
+    local i_recurse_levels = recurse_levels or 5
+    if obj then
+        local dent = string.rep("\t", indent)
+        if type(obj) == "string" then
+            print(obj)
+            return
+        end
+        if type(obj) == "table" then
+            if visit_table[obj] ~= nil then
+                print(dent.."(Already visited",obj,"-- skipping.)")
+                return
+            else
+                visit_table[obj] = true
+            end
+        end
+        local keys = {}
+        for k,v in pairs(obj) do
+            table.insert(keys, k)
+        end
+        table.sort(keys, SortByTypeAndValue)
+        -- ...
+        for i,k in ipairs(keys) do
+            local v = obj[k]
+            if type(v) == "table" and i_recurse_levels > 0 then
+                if v.entity and v.entity:GetGUID() then
+                    print(dent.."K: ",k," V: ", v, "(Entity -- skipping.)")
+                else
+                    print(dent.."K: ",k," V: ", v)
+                    dumptable(v, indent+1, i_recurse_levels-1, visit_table)
+                end
+            else
+                print(dent.."K: ",k," V: ",v)
+            end
+        end
+    elseif not is_terse then
+        print("nil")
+    end
+end
+```
+
+**关键设计点**：
+
+1. **`visit_table` 防循环引用**：表可能互相引用（A 引用 B，B 引用 A）。`visit_table` 记录已访问过的表，遇到重复就跳过并提示 `"Already visited"`
+2. **`recurse_levels` 控制深度**：默认递归 5 层，防止无限展开
+3. **实体特殊处理**：遇到带 `entity:GetGUID()` 的对象（游戏实体）会跳过，因为实体的表结构极其庞大
+4. **键排序**：用 `SortByTypeAndValue` 把键先按类型再按值排序，输出更易读
+
+**使用示例**：
+
+```lua
+-- 在控制台中
+c_select()                           -- 选中一个实体
+dumptable(c_sel().components)         -- 打印它的所有组件
+
+-- 在 Mod 代码中
+local recipe = AllRecipes["spear"]
+dumptable(recipe)                     -- 查看长矛的配方数据结构
+```
+
+还有一个安静版本 `dumptablequiet`——它不会打印空表的 `"(empty)"` 和 `nil`，输出更干净：
+
+```lua
+function dumptablequiet(obj, indent, recurse_levels, visit_table)
+    return dumptable(obj, indent, recurse_levels, visit_table, true)
+end
+```
+
+> **实用技巧**：`table.inspect` 是另一个选择（`debugtools.lua` 第 1 行 `require("inspect")`），它返回一个格式化的字符串而不是直接 `print`。适合需要把表内容存到变量中做进一步处理的场景：`print(table.inspect(mydata))`。
+
+---
+
+### 4.3.4 进阶：DumpEntity —— 全面检查一个游戏实体
+
+`scripts/debughelpers.lua` 提供了 `DumpEntity` 函数，它是检查游戏实体状态的终极工具：
+
+```lua
+-- scripts/debughelpers.lua 第 20-42 行
+function DumpEntity(ent)
+    print("============ Dumping entity ",ent,"============")
+    print(ent.entity:GetDebugString())
+    print("-----------------------------------------------")
+    for name,value in pairs(ent) do
+        if type(value) == "function" then
+            local info = debug.getinfo(value,"LnS")
+            print(string.format("   %s = function - %s", name, info.source..":"..tostring(info.linedefined)))
+        else
+            if value and type(value) == "table" and value.IsValid and type(value.IsValid) == "function" then
+               print(string.format("   %s = %s (valid:%s)", name, tostring(value),tostring(value:IsValid())))
+            else
+               print(string.format("   %s = %s", name, tostring(value)))
+            end
+        end
+    end
+    print("-----------------------------------------------")
+    for i,v in pairs(ent.components) do
+        print("   Dumping component",i)
+        DumpComponent(v)
+    end
+    print("================================================")
+end
+```
+
+**输出内容**：
+
+1. **引擎调试字符串**（`entity:GetDebugString()`）：包含实体的引擎层信息（位置、物理状态、动画状态等）
+2. **实体表的所有字段**：包括函数（显示定义位置）、引用（显示是否有效）、基本值
+3. **所有组件的详细内容**：对每个组件调用 `DumpComponent`，列出组件的所有字段
+
+**使用方式**（在控制台中）：
+
+```lua
+c_select()    -- 选中一个实体
+c_dump()      -- 调用 DumpEntity
+```
+
+或者在 Mod 代码中：
+
+```lua
+AddPrefabPostInit("spear", function(inst)
+    DumpEntity(inst)  -- 打印长矛实体的完整信息
+end)
+```
+
+`DumpComponent` 是 `DumpEntity` 的子函数，专门用于打印单个组件：
+
+```lua
+function DumpComponent( comp )
+    for name,value in pairs(comp) do
+        if type(value) == "function" then
+            local info = debug.getinfo(value,"LnS")
+            print(string.format("      %s = function - %s", name, info.source..":"..tostring(info.linedefined)))
+        else
+            -- ...
+            print(string.format("      %s = %s", name, tostring(value)))
+        end
+    end
+end
+```
+
+**为什么对函数做特殊处理？** 因为打印一个函数值只会显示 `function: 0x12345`，没什么用。通过 `debug.getinfo(value,"LnS")` 可以获取函数的**定义位置**（源文件名 + 行号），让你能快速找到这个函数的实现代码。
+
+---
+
+### 4.3.5 进阶：GetDebugString —— 实体自描述
+
+很多游戏实体和组件实现了 `GetDebugString()` 方法，返回一段人类可读的状态描述。这个方法在 `EntityScript:GetDebugString()` 中被汇总：
+
+```lua
+-- scripts/entityscript.lua 第 963-988 行
+function EntityScript:GetDebugString()
+    if not self:IsValid() then
+        return tostring(self).." <INVALID>"
+    end
+
+    local str = {}
+    table.insert(str, tostring(self))
+    if self:IsAsleep() then
+        table.insert(str, " <ASLEEP>")
+    end
+    table.insert(str, string.format(" age %2.2f", self:GetTimeAlive()))
+    table.insert(str, "\n")
+    table.insert(str, self.entity:GetDebugString())
+
+    table.insert(str, "Buffered Action: "..tostring(self.bufferedaction).."\n")
+
+    if self.sg then
+        table.insert(str, "SG:" .. tostring(self.sg).."\n")
+    end
+
+    if self.debugstringfn then
+        table.insert(str, "DebugString: "..self:debugstringfn().."\n")
+    end
+    -- ...
+end
+```
+
+**`debugstringfn` 的妙用**：如果你在自己的 Prefab 上设置了 `inst.debugstringfn`，`GetDebugString` 会自动调用它。这是给你的自定义实体添加调试信息的官方方式：
+
+```lua
+-- 在你的 prefab 文件中
+local function fn()
+    local inst = CreateEntity()
+    -- ...
+
+    inst.debugstringfn = function(inst)
+        return string.format("自定义状态: level=%d, cooldown=%.1f",
+            inst._level or 0,
+            inst._cooldown or 0)
+    end
+
+    return inst
+end
+```
+
+之后在控制台中 `c_select()` + `c_dump()` 或 `print(c_sel():GetDebugString())` 就能看到你的自定义调试信息。
+
+---
+
+### 4.3.6 老手进阶：debugtools.lua 完整工具箱
+
+#### `dprint` —— 开发者专用条件打印
+
+```lua
+-- scripts/debugtools.lua 第 243-272 行
+function dprint(...)
+    global("CHEATS_ENABLE_DPRINT")
+    global("DPRINT_PRINT_SOURCELINE")
+    global("DPRINT_USERNAME")
+
+    if not (CHEATS_ENABLED and CHEATS_ENABLE_DPRINT) then
+        return
+    end
+
+    if DPRINT_USERNAME then
+        if type(TheSim.GetUsersName) == "function" then
+            userName = TheSim:GetUsersName()
+        end
+        if userName ~= DPRINT_USERNAME then
+            return
+        end
+    end
+
+    if DPRINT_PRINT_SOURCELINE then
+        local info = debug.getinfo(2, "Sl")
+        local source = info.source
+        if info.source and string.sub(info.source,1,1) == "@" then
+            source = source:sub(2)
+        end
+        local defline = string.format("%s(%d,1)", tostring(source), info.currentline)
+        oldprint(defline, ...)
+    else
+        oldprint(...)
+    end
+end
+```
+
+`dprint` 有三道过滤门：
+
+1. **`CHEATS_ENABLED` 和 `CHEATS_ENABLE_DPRINT`**：必须同时为 `true`——在正式发布版本中这些默认关闭，所以 `dprint` 不会产生任何输出
+2. **`DPRINT_USERNAME`**：如果设置了，只有当前用户名匹配时才输出——这在多人开发团队中非常有用，每个开发者可以只看到自己的调试信息
+3. **`DPRINT_PRINT_SOURCELINE`**：开启后会附带源文件名和行号
+
+**关键区别**：`dprint` 使用 `oldprint`（直接调用 `TheSim:LuaPrint`），**绕过了 `debugprint.lua` 的 print 监听器链**。这意味着 `dprint` 的输出：
+- ✅ 会写入日志文件
+- ❌ 不会出现在游戏内控制台叠加层
+- ❌ 不会触发 `AddPrintLogger` 注册的自定义监听器
+
+#### `eprint` —— 只打印调试选中实体的信息
+
+```lua
+function eprint(inst, ...)
+    if inst == GetDebugEntity() then
+        dprint(...)
+    end
+end
+```
+
+当你用 `c_select()` 选中了一个实体后，只有关于**这个实体**的 `eprint` 才会输出。这在游戏中有大量同类实体时非常有用——你不想看到 200 只蜘蛛的 AI 日志，只想看被你选中的那一只。
+
+#### `printsel` —— 打印选中实体的条件输出
+
+```lua
+function printsel(inst, ...)
+    if c_sel() == inst or (inst.inst and c_sel() == inst.inst) then
+        print(...)
+    end
+end
+```
+
+和 `eprint` 类似，但使用 `print` 而非 `dprint`——不需要 `CHEATS_ENABLED`，适合 Mod 开发者使用。
+
+#### `Dbg` / `EnableDebugOnEntity` —— 实体级调试开关
+
+这是一个更精细的调试系统，允许你对**每个实体**单独开关调试输出：
+
+```lua
+-- 开启某个实体的调试
+EnableDebugOnEntity(myinst)            -- 开启所有调试
+EnableDebugOnEntity(myinst, "combat")  -- 只开启 "combat" 标签的调试
+EnableDebugOnEntity(myinst, 5)         -- 只开启优先级 < 5 的调试
+EnableDebugOnEntity(myinst, false)     -- 关闭
+
+-- 在代码中条件输出
+Dbg(self.inst, "combat", "受到攻击:", damage)     -- 只在 "combat" 标签开启时输出
+Dbg(self.inst, 3, "AI 状态变化:", newstate)        -- 只在优先级 >= 3 时输出
+Dbg(self.inst, true, "基础信息")                   -- 只要开启就输出
+```
+
+`Dbg` 的实现：
+
+```lua
+function Dbg(thing, level, ...)
+    if not thing._DEBUG_List or not thing._DEBUG_List.on or not CHEATS_ENABLED then return end
+
+    thing._DEBUG_List.priority = thing._DEBUG_List.priority or 0
+
+    if type(level) == "string" and thing._DEBUG_List[level] then
+        oldprint(...)
+    elseif type(level) == "number" and thing._DEBUG_List.priority < level then
+        oldprint(...)
+    elseif thing._DEBUG_List["all"] then
+        oldprint(...)
+    end
+end
+```
+
+**为什么要这么设计？** 因为在复杂的游戏系统中，你可能同时在调试 AI、战斗、寻路等多个子系统。`Dbg` 让你能精确控制"我只想看这个实体的战斗相关日志"，而不是被所有日志淹没。
+
+#### `printwrap` —— 智能打印
+
+```lua
+function printwrap(msg, ...)
+    if type(...) == "table" then
+        print(msg)
+        dumptable(..., 0, 0)
+    else
+        print(msg, ...)
+    end
+    return ...
+end
+```
+
+如果参数是表，自动用 `dumptable` 展开；否则正常打印。而且它**返回参数本身**——这意味着你可以把它插入到任何表达式中而不改变逻辑：
+
+```lua
+-- 原始代码
+local data = GetSomeData()
+
+-- 加调试输出（不改变逻辑流程）
+local data = printwrap("获取到的数据:", GetSomeData())
+```
+
+#### `instrument_userdata` —— 追踪引擎 API 调用
+
+```lua
+function instrument_userdata(instance)
+    local methods = getmetatable(instance).__index
+    local Proxy = {}
+    for fn,def in pairs(methods) do
+        Proxy[fn] = function (junk, ...)
+            print("instrument_userdata", debugstack())
+            return instance[fn](instance, ...)
+        end
+    end
+    return Proxy
+end
+```
+
+这个函数创建一个**代理对象**，拦截所有方法调用并打印调用栈。用途是追踪引擎层 C 函数的调用来源：
+
+```lua
+-- 使用示例：追踪 TheNet 的所有方法调用
+TheNet = instrument_userdata(TheNet)
+-- 之后任何代码调用 TheNet:XXX() 都会打印完整调用栈
+```
+
+> **警告**：`instrument_userdata` 会严重影响性能，只适合临时调试使用，绝不要在发布版本中使用。
+
+#### `debuglocals` —— 打印当前局部变量
+
+```lua
+function debuglocals(level)
+    local t = {}
+    local index = 1
+    while true do
+        local name, value = debug.getlocal(level + 1, index)
+        if not name then break end
+        t[index] = string.format("%s = %s", name, tostring(value))
+        index = index + 1
+    end
+    return table.concat(t, "\n")
+end
+```
+
+列出指定调用层级的所有局部变量。在追踪错误时非常有用——你不仅知道哪行出了错，还知道出错时各变量的值。
+
+---
+
+### 4.3.7 老手进阶：高级 print 调试模式
+
+#### 模式一：二分法定位崩溃
+
+当 Mod 崩溃但错误信息不够明确时，用 `print` 进行二分定位：
+
+```lua
+print("=== 检查点 A ===")
+-- 一段可疑代码...
+print("=== 检查点 B ===")
+-- 另一段可疑代码...
+print("=== 检查点 C ===")
+```
+
+运行后如果日志中有 A、B 但没有 C，说明崩溃发生在 B 和 C 之间。然后在这段代码中继续细分，快速收敛到出错行。
+
+#### 模式二：事件追踪
+
+饥荒大量使用事件系统，事件驱动的 bug 很难追踪。你可以临时 hook 事件监听：
+
+```lua
+-- 追踪某个实体上的所有事件
+local old_PushEvent = inst.PushEvent
+inst.PushEvent = function(self, event, data)
+    print(string.format("[EventTrace] %s -> %s", tostring(self), event))
+    return old_PushEvent(self, event, data)
+end
+```
+
+#### 模式三：组件方法拦截
+
+追踪某个组件方法被调用的时机和参数：
+
+```lua
+-- 追踪 health 组件的 DoDelta 调用
+AddPrefabPostInit("wilson", function(inst)
+    if inst.components.health then
+        local old_DoDelta = inst.components.health.DoDelta
+        inst.components.health.DoDelta = function(self, amount, ...)
+            print(string.format("[MyMod] Health:DoDelta(%s) called on %s",
+                tostring(amount), tostring(self.inst)))
+            print("  调用栈:", debugstack(2, 3, 0))
+            return old_DoDelta(self, amount, ...)
+        end
+    end
+end)
+```
+
+#### 模式四：周期性状态快照
+
+对于随时间变化的 bug（比如数值漂移、内存泄漏），可以定期打印状态快照：
+
+```lua
+-- 每 10 秒打印一次关键状态
+inst:DoPeriodicTask(10, function()
+    local health = inst.components.health
+    local hunger = inst.components.hunger
+    print(string.format("[MyMod] 状态快照: HP=%.1f%%, Hunger=%.1f%%, Entities=%d",
+        health and health:GetPercent() * 100 or -1,
+        hunger and hunger:GetPercent() * 100 or -1,
+        GetTableSize(Ents)))
+end)
+```
+
+#### 模式五：AddPrintLogger 做自定义过滤
+
+在 4.1 节中介绍过 `AddPrintLogger`。进阶用法——只关注错误相关的输出：
+
+```lua
+AddPrintLogger(function(str)
+    if string.find(str, "error") or string.find(str, "Error") or string.find(str, "ERROR") then
+        -- 把错误信息高亮存储，方便后续分析
+        if _G.MY_ERROR_LOG == nil then _G.MY_ERROR_LOG = {} end
+        table.insert(_G.MY_ERROR_LOG, {
+            time = os.clock(),
+            msg = str
+        })
+    end
+end)
+```
+
+---
+
+### 4.3.8 实用速查：调试打印函数对照表
+
+| 函数 | 定义位置 | 输出目标 | 条件 | 适用场景 |
+|------|---------|---------|------|---------|
+| `print(...)` | `debugprint.lua` | 日志文件 + 控制台叠加层 | 无条件 | 通用打印 |
+| `nolineprint(...)` | `debugprint.lua` | 日志文件 + 控制台叠加层 | 无条件 | 不附带行号的打印（控制台输出） |
+| `dprint(...)` | `debugtools.lua` | 仅日志文件 | CHEATS_ENABLED + CHEATS_ENABLE_DPRINT | 引擎开发者调试 |
+| `eprint(inst, ...)` | `debugtools.lua` | 仅日志文件 | dprint 条件 + inst == 调试选中实体 | 针对特定实体的调试 |
+| `printsel(inst, ...)` | `debugtools.lua` | 日志文件 + 控制台叠加层 | inst == c_sel() | Mod 开发者针对选中实体 |
+| `Dbg(thing, level, ...)` | `debugtools.lua` | 仅日志文件 | CHEATS_ENABLED + 实体调试开关 | 按标签/优先级过滤的调试 |
+| `modprint(...)` | `modutil.lua` | 日志文件 + 控制台叠加层 | IsModErrorEnabled() | Mod 开发期间 |
+| `moderror(msg)` | `modutil.lua` | 日志或抛出 error | 始终执行 | Mod 错误报告 |
+
+| 函数 | 定义位置 | 作用 |
+|------|---------|------|
+| `dumptable(obj)` | `debugtools.lua` | 递归打印表内容（防循环引用） |
+| `dumptablequiet(obj)` | `debugtools.lua` | 安静版 dumptable（不打印空表和 nil） |
+| `DumpEntity(ent)` | `debughelpers.lua` | 打印实体的全部信息（引擎状态 + 字段 + 组件） |
+| `DumpComponent(comp)` | `debughelpers.lua` | 打印单个组件的全部字段 |
+| `debugstack()` | `debugtools.lua` | 返回格式化的调用栈字符串 |
+| `debugstack_oneline(n)` | `debugtools.lua` | 返回第 n 层的单行调用信息 |
+| `debuglocals(level)` | `debugtools.lua` | 返回指定层级的所有局部变量 |
+| `table.inspect(t)` | inspect 库 | 返回表的格式化字符串（可处理递归表） |
+
+---
+
+### 4.3.9 小结
+
+- **`print` 是最基础的调试工具**——简单、直接、无需配置。在代码中加 `print` 就能在日志中看到输出
+- **给 print 加前缀**，方便在日志中搜索；**用条件开关**控制调试输出的开关
+- **`dumptable`** 是查看表内容的利器；**`DumpEntity`** 是检查实体状态的终极工具
+- **`debugtools.lua`** 提供了完整的调试工具箱：`dprint`（条件打印）、`Dbg`（实体级调试）、`debugstack`（调用栈）、`debuglocals`（局部变量）等
+- **高级模式**包括二分法定位、事件追踪、方法拦截、周期性快照——这些模式组合使用能解决绝大多数调试问题
+- **发布 Mod 前**记得清理调试 `print`，或使用条件打印（`DEBUG_MODE` 开关、`modprint` 等）确保正式版本不会输出垃圾信息
+
+> **下一节预告**：4.4 节我们将系统化地讲解常见崩溃类型——`nil` 访问、栈溢出、无限循环——以及针对每种类型的排查流程。知道"怎么打印"之后，更重要的是知道"打印什么、在哪打印"。
 
 ## 4.4 常见崩溃类型：nil 访问、栈溢出、无限循环的排查流程
 
-（待编写）
+### 本节导读
+
+Mod 开发中遇到崩溃是家常便饭。但"崩溃"不是一个模糊的概念——它们有**明确的类型、固定的错误信息模式、和系统化的排查方法**。掌握这些模式，你就能从"看到错误一脸懵"变成"一看错误就知道问题在哪"。
+
+> **新手**可以先记住最常见的 3 种错误类型和对应的错误信息，学会"翻译"错误信息；**进阶读者**可以理解每种错误的根因和游戏引擎的保护机制；**老手**可以深入了解 `strict.lua`、`IsValid` 防御模式、以及如何让你的 Mod 代码更健壮。
+
+---
+
+### 4.4.1 快速入门：三大崩溃类型速记
+
+| 崩溃类型 | 日志中的典型错误信息 | 一句话翻译 |
+|----------|---------------------|-----------|
+| **nil 访问** | `attempt to index a nil value` | 你在一个不存在的东西上用了 `.` 或 `:` |
+| **栈溢出** | `stack overflow` | 函数调用链太深了（通常是无限递归） |
+| **无限循环** | 游戏卡死（无错误信息）或 `infinite loop detected` | 代码陷入了永远跳不出去的循环 |
+
+**新手记忆法**：
+- 看到 `nil` → 某个变量没有值
+- 看到 `stack overflow` → 某个函数在不停地调用自己
+- 游戏卡死 → 某个 `while` 或 `for` 循环出不来
+
+---
+
+### 4.4.2 nil 访问：最常见的崩溃
+
+#### 什么是 nil 访问？
+
+在 Lua 中，`nil` 表示"没有值"。当你试图对一个 `nil` 值做 `.`、`:`、`[]` 操作时，Lua 会报错：
+
+```
+attempt to index a nil value
+```
+
+或者更具体的变体：
+
+```
+attempt to index local 'inst' (a nil value)
+attempt to index field 'components' (a nil value)
+attempt to call a nil value
+```
+
+#### 新手最常踩的 nil 坑
+
+**坑 1：组件不存在**
+
+```lua
+-- 错误写法
+inst.components.health:SetPercent(1)
+-- 如果 inst 没有 health 组件，inst.components.health 是 nil
+-- 对 nil 调用 :SetPercent() 就会崩溃
+```
+
+```lua
+-- 正确写法
+if inst.components.health ~= nil then
+    inst.components.health:SetPercent(1)
+end
+```
+
+**坑 2：客户端 vs 服务端组件缺失**
+
+在联机版中，很多组件**只存在于服务端**。如果你的代码在客户端执行，访问服务端专属组件就会得到 `nil`：
+
+```lua
+-- 这段代码在客户端会崩溃
+AddPrefabPostInit("wilson", function(inst)
+    inst.components.health:SetMaxHealth(200)  -- health 组件在客户端不存在！
+end)
+```
+
+```lua
+-- 正确写法：先检查是否为服务端
+AddPrefabPostInit("wilson", function(inst)
+    if not TheWorld.ismastersim then return end  -- 客户端直接返回
+    inst.components.health:SetMaxHealth(200)
+end)
+```
+
+**为什么客户端没有 health 组件？** 因为在 C/S 架构中，血量计算是服务端的权威逻辑。客户端通过 `replica`（副本）来获取只读的血量信息，但不能直接操作 `components.health`。这是饥荒联机版 Mod 开发中**最重要的概念之一**。
+
+**坑 3：实体已被删除**
+
+实体被 `Remove()` 后，对它的任何操作都可能崩溃。这在延迟回调中特别常见：
+
+```lua
+-- 危险代码
+inst:DoTaskInTime(5, function()
+    inst.components.health:SetPercent(1)  -- 5 秒后 inst 可能已经不存在了！
+end)
+```
+
+```lua
+-- 安全代码
+inst:DoTaskInTime(5, function()
+    if inst:IsValid() then
+        inst.components.health:SetPercent(1)
+    end
+end)
+```
+
+`IsValid()` 是引擎提供的检查方法（`scripts/entityscript.lua` 第 1773 行），用于判断实体是否还存活：
+
+```lua
+function EntityScript:IsValid()
+    return self.entity:IsValid()
+end
+```
+
+**坑 4：函数返回了 nil**
+
+```lua
+local target = c_find("beefalo")
+target.components.health:Kill()  -- 如果附近没有牛，c_find 返回 nil！
+```
+
+```lua
+-- 安全写法
+local target = c_find("beefalo")
+if target then
+    target.components.health:Kill()
+end
+```
+
+#### nil 访问的排查流程
+
+1. **看错误信息第一行**：它会告诉你是哪个变量是 `nil`
+
+```
+scripts/mods/workshop-123456789/modmain.lua:42: attempt to index local 'inst' (a nil value)
+```
+
+→ 第 42 行的 `inst` 变量是 `nil`
+
+2. **看调用栈**：从上到下追溯，找到你的 Mod 文件
+
+```
+stack traceback:
+    scripts/mods/workshop-123456789/modmain.lua:42: in function 'fn'
+    scripts/modutil.lua:xxx: in function ...
+```
+
+3. **思考"为什么这个变量是 nil"**：
+   - 是不是客户端没有这个组件？→ 加 `TheWorld.ismastersim` 检查
+   - 是不是实体已经被删除了？→ 加 `IsValid()` 检查
+   - 是不是函数没有返回预期的值？→ 检查函数返回值
+   - 是不是拼写错误？→ `inst.components.helath` vs `inst.components.health`
+
+> **进阶提示**：如果错误信息说 `attempt to call a nil value`（注意是 `call` 不是 `index`），说明你在调用一个不存在的函数。常见原因是方法名拼写错误、或者引用了一个未 `require` 的模块。
+
+---
+
+### 4.4.3 未声明变量访问：`strict.lua` 的保护
+
+饥荒引入了一个"严格模式"——`scripts/strict.lua`，它会在你**读写未声明的全局变量**时报错：
+
+```lua
+-- scripts/strict.lua 核心实现
+mt.__newindex = function (t, n, v)
+  if __STRICT and not mt.__declared[n] then
+    local w = debug.getinfo(2, "S").what
+    if w ~= "main" and w ~= "C" then
+      error("assign to undeclared variable '"..n.."'", 2)
+    end
+    mt.__declared[n] = true
+  end
+  rawset(t, n, v)
+end
+
+mt.__index = function (t, n)
+  if not mt.__declared[n] and debug.getinfo(2, "S").what ~= "C" then
+    error("variable '"..n.."' is not declared", 2)
+  end
+  return rawget(t, n)
+end
+```
+
+**为什么需要这个？** 在没有严格模式的 Lua 中，访问一个未声明的全局变量只会默默返回 `nil`——不会报错。这导致拼写错误极难发现：
+
+```lua
+-- 没有 strict.lua 的情况
+local myValue = 42
+print(myVlaue)    -- 拼错了！但 Lua 不会报错，只会打印 nil
+
+-- 有 strict.lua 的情况
+print(myVlaue)    -- 立即报错：variable 'myVlaue' is not declared
+```
+
+**Mod 开发者需要注意**：`strict.lua` 在 `main.lua` 极早的位置就被加载了。如果你在 `modmain.lua` 中试图读写一个全局变量（比如忘了写 `local`），可能会触发这个错误。
+
+**解决方法**：
+1. 使用 `local` 声明变量（推荐）
+2. 使用 `GLOBAL` 表访问全局变量：`GLOBAL.ThePlayer`
+3. 游戏提供了 `global("变量名")` 函数来声明全局变量白名单
+
+```lua
+function global(...)
+   for _, v in ipairs{...} do mt.__declared[v] = true end
+end
+```
+
+---
+
+### 4.4.4 栈溢出：无限递归的恶果
+
+#### 什么是栈溢出？
+
+每次函数调用都会在调用栈中占据一个"栈帧"。Lua 的调用栈有大小限制（通常几百层）。如果函数 A 调用函数 B、B 又调用 A，或者函数自己调用自己而没有终止条件，栈就会被填满：
+
+```
+stack overflow
+```
+
+#### 最常见的触发场景
+
+**场景 1：事件监听导致的递归**
+
+```lua
+-- 危险代码
+inst:ListenForEvent("healthdelta", function(inst, data)
+    inst.components.health:DoDelta(10)  -- DoDelta 会触发 healthdelta 事件
+    -- healthdelta 事件又调用这个回调 → 无限递归 → 栈溢出
+end)
+```
+
+**为什么会这样？** 因为 `health:DoDelta` 修改血量后会 `PushEvent("healthdelta")`，而你的监听回调又在调用 `DoDelta`——这形成了一个闭环。
+
+**解决方法**：加条件判断打破循环：
+
+```lua
+inst:ListenForEvent("healthdelta", function(inst, data)
+    if data.amount < 0 then  -- 只在受伤时补血，避免补血触发的事件再次进入
+        inst.components.health:DoDelta(10)
+    end
+end)
+```
+
+**场景 2：PostInit 中修改了触发 PostInit 的条件**
+
+```lua
+-- 危险代码
+AddPrefabPostInit("all", function(inst)
+    local child = SpawnPrefab("log")  -- SpawnPrefab 会触发 PostInit
+    -- 如果 PostInit 注册了 "all"，SpawnPrefab 又会进入这个函数
+    -- → 无限递归
+end)
+```
+
+**场景 3：`__index` 元方法中访问自身**
+
+```lua
+-- 危险代码
+local mt = {
+    __index = function(t, k)
+        return t[k]  -- t[k] 又触发 __index → 无限递归
+    end
+}
+```
+
+#### 游戏引擎的防护措施
+
+游戏源码中有明确的防递归设计。例如 `scripts/widgets/text.lua` 中：
+
+```lua
+-- 注释原文：stop stackoverflow from infinite recursion due to bad string data
+```
+
+以及 `scripts/components/inspectaclesparticipant.lua` 中：
+
+```lua
+-- 注释原文：Delay a frame to prevent stack overflows in loading sequences.
+```
+
+**"延迟一帧"是饥荒中打破递归的常用手法**——通过 `DoTaskInTime(0, fn)` 把操作推迟到下一帧执行，当前帧的调用栈就不会增长：
+
+```lua
+-- 安全写法
+inst:ListenForEvent("healthdelta", function(inst, data)
+    inst:DoTaskInTime(0, function()
+        if inst:IsValid() and inst.components.health then
+            inst.components.health:DoDelta(10)
+        end
+    end)
+end)
+```
+
+#### 栈溢出的排查流程
+
+1. **看错误信息**：`stack overflow` 通常伴随一段**极长的、重复出现同几行代码**的调用栈
+2. **找重复模式**：如果看到 `A → B → A → B → ...` 这样的循环，就找到了递归链
+3. **分析为什么会循环**：
+   - 事件监听回调修改了触发事件的状态？
+   - 两个 PostInit 互相触发？
+   - 元方法中访问了自身？
+4. **打破循环**：加条件判断、延迟执行、或重新设计逻辑
+
+---
+
+### 4.4.5 无限循环：游戏卡死的元凶
+
+#### 什么是无限循环？
+
+和栈溢出不同，无限循环不会报错——它只是让游戏**完全卡死**，不响应任何操作。因为 Lua 是单线程的，一个死循环会阻塞整个游戏。
+
+#### 最常见的触发场景
+
+**场景 1：`while` 循环条件永远为真**
+
+```lua
+-- 危险代码
+local count = 0
+while count < 10 do
+    -- 忘了 count = count + 1
+    DoSomething()
+end
+-- 游戏永远卡在这里
+```
+
+**场景 2：`repeat ... until` 条件永远为假**
+
+```lua
+-- 危险代码
+local found = false
+repeat
+    local ent = FindEntity(...)
+    if ent then found = true end
+until found
+-- 如果永远找不到实体，就永远循环
+```
+
+**场景 3：`for` 循环中修改了迭代变量**
+
+```lua
+-- 危险代码（概念性）
+local t = {1, 2, 3}
+for i = 1, #t do
+    table.insert(t, t[i] + 1)  -- 每次插入一个元素，#t 增长，永远到不了 #t
+end
+```
+
+#### 游戏引擎的防无限循环机制
+
+饥荒的沙箱执行器中有一个专门防无限循环的函数——`RunInSandboxSafeCatchInfiniteLoops`（`scripts/util.lua` 第 816-840 行）：
+
+```lua
+function RunInSandboxSafeCatchInfiniteLoops(untrusted_code, error_handler, maxops)
+    -- ...
+    local co = coroutine.create(function()
+        coroutine.yield(xpcall(untrusted_function, error_handler or function() end))
+    end)
+    debug.sethook(co, function() error("infinite loop detected") end, "", maxops or 20000)
+    -- ...
+    local result = {coroutine.resume(co)}
+    -- ...
+end
+```
+
+**原理**：把不可信代码放在一个协程中执行，并通过 `debug.sethook` 设置一个**指令计数钩子**——当执行的 Lua 指令数超过 `maxops`（默认 20000）时，强制抛出 `"infinite loop detected"` 错误。
+
+**但是**，这个机制**不是**给所有 Mod 代码用的——它主要用于执行用户输入的不可信代码（如沙箱环境）。普通 Mod 代码（`modmain.lua`）不在这个保护范围内。所以在 Mod 中写死循环，游戏就真的会卡死。
+
+#### 无限循环的排查流程
+
+无限循环的棘手之处在于——游戏卡死后你什么日志都看不到（因为来不及写入）。
+
+1. **强制终止游戏**：通过任务管理器杀掉进程
+2. **二分法定位**：在可疑代码段中插入 `print` 标记点，逐步缩小范围
+3. **检查所有 `while` 和 `repeat` 循环**：确保退出条件一定能满足
+4. **加安全计数器**：
+
+```lua
+-- 安全写法
+local MAX_ITERATIONS = 10000
+local count = 0
+while someCondition do
+    count = count + 1
+    if count > MAX_ITERATIONS then
+        print("[MyMod] WARNING: 循环超过最大次数，强制退出！")
+        break
+    end
+    -- 正常逻辑...
+end
+```
+
+---
+
+### 4.4.6 进阶：其他常见错误类型
+
+#### 类型一：`attempt to perform arithmetic on a nil value`
+
+```lua
+local damage = base_damage * multiplier  -- multiplier 是 nil
+```
+
+原因是对 `nil` 做了数学运算。修复方式：给默认值。
+
+```lua
+local damage = base_damage * (multiplier or 1)
+```
+
+#### 类型二：`attempt to compare nil with number`
+
+```lua
+if inst.components.health:GetPercent() < 0.5 then  -- 如果 health 组件不存在
+```
+
+对 `nil` 做比较运算。同样需要先检查组件是否存在。
+
+#### 类型三：`attempt to concatenate a nil value`
+
+```lua
+print("名字是: " .. inst.name)  -- inst.name 可能是 nil
+```
+
+字符串拼接遇到 `nil`。解决方法：
+
+```lua
+print("名字是: " .. tostring(inst.name))  -- tostring(nil) == "nil"
+-- 或者
+print("名字是: " .. (inst.name or "未知"))
+```
+
+#### 类型四：`bad argument #N to 'xxx'`
+
+```lua
+string.format("%d", nil)  -- bad argument #1 to 'format' (number expected, got nil)
+```
+
+传给标准库函数的参数类型不对。需要在调用前检查参数。
+
+#### 类型五：SCRIPT CRASH（协程崩溃）
+
+这是 4.1 节已经介绍过的——来自调度器（`scripts/scheduler.lua`）的协程崩溃：
+
+```lua
+if not success then
+    print(debug.traceback(v.co, "\nCOROUTINE "..tostring(v.id).." SCRIPT CRASH:\n".. tostring(yieldtype)))
+    self:KillTask(v)
+end
+```
+
+SCRIPT CRASH 意味着一个**异步任务**（通常是 `DoTaskInTime`、`DoPeriodicTask` 创建的任务）崩溃了。引擎会杀死这个任务但不影响其他任务——游戏不会停止，但相关功能可能会失灵。
+
+---
+
+### 4.4.7 进阶：游戏的多层错误保护体系
+
+饥荒的错误保护不是单一的，而是一个**多层防御体系**。理解它可以帮你预判"我的错误会导致什么后果"。
+
+#### 第一层：`strict.lua` —— 编码阶段
+
+在代码刚开始执行时，`strict.lua` 就会拦截未声明的全局变量读写。这是**最早**触发的保护——通常在 `modmain.lua` 加载时就会报错。
+
+#### 第二层：`RunInEnvironment` —— Mod 加载阶段
+
+Mod 的 `modmain.lua` 在 `RunInEnvironment`（`scripts/util.lua` 第 786 行）中执行，外层有 `xpcall` 保护：
+
+```lua
+function RunInEnvironment(fn, fnenv)
+    setfenv(fn, fnenv)
+    return xpcall(fn, debug.traceback)
+end
+```
+
+如果 `modmain.lua` 执行时崩溃，`xpcall` 会捕获错误，Mod 被标记为失败，但游戏继续运行。
+
+#### 第三层：`runmodfn` —— Mod 运行时回调
+
+Mod 注册的各种 PostInit、回调函数在运行时通过 `runmodfn` 执行，同样有 `xpcall` + `debug.traceback` 保护：
+
+```lua
+local runmodfn = function(fn, mod, modtype)
+    return (function(...)
+        if fn then
+            local status, r = xpcall(function() return fn(unpack(arg)) end, debug.traceback)
+            if not status then
+                print("error calling "..modtype.." in mod "..ModInfoname(mod.modname))
+                ModManager:RemoveBadMod(mod.modname, r)
+                ModManager:DisplayBadMods()
+            end
+        end
+    end)
+end
+```
+
+出错的 Mod 会被**自动禁用**（`RemoveBadMod`），并弹出错误对话框（`DisplayBadMods`）。
+
+#### 第四层：调度器 —— 异步任务
+
+协程内的错误通过调度器的 `coroutine.resume` 捕获。崩溃的协程被杀死，其他协程和主循环不受影响。
+
+#### 第五层：`SetGlobalErrorWidget` —— 致命错误
+
+当错误严重到无法继续时（比如关键系统文件加载失败），`SetGlobalErrorWidget` 会弹出一个全屏错误对话框：
+
+```lua
+-- scripts/gamelogic.lua 第 56-60 行
+function SetGlobalErrorWidget(...)
+    if global_error_widget == nil then  -- 只保留第一个错误！
+        global_error_widget = ScriptErrorWidget(...)
+    end
+end
+```
+
+注意 `global_error_widget == nil` 的检查——**只有第一个致命错误会被显示**。这是因为第一个错误往往是根因，后续错误可能是连锁反应。
+
+#### 第六层：`known_assert` —— 已知错误的友好提示
+
+`scripts/knownerrors.lua` 定义了一组已知的、常见的错误，并为每个错误提供了**用户友好的提示信息**和修复链接：
+
+```lua
+ERRORS = {
+    CONFIG_DIR_WRITE_PERMISSION = {
+        message = "Unable to write to config directory.\nPlease make sure you have permissions...",
+        url = "https://support.klei.com/hc/en-us/articles/...",
+    },
+    CONFIG_DIR_DISK_SPACE = {
+        message = "There is not enough available hard drive space...",
+    },
+}
+
+function known_assert(condition, key)
+    if not condition then
+        if ERRORS[key] ~= nil then
+            known_error_key = key
+            error(ERRORS[key].message, 2)
+        else
+            error(key, 2)
+        end
+    end
+end
+```
+
+**设计意图**：对于磁盘空间不足、权限问题这类"不是代码 Bug 而是环境问题"的错误，直接给用户看"attempt to index a nil value"毫无帮助。`known_assert` 把这些已知场景转换成用户能理解的提示，甚至附带修复文档链接。
+
+---
+
+### 4.4.8 老手进阶：编写健壮的 Mod 代码
+
+#### 原则一：防御性编程
+
+在饥荒中，**永远不要假设任何东西存在**。组件可能为 nil，实体可能已删除，函数可能未加载：
+
+```lua
+-- 不健壮
+inst.components.health:DoDelta(-10)
+
+-- 健壮
+if inst:IsValid() and inst.components.health ~= nil then
+    inst.components.health:DoDelta(-10)
+end
+```
+
+**快捷写法**——利用 Lua 的短路求值：
+
+```lua
+local health = inst and inst.components and inst.components.health
+if health then
+    health:DoDelta(-10)
+end
+```
+
+#### 原则二：ismastersim 检查
+
+任何修改游戏世界状态的代码都应该只在服务端执行：
+
+```lua
+AddPrefabPostInit("wilson", function(inst)
+    if not TheWorld.ismastersim then return end
+    -- 以下代码只在服务端执行
+    inst.components.health:SetMaxHealth(200)
+end)
+```
+
+#### 原则三：延迟回调中的 IsValid 检查
+
+所有 `DoTaskInTime`、`DoPeriodicTask` 中的回调都应该先检查实体有效性：
+
+```lua
+inst:DoPeriodicTask(5, function(inst)
+    if not inst:IsValid() then return end
+    -- 安全操作...
+end)
+```
+
+#### 原则四：安全的事件监听
+
+监听事件时，确保回调不会触发同一事件，避免递归：
+
+```lua
+-- 使用标志位防止重入
+local _processing = false
+inst:ListenForEvent("healthdelta", function(inst, data)
+    if _processing then return end
+    _processing = true
+    -- 可能触发 healthdelta 的操作...
+    _processing = false
+end)
+```
+
+#### 原则五：安全的 pcall 包装
+
+对于可能失败的关键操作，用 `pcall` 包一层：
+
+```lua
+local success, result = pcall(function()
+    return SomeFunctionThatMightFail(args)
+end)
+
+if success then
+    -- 使用 result
+else
+    print("[MyMod] 操作失败:", result)
+    -- 优雅降级处理...
+end
+```
+
+#### 原则六：给 `for` 和 `while` 加安全上限
+
+```lua
+local function SafeSearch(start, condition, maxsteps)
+    maxsteps = maxsteps or 1000
+    local step = 0
+    local current = start
+    while condition(current) do
+        step = step + 1
+        if step > maxsteps then
+            print("[MyMod] SafeSearch: 超过最大步数，中断")
+            return nil
+        end
+        current = GetNext(current)
+    end
+    return current
+end
+```
+
+---
+
+### 4.4.9 实用速查：错误信息翻译表
+
+| 错误信息 | 中文翻译 | 常见原因 | 修复思路 |
+|----------|---------|---------|---------|
+| `attempt to index a nil value` | 对 nil 做索引操作 | 组件/变量不存在 | 加 nil 检查 |
+| `attempt to index local 'X' (a nil value)` | 局部变量 X 是 nil | 变量未赋值或函数返回 nil | 检查赋值来源 |
+| `attempt to index field 'X' (a nil value)` | 字段 X 是 nil | 嵌套访问中某一层为 nil | 逐层检查 |
+| `attempt to call a nil value` | 调用了不存在的函数 | 拼写错误或未 require | 检查函数名和导入 |
+| `attempt to perform arithmetic on a nil value` | 对 nil 做算术运算 | 数值变量为 nil | 加默认值 `(x or 0)` |
+| `attempt to compare nil with number` | 对 nil 做比较 | 比较对象为 nil | 先检查是否存在 |
+| `attempt to concatenate a nil value` | 拼接了 nil | 字符串拼接遇到 nil | 用 `tostring()` 或 `or ""` |
+| `stack overflow` | 调用栈溢出 | 无限递归 | 找到循环调用链，加终止条件 |
+| `variable 'X' is not declared` | 变量未声明 | strict.lua 拦截 | 加 `local` 或用 `GLOBAL` |
+| `assign to undeclared variable 'X'` | 给未声明变量赋值 | strict.lua 拦截 | 加 `local` 或 `global("X")` |
+| `infinite loop detected` | 检测到无限循环 | while/for 出不来 | 检查循环退出条件 |
+| `COROUTINE X SCRIPT CRASH` | 协程崩溃 | 异步任务中出错 | 看栈追踪定位出错行 |
+| `could not load component X` | 组件加载失败 | 文件不存在或返回值错误 | 检查文件路径和返回语句 |
+| `component X already exists` | 组件重复添加 | AddComponent 被调用两次 | 先检查是否已有该组件 |
+| `Error loading file X` | 文件加载失败 | Lua 语法错误 | 检查括号、end、逗号 |
+
+---
+
+### 4.4.10 小结
+
+- **nil 访问**是最常见的崩溃类型——养成"先检查再访问"的习惯
+- **栈溢出**意味着无限递归——找到循环调用链并打破它
+- **无限循环**会卡死游戏——给所有循环加安全上限
+- 饥荒有**六层错误保护体系**：`strict.lua` → `RunInEnvironment` → `runmodfn` → 调度器 → `SetGlobalErrorWidget` → `known_assert`
+- **健壮代码的核心原则**：防御性编程、`ismastersim` 检查、`IsValid` 检查、防重入、`pcall` 包装、循环上限
+
+> **下一节预告**：4.5 节我们将聚焦网络相关 bug 的调试——客户端 vs 服务端的代码执行差异、RPC 调试、NetVar 同步问题。这是联机版 Mod 开发中最具挑战性的部分。
 
 ## 4.5 网络相关 bug 的调试思路（客户端 vs 服务端）
 
