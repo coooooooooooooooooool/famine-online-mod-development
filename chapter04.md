@@ -3708,4 +3708,335 @@ end)
 
 ## 4.7 Mod 冲突的快速排查方法
 
-（待编写）
+### 本节导读
+
+"我的 Mod 单独开没问题，和别人的 Mod 一起就出 Bug"——这是 Mod 冲突。冲突不是某个 Mod 的"错"，而是两个 Mod 在不知情的情况下修改了同一段游戏逻辑。理解冲突的原因和排查方法，能帮你快速定位问题、写出更兼容的 Mod。
+
+> **新手**可以从「如何找出是哪个 Mod 导致的问题」开始；**进阶读者**可以理解 Mod 冲突的技术原因和 PostInit 的叠加机制；**老手**可以学习如何编写不容易与其他 Mod 冲突的代码。
+
+---
+
+### 4.7.1 快速入门：二分法排查冲突 Mod
+
+当你怀疑是 Mod 冲突导致的问题时，最高效的排查方法是**二分法**：
+
+1. 禁用一半的 Mod，测试问题是否还在
+2. 如果问题消失，说明冲突 Mod 在被禁用的那一半里
+3. 在那一半中再禁用一半，继续测试
+4. 重复直到找到冲突的 Mod
+
+**效率分析**：假设你有 32 个 Mod，二分法只需 5 次测试就能找到冲突 Mod（log2(32) = 5）。比逐个排查（最多 32 次）快得多。
+
+> **新手提示**：记得先确认"只开你的 Mod 时是否正常"。如果你的 Mod 本身就有问题，和其他 Mod 无关。
+
+---
+
+### 4.7.2 新手必知：Mod 冲突的常见表现
+
+| 表现 | 可能原因 |
+|------|---------|
+| 某个物品的属性不对 | 两个 Mod 都修改了同一个物品的属性 |
+| 配方被覆盖/消失 | 两个 Mod 都修改了同一个配方 |
+| 游戏崩溃，错误指向原版代码 | 某个 Mod 修改了原版函数的行为 |
+| 某个功能时灵时不灵 | 加载顺序导致 Mod 的修改被覆盖 |
+| UI 元素重叠或消失 | 两个 Mod 都修改了同一个 UI 组件 |
+
+---
+
+### 4.7.3 进阶：理解 Mod 为什么会冲突
+
+#### 原因 1：PostInit 的叠加机制
+
+多个 Mod 可以对同一个 Prefab 注册 `AddPrefabPostInit`。这些回调会**按 Mod 加载顺序依次执行**：
+
+```lua
+-- scripts/modutil.lua 第 593-598 行
+env.AddPrefabPostInit = function(prefab, fn)
+    initprint("AddPrefabPostInit", prefab)
+    if env.postinitfns.PrefabPostInit[prefab] == nil then
+        env.postinitfns.PrefabPostInit[prefab] = {}
+    end
+    table.insert(env.postinitfns.PrefabPostInit[prefab], fn)
+end
+```
+
+所有 Mod 的 PostInit 回调被收集到同一个列表中，然后依次调用。这本身不是问题——**问题出在回调之间的依赖和冲突**。
+
+**冲突场景**：Mod A 给 `wilson` 添加了一个自定义组件，Mod B 的 PostInit 假设 `wilson` 有某个原版组件并直接修改它的函数。如果 Mod B 先加载，它修改了原版函数；然后 Mod A 加载，它可能依赖被修改前的行为。
+
+#### 原因 2：函数替换 vs 函数包装
+
+**函数替换**（危险）：
+
+```lua
+-- Mod A 直接替换原版函数
+AddPrefabPostInit("spear", function(inst)
+    inst.components.weapon.GetDamage = function(self, attacker, target)
+        return 100  -- 固定 100 伤害
+    end
+end)
+```
+
+这完全覆盖了原始的 `GetDamage` 函数。如果另一个 Mod 也替换了这个函数，后加载的 Mod 会"赢"，前一个 Mod 的修改完全丢失。
+
+**函数包装**（安全）：
+
+```lua
+-- Mod B 包装原版函数
+AddPrefabPostInit("spear", function(inst)
+    local old_GetDamage = inst.components.weapon.GetDamage
+    inst.components.weapon.GetDamage = function(self, attacker, target)
+        local base_damage = old_GetDamage(self, attacker, target)
+        return base_damage * 1.5  -- 在原始基础上 ×1.5
+    end
+end)
+```
+
+这保留了原始函数的引用，在其基础上做修改。即使另一个 Mod 也包装了这个函数，两者可以共存。
+
+**规则**：**永远用包装而非替换。** 这是 Mod 兼容性的第一原则。
+
+#### 原因 3：Mod 加载顺序
+
+Mod 按 `modinfo.lua` 中的 `priority` 值排序加载。在 `scripts/mods.lua` 第 537-559 行：
+
+```lua
+local function modPrioritySort(a, b)
+    if a.modinfo and b.modinfo then
+        local apriority = sanitizepriority(a.modinfo.priority)
+        local bpriority = sanitizepriority(b.modinfo.priority)
+        if apriority == bpriority then
+            -- 优先级相同时按名字排序
+            return stringidsorter(aname, bname)
+        end
+        return apriority > bpriority  -- 数字越大越先加载
+    end
+    return stringidsorter(a.modname, b.modname)
+end
+table.sort(self.mods, modPrioritySort)
+```
+
+**`priority` 值越大的 Mod 越先加载**。如果你的 Mod 需要在其他 Mod 之前加载（比如你是一个"库 Mod"），应该设置较高的 `priority`。
+
+**优先级相同时怎么办？** 按 Mod 名字的字符串排序——这意味着加载顺序取决于 Mod 的文件夹名，是不可靠的。不要依赖这个顺序。
+
+#### 原因 4：全局变量污染
+
+在 `modmain.lua` 中，如果不小心创建了全局变量，可能会覆盖其他 Mod 或游戏本身的变量：
+
+```lua
+-- 危险！在 modmain.lua 中
+function MyHelper()  -- 这是一个全局函数！
+    -- ...
+end
+```
+
+虽然 Mod 运行在沙箱环境中，但如果你在 Mod 环境中定义了和游戏全局变量同名的变量，可能会产生意想不到的效果。
+
+**正确做法**：始终使用 `local`：
+
+```lua
+local function MyHelper()
+    -- ...
+end
+```
+
+#### 原因 5：`AddClassPostConstruct` 的冲突
+
+`AddClassPostConstruct` 会修改一个类的构造函数，影响这个类的**所有实例**：
+
+```lua
+-- scripts/modutil.lua 中
+local function DoAddClassPostConstruct(classdef, postfn)
+    local constructor = classdef._ctor
+    classdef._ctor = function (self, ...)
+        constructor(self, ...)
+        postfn(self, ...)
+    end
+end
+```
+
+多个 Mod 都可以对同一个类添加 PostConstruct，它们会按注册顺序依次执行。如果一个 Mod 在 PostConstruct 中做了破坏性修改（比如删除了某个方法），后续的 PostConstruct 可能就找不到预期的方法了。
+
+---
+
+### 4.7.4 进阶：利用日志定位冲突
+
+#### 技巧 1：开启 Mod 初始化调试打印
+
+在 `modsettings.lua`（位于 Mod 目录外的全局配置）中添加：
+
+```lua
+EnableModDebugPrint()
+```
+
+开启后，日志中会显示每个 Mod 注册的 PostInit、RPC 等信息：
+
+```
+智能锅 (workshop-123456789) AddPrefabPostInit spear
+智能锅 (workshop-123456789) AddComponentPostInit combat
+伤害倍率 (workshop-987654321) AddPrefabPostInit spear
+```
+
+如果你看到**两个 Mod 都对同一个 prefab/component 注册了 PostInit**，这就是潜在冲突点。
+
+#### 技巧 2：检查加载顺序
+
+在日志中搜索 `"Loading mod:"`，可以看到 Mod 的实际加载顺序：
+
+```
+Loading mod: 库Mod (workshop-111) Version:1.0
+Loading mod: 智能锅 (workshop-222) Version:2.0
+Loading mod: 伤害倍率 (workshop-333) Version:1.5
+```
+
+如果调换某两个 Mod 的加载顺序后问题消失/出现，说明冲突和执行顺序有关。
+
+#### 技巧 3：在日志中搜索 Mod 错误
+
+```
+error calling LoadPrefabFile in mod 伤害倍率 (workshop-333):
+Disabling 伤害倍率 (workshop-333) because it had an error.
+```
+
+这些信息明确指出了哪个 Mod 出了问题。
+
+#### 技巧 4：追踪函数是否被覆盖
+
+在你的 Mod 的 PostInit 中，检查函数是否已被修改：
+
+```lua
+AddPrefabPostInit("spear", function(inst)
+    if not TheWorld.ismastersim then return end
+
+    local damage_fn = inst.components.weapon.GetDamage
+    print("[MyMod] spear.GetDamage 来源:", debug.getinfo(damage_fn, "S").source)
+    -- 如果输出的不是原版文件路径，说明被其他 Mod 修改过了
+end)
+```
+
+---
+
+### 4.7.5 老手进阶：编写高兼容性 Mod 的原则
+
+#### 原则 1：包装而非替换
+
+```lua
+-- 包装模板
+local old_fn = target.SomeFunction
+target.SomeFunction = function(self, ...)
+    -- 你的前置逻辑...
+    local result = old_fn(self, ...)
+    -- 你的后置逻辑...
+    return result
+end
+```
+
+#### 原则 2：检查再操作
+
+```lua
+-- 不要假设组件/函数存在
+AddComponentPostInit("health", function(self)
+    if self.DoDelta then  -- 检查函数存在
+        local old_DoDelta = self.DoDelta
+        self.DoDelta = function(self, ...)
+            -- ...
+            return old_DoDelta(self, ...)
+        end
+    end
+end)
+```
+
+#### 原则 3：使用唯一标识
+
+避免用通用名称定义全局变量、标签或事件名：
+
+```lua
+-- 不好
+inst:AddTag("custom")
+inst:ListenForEvent("update", fn)
+
+-- 好
+inst:AddTag("mymod_custom")
+inst:ListenForEvent("mymod_update", fn)
+```
+
+#### 原则 4：提供 `priority` 设置
+
+如果你的 Mod 是一个被其他 Mod 依赖的"库"，在 `modinfo.lua` 中设置高优先级：
+
+```lua
+priority = 100  -- 确保在普通 Mod（默认 0）之前加载
+```
+
+#### 原则 5：最小化修改范围
+
+```lua
+-- 不好：修改所有实体
+AddPrefabPostInitAny(function(inst)
+    -- 这会对世界上每一个实体执行
+end)
+
+-- 好：只修改需要的实体
+AddPrefabPostInit("spear", function(inst)
+    -- 只影响长矛
+end)
+```
+
+#### 原则 6：提供配置选项
+
+如果你的 Mod 可能和其他 Mod 冲突，提供配置选项让用户关闭可能冲突的功能。
+
+---
+
+### 4.7.6 实用速查：Mod 冲突排查流程图
+
+```
+发现 Bug
+  │
+  ├── 只开你的 Mod 是否正常？
+  │     ├── 不正常 → 你的 Mod 自身有 Bug，不是冲突问题
+  │     └── 正常 → 确认是 Mod 冲突
+  │
+  ├── 二分法找出冲突 Mod
+  │     ├── 禁用一半 Mod → 问题消失 → 冲突在禁用的那一半
+  │     └── 禁用一半 Mod → 问题还在 → 冲突在启用的那一半
+  │     （重复直到定位到具体 Mod）
+  │
+  ├── 确认冲突类型
+  │     ├── 搜索日志中两个 Mod 的 PostInit 目标是否重叠
+  │     ├── 检查是否有函数替换（用 debug.getinfo 追踪）
+  │     └── 检查加载顺序是否影响结果
+  │
+  └── 修复
+        ├── 用函数包装替代函数替换
+        ├── 加条件检查避免假设
+        ├── 调整 priority 改变加载顺序
+        └── 联系另一个 Mod 的作者协商兼容方案
+```
+
+---
+
+### 4.7.7 小结
+
+- **二分法**是排查 Mod 冲突最高效的方法——先确认是冲突，再定位具体 Mod
+- Mod 冲突的本质是**多个 Mod 修改了同一段逻辑**——PostInit 叠加、函数替换、全局变量污染
+- **加载顺序**由 `modinfo.lua` 的 `priority` 决定——数值越大越先加载
+- **编写兼容代码的核心原则**：包装而非替换、检查再操作、使用唯一标识、最小化修改范围
+- **日志是定位冲突的关键工具**——开启 `EnableModDebugPrint()` 查看各 Mod 的 PostInit 注册信息
+
+---
+
+## 第4章 总结
+
+本章系统性地介绍了饥荒联机版 Mod 开发中的调试与排错方法：
+
+1. **4.1 日志系统**：理解 `print` 重写机制、`server_log` 与 `client_log` 的区别、日志关键词速查
+2. **4.2 控制台调试**：掌握 `c_spawn`、`c_select`、`c_find` 等核心命令，理解本地/远程执行管线
+3. **4.3 print 调试法**：从基础 print 到 `dumptable`、`DumpEntity`、`debugtools.lua` 完整工具箱
+4. **4.4 常见崩溃类型**：nil 访问、栈溢出、无限循环的识别模式和排查流程
+5. **4.5 网络 bug 调试**：客户端/服务端架构、NetVar/Replica/Classified 同步机制、RPC 系统
+6. **4.6 性能定位**：游戏更新机制、实体休眠、常见性能杀手和优化策略
+7. **4.7 Mod 冲突排查**：二分法排查、PostInit 叠加机制、编写高兼容性代码的原则
+
+调试是一项**需要练习的技能**——每次遇到 Bug 都是学习的机会。掌握了这些方法和工具，你就能从容应对 Mod 开发中的各种问题。
