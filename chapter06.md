@@ -1038,7 +1038,984 @@ end)
 
 ## 6.2 Replica 组件——客户端的"影子"
 
-（待编写）
+### 本节导读
+
+6.1 节我们讲过：`AddComponent("health")` 里的第三步是 **`ReplicateComponent("health")`**——"客户端创建一个叫 `inst.replica.health` 的影子"。那一节一笔带过没深入讲。这一节我们把这个"**影子**"彻底拆开——**它是什么、怎么被创建、怎么和服务端组件同步、你写 Mod 时要注意什么**。
+
+> **新手**从 6.2.1-6.2.3 入手，理解「客户端看不到服务端的真组件，只能通过 replica 拿数据」这个核心命题，能看懂官方任何一个 `*_replica.lua` 文件的结构；**进阶读者**从 6.2.4 开始深入，学习 `REPLICATABLE_COMPONENTS` 注册表、tag 标记法（`_health` vs `__health`）、以及 replica 里三种不同的数据源（net 变量、直接 tag、查 classified）；**老手**可以跳到 6.2.7-6.2.8，了解 replica 的完整生命周期、`AddReplicableComponent` 给自定义组件加 replica 的方法，以及写 replica 时最容易踩的 6 个陷阱。
+
+**前置知识**：本节假设你**已经读过 5.4 节**（Pristine State）对"两段代码为什么各执行一次"和 replica 整体机制的讲解。6.2 节**不重复 5.4**——我们从**组件视角**重新切入，关注 replica 组件文件的骨架、API 使用模式、和写 Mod 时的实战。
+
+---
+
+### 6.2.1 快速入门：为什么需要 Replica？
+
+#### 第一步：服务端和客户端看到的是"同一个实体"吗？
+
+先想一个看似简单的问题——**玩家 A 的客户端怎么知道"蜘蛛怪 X 还剩 50 血"？**
+
+在单机游戏里，这不是问题：血量就存在某个变量里，UI 直接读。
+
+**但在联机版里情况完全不同**：
+
+- **服务端（主机）**：蜘蛛的 `health` 组件是真实的——`inst.components.health.currenthealth = 50`
+- **客户端**（连进来的其他玩家）：**根本没有 `inst.components.health`！**
+
+这不是 bug——是饥荒联机版的故意设计。**客户端实体 `inst.components` 表里几乎是空的**（只有极少数客户端也需要独立运行的组件）。因为：
+
+1. **网络带宽限制**：如果每个组件的所有字段都实时同步，几百只蜘蛛 × 几十个组件 × 几个字段 = 服务器上行带宽爆炸
+2. **权威性要求**：只有服务端的数据才是"真"——客户端随便改数字没意义（也会被系统检测为作弊）
+3. **客户端不需要全部信息**：客户端只要**能显示、能做预判**就够了——蜘蛛的 AI 决策、伤害计算、目标搜索都在服务端跑
+
+但客户端又必须能看到"这只蜘蛛还剩 50 血"——因为：
+- 要显示血量 debug UI（控制台 `c_sel()` 检查）
+- 要判断"蜘蛛死了没，要不要播放死亡动画"
+- 要给玩家显示"这个敌人血量低了"的视觉提示
+
+**Klei 的解决方案**：**在客户端创建一个"影子组件"——只有必要字段，通过网络同步**。这就是 **Replica**（复刻、副本）。
+
+#### 第二步：Replica 的工作模型
+
+```
+┌──────────────────────────────────┐           ┌──────────────────────────────────┐
+│  服务端（主机）                    │           │  客户端（其他玩家）                 │
+├──────────────────────────────────┤           ├──────────────────────────────────┤
+│  inst.components.health          │           │  inst.components.health = nil    │
+│    .maxhealth = 200              │           │                                   │
+│    .currenthealth = 50           │           │  inst.replica.health             │
+│    .regenrate = ...              │──────────▶│    .classified.maxhealth:value() │
+│    .invincible = false           │  同步     │      → 200                        │
+│    .lunarburns = {...}           │           │    .classified.currenthealth     │
+│    ...（几十个字段）                │           │      → 50                         │
+│                                  │           │    （只读接口）                      │
+└──────────────────────────────────┘           └──────────────────────────────────┘
+```
+
+关键差异：
+
+- **服务端**：`inst.components.health` 是一个**完整的** `Health` 实例，几十个字段、几十个方法、各种回调
+- **客户端**：`inst.components.health` 是 `nil`！但 `inst.replica.health` 是一个**精简的** `Health` 实例——只有几个必要方法（`GetCurrent`、`GetPercent`、`IsDead` 等），字段通过 classified（联网对象）拿
+- 服务端某字段变了 → 通过 net 变量自动同步 → 客户端的 `classified` 拿到新值 → `replica` 方法读 classified 就是最新值
+
+#### 第三步：一个直观的 Mod 示例
+
+假设你想做一个"**看某个怪物还剩多少血**"的 UI（类似其他 MMO 的敌人血条）——Mod 代码必须在**客户端**运行。但你在客户端写：
+
+```lua
+-- ❌ 错！客户端没有 components.health
+local hp = inst.components.health.currenthealth
+```
+
+**崩溃**——因为客户端 `inst.components.health == nil`。
+
+正确写法是**通过 replica 访问**：
+
+```lua
+-- ✅ 对
+local hp = inst.replica.health:GetCurrent()
+local pct = inst.replica.health:GetPercent()
+```
+
+同一个方法、同一个调用——但**底层在服务端读组件字段，在客户端读 classified 同步值**。这个"**无感切换**"就是 replica 最大的价值。
+
+> **新手记忆**：**客户端要"看到"服务端组件的数据，只能通过 `inst.replica.<组件名>`**。这是饥荒联机版的铁律，违反它就是崩溃。
+
+---
+
+### 6.2.2 快速入门：`inst.replica.health` 到底是什么？
+
+先看**引擎给实体预置的 `replica` 容器**（`scripts/entityscript.lua` 第 208-246 行）：
+
+```208:246:scripts/entityscript.lua
+local replica_mt =
+{
+	__index = function(t, k)
+		return rawget(t, "inst"):ValidateReplicaComponent(k, rawget(t, "_")[k])
+	end,
+}
+
+EntityScript = Class(function(self, entity)
+    self.entity = entity
+    self.components = {}
+    self.lower_components_shadow = {}
+    self.GUID = entity:GetGUID()
+    self.spawntime = GetTime()
+```
+
+注意第 208-213 行的 `replica_mt`——这是 `inst.replica` 这张表的 **metatable**。当你写 `inst.replica.health` 时，实际发生的是：
+
+1. **表里直接找**——初始是空的，找不到
+2. **触发 `__index`**——调用 `ValidateReplicaComponent("health", rawget(t, "_")["health"])`
+3. **检查 `_health` tag**——`ValidateReplicaComponent` 实现在 `entityreplica.lua` 第 30-32 行：
+
+```30:32:scripts/entityreplica.lua
+function EntityScript:ValidateReplicaComponent(name, cmp)
+    return self:HasTag("_"..name) and cmp or nil
+end
+```
+
+**翻译**：如果实体有 `"_health"` tag，就返回真正的 replica 组件；否则返回 `nil`。
+
+**为什么要检查 `_health` tag？** 因为 replica 实例虽然在 `inst.replica._` 表里挂着，但只有"**当前活跃**"的 replica 才应该被访问——如果你在 `RemoveComponent("health")` 之后继续访问 `inst.replica.health`，会得到 `nil`（因为 `_health` tag 被移除了）。这是一种**"安全阀"**机制。
+
+#### `inst.replica._` 是什么？
+
+是**真正存放 replica 实例的"小仓库"**。第 244 行：
+
+```lua
+self.replica = { _ = {}, inst = self }
+```
+
+当 `ReplicateComponent("health")` 执行时（6.1.2 节讲过），最后一行：
+
+```lua
+rawset(self.replica._, name, cmp(self))
+```
+
+**把 replica 实例放到 `inst.replica._.health`**。外界访问 `inst.replica.health` 时，经过 metatable 里的 `rawget(t, "_")[k]` 再走 `_health` tag 检查——两层间接，双保险。
+
+> **开发逻辑**：为什么不直接 `inst.replica.health = cmp(self)`？因为 Klei 要保证**只有合法的 replica 才能被访问**——直接赋值让检查失去意义。metatable + 下划线约定是 Lua 里实现"**有条件的字段访问**"最干净的写法。
+
+#### 看一个 replica 文件的完整开头
+
+`scripts/components/health_replica.lua` 第 1-9 行：
+
+```1:9:scripts/components/health_replica.lua
+local Health = Class(function(self, inst)
+    self.inst = inst
+
+    if TheWorld.ismastersim then
+        self.classified = inst.player_classified
+    elseif self.classified == nil and inst.player_classified ~= nil then
+        self:AttachClassified(inst.player_classified)
+    end
+end)
+```
+
+**解读**：
+
+- **`Class(function(self, inst) ... end)`**——和主组件一样，是一个 Lua Class
+- **构造函数参数 `inst`**——将要挂到哪个实体上
+- **`if TheWorld.ismastersim then`**——**服务端走这支**：直接把 `player_classified` 引用过来（因为服务端两个都在）
+- **`else` 支**——**客户端走这支**：调用 `AttachClassified`，挂载联网对象并监听"onremove"事件
+
+**这就是 replica 的核心矛盾——服务端和客户端各走一支**。同一个 replica 文件在两端都会被执行，但做的事很不一样：服务端只是**引用**真组件，客户端才真正**建立网络接收通道**。
+
+---
+
+### 6.2.3 快速入门：Replica 组件的骨架
+
+刚才我们看了 `health_replica.lua` 的构造函数。现在看它的**方法**是如何实现"服务端和客户端**不同路径**"的。
+
+#### 经典三段式：`GetCurrent`
+
+```100:108:scripts/components/health_replica.lua
+function Health:GetCurrent()
+    if self.inst.components.health ~= nil then
+        return self.inst.components.health.currenthealth
+    elseif self.classified ~= nil then
+        return self.classified.currenthealth:value()
+    else
+        return 100
+    end
+end
+```
+
+**完美的三段式**：
+
+```
+① 服务端：有真组件 → 直接读真组件字段
+② 客户端：有 classified → 读 net 变量的值
+③ 极端兜底：什么都没有 → 返回默认值（100）
+```
+
+为什么要三段式？**因为 replica 方法可能在以下任意场景下被调用**：
+
+| 场景 | `components.health` | `classified` | 命中分支 |
+|------|---------------------|--------------|---------|
+| 服务端查询任意实体 | 存在 | 存在（同一引用） | ① 直接读真组件 |
+| 客户端查询玩家实体 | `nil` | 存在 | ② 读 classified |
+| 客户端查询其他实体 | `nil` | `nil`（未建立） | ③ 默认值 |
+
+**注意**：**第一支 `self.inst.components.health ~= nil` 不是多余的**——即便 `classified` 存在，服务端也应该优先读真组件（更及时、无网络延迟）。
+
+#### 另一种常见模式：直接读 tag
+
+看 `health_replica.lua` 第 130-140 行：
+
+```130:140:scripts/components/health_replica.lua
+function Health:SetIsDead(isdead)
+    if isdead then
+        self.inst:AddTag("isdead")
+    else
+        self.inst:RemoveTag("isdead")
+    end
+end
+
+function Health:IsDead()
+    return self.inst:HasTag("isdead")
+end
+```
+
+**这里没有走 classified**——用 **tag 直接存状态**。为什么？因为：
+
+- **tag 的同步成本几乎为零**：它在实体创建时通过 pristine state 同步，后续可实时同步（tag 变化会通过实体的网络消息系统推送）
+- **语义简单**：`isdead` 是布尔量，用 tag 比开一个 net_bool 更轻量
+- **查询快**：`HasTag` 是内置 C++ 实现，比访问 `classified.xxx:value()` 还快
+
+> **开发逻辑**：**能用 tag 表达的布尔状态，就不要开 net 变量**。Klei 在源码里大量用 tag 做这种"轻量状态同步"——`"isdead"`、`"cannotheal"`、`"cannotmurder"`、`"sleeping"`、`"incombat"` 等。
+
+#### SetXxx 方法的写法
+
+看 `health_replica.lua` 第 51-61 行：
+
+```51:61:scripts/components/health_replica.lua
+function Health:SetCurrent(current)
+    if self.classified ~= nil then
+        self.classified:SetValue("currenthealth", current)
+    end
+end
+
+function Health:SetMax(max)
+    if self.classified ~= nil then
+        self.classified:SetValue("maxhealth", max)
+    end
+end
+```
+
+**SetXxx 只在服务端被调用**——因为同步是单向的（服务端 → 客户端）。客户端调用 `SetCurrent(50)` 不会改变服务端的值（事实上引擎会 assert 阻止这种操作）。
+
+**实际流程**：
+
+```
+服务端：
+  inst.components.health.currenthealth = 50  （直接改字段）
+    ↓
+  Class 的 onset 触发 oncurrenthealth 回调（health.lua 第 18-26 行）
+    ↓
+  oncurrenthealth 里调用 self.inst.replica.health:SetCurrent(50)
+    ↓
+  replica 的 SetCurrent 调用 self.classified:SetValue("currenthealth", 50)
+    ↓
+  classified 更新 net 变量 → 网络包发出 → 客户端收到 → classified 的 net 变量更新
+    ↓
+  客户端调用 inst.replica.health:GetCurrent() 时，读到最新值 50
+```
+
+**整个链路**：写一个字段 `health.currenthealth = 50` → 自动触发几跳 → 客户端同步——**你不用写一行网络代码**。这就是 replica 系统最干净的地方。
+
+#### 用 `inst.player_classified` vs 独立 classified
+
+`health_replica.lua` 用的是 **`inst.player_classified`**（玩家专属共享 classified），因为 health 只在玩家身上存在——Klei 把所有玩家相关的 replica 数据都挤进一个 `player_classified` 实体，节省网络实体数量。
+
+而 `inventoryitem_replica.lua`（第 13-14 行）为**每个物品** SpawnPrefab 了一个独立的 classified：
+
+```13:14:scripts/components/inventoryitem_replica.lua
+        self.classified = SpawnPrefab("inventoryitem_classified")
+        self.classified.entity:SetParent(inst.entity)
+```
+
+**差异的原因**：玩家数量少（最多 6-8 个），可以共用 classified；但物品可能有几千个，所以每个物品独立 classified（这些 classified 实体也会加到 `Ents` 全局表里）。
+
+6.3 节我们会详细讲 Classified 实体的设计哲学，这里只要记住：**replica 背后的 net 数据存在某个 classified 实体上**——可能是玩家共享的，也可能是物品独有的。
+
+---
+
+### 6.2.4 进阶：`REPLICATABLE_COMPONENTS` 注册表
+
+上一节你可能注意到一个反直觉的事实：**不是所有组件都会创建 replica**。只有被"登记"在一张白名单里的组件，才会在 `AddComponent` 时触发 `ReplicateComponent` 真正做事情。
+
+这张白名单就在 `entityreplica.lua` 第 5-26 行：
+
+```5:26:scripts/entityreplica.lua
+local REPLICATABLE_COMPONENTS =
+{
+    builder = true,
+    combat = true,
+    container = true,
+    constructionsite = true,
+    equippable = true,
+    fishingrod = true,
+    follower = true,
+    health = true,
+    hunger = true,
+    inventory = true,
+    inventoryitem = true,
+    moisture = true,
+    named = true,
+    oceanfishingrod = true,
+    rider = true,
+    sanity = true,
+    sheltered = true,
+    stackable = true,
+    writeable = true,
+}
+```
+
+**官方原版一共只有 20 个"可复刻"组件**。绝大多数组件（`fueled`、`perishable`、`workable`、`weapon` 等）**没有 replica**——因为客户端根本不需要知道它们的精细状态。
+
+#### `ReplicateComponent` 的过滤逻辑
+
+看 `entityreplica.lua` 第 34-60 行：
+
+```34:60:scripts/entityreplica.lua
+function EntityScript:ReplicateComponent(name)
+    if not REPLICATABLE_COMPONENTS[name] then
+        return
+    end
+
+    if TheWorld.ismastersim then
+        self:AddTag("_"..name)
+        if self:HasTag("__"..name) then
+            self:RemoveTag("__"..name)
+            return
+        end
+    end
+
+    if rawget(self.replica, "_")[name] ~= nil then
+        print("replica "..name.." already exists! "..debugstack_oneline(3))
+    end
+
+    local filename = name.."_replica"
+    local cmp = Replicas[filename]
+    if cmp == nil then
+        cmp = require("components/"..filename)
+        Replicas[filename] = cmp
+    end
+    assert(cmp ~= nil, "replica "..name.." does not exist!")
+
+    rawset(self.replica._, name, cmp(self))
+end
+```
+
+**第一行就是白名单检查**：`if not REPLICATABLE_COMPONENTS[name] then return end`——**不在白名单里的组件，这个函数啥都不干直接返回**。
+
+这就是为什么你在 `weapon.lua` 里写 `SetDamage` 不需要考虑客户端同步——**weapon 压根没有 replica**，客户端只能通过其他组件间接感知（比如 `inventoryitem_replica` 里记录了 attackrange）。
+
+#### 为什么不全部都做 replica？
+
+你可能想："干脆所有组件都做 replica 不就一劳永逸吗？" **不行**，原因有三：
+
+1. **网络负担**：每个 replica 要同步几个字段——350 个组件 × 几个字段 × 几千个实体 = 带宽灾难
+2. **大部分组件不需要客户端感知**：`weapon.damage` 客户端知道没意义（伤害在服务端结算）
+3. **设计约束**：强制开发者思考"**哪些状态客户端真的需要**"，避免滥用同步
+
+**判断哪些组件需要 replica 的经验法则**：
+
+| 组件需要 replica 当且仅当 | 举例 |
+|---------------------------|------|
+| 客户端需要它的**数据来渲染 UI** | `health` 显示血量、`sanity` 显示理智 |
+| 客户端需要它的**数据做预测判断** | `inventoryitem` 判断能否拾起 |
+| 客户端需要它来**识别实体能力** | `combat` 判断"这个东西能不能打我" |
+| **右键菜单要用它**判断可用动作 | `workable`（可采集？）实际是通过 tag 实现 |
+
+**绝大多数"纯服务端计算"的组件不需要 replica**：`fueled`（火把燃料）、`perishable`（腐烂）、`burnable`（燃烧）、`growable`（生长）等——客户端即便想知道也知道不了，也没必要知道。
+
+#### Mod 如何往白名单里加组件？
+
+`entityreplica.lua` 最后一行（第 98-100 行）：
+
+```98:100:scripts/entityreplica.lua
+-- Mod access
+function AddReplicableComponent(name)
+    REPLICATABLE_COMPONENTS[name] = true
+end
+```
+
+这是 **Klei 留给 Mod 的扩展入口**——如果你写了一个自定义组件 `myweapon`，想让客户端也能感知到它的数据：
+
+```lua
+-- modmain.lua
+AddReplicableComponent("myweapon")
+```
+
+然后在 `scripts/components/` 下放一个 `myweapon_replica.lua`——这样每次 `AddComponent("myweapon")` 都会自动 ReplicateComponent，客户端就会有 `inst.replica.myweapon`。
+
+我们在 6.7 节会完整实战一次这个流程。
+
+---
+
+### 6.2.5 进阶：tag 标记机制（`_health` vs `__health`）
+
+`ReplicateComponent` 第 39-45 行有一段容易被忽视的代码：
+
+```lua
+if TheWorld.ismastersim then
+    self:AddTag("_"..name)
+    if self:HasTag("__"..name) then
+        self:RemoveTag("__"..name)
+        return
+    end
+end
+```
+
+**这段代码里两个 tag**：`_health`（单下划线）和 `__health`（双下划线）。它们是干什么的？
+
+#### 第一步：`_health` tag 的作用
+
+**`_health` tag 表示"**该实体的 health replica 当前是活跃的**"。
+
+前面 6.2.2 节的 `ValidateReplicaComponent` 会检查这个 tag——没有这个 tag 的话，`inst.replica.health` 访问会返回 `nil`，就像这个 replica 不存在一样。
+
+**谁会加这个 tag？**
+- 服务端 `AddComponent("health")` 时自动加
+- 通过 pristine state **自动同步到客户端**——客户端看到这个 tag 就知道"这个实体有 health replica"
+
+**为什么客户端也需要知道这个 tag？** 因为客户端要**判断一个实体有没有某能力**。比如客户端 UI 代码：
+
+```lua
+if target.replica.health ~= nil then
+    -- 显示目标血条
+end
+```
+
+如果没有 `_health` tag，这个判断就永远是 `nil`——正确。
+
+#### 第二步：`__health` tag 是什么？
+
+**`__health`（双下划线）表示"**服务端曾经有 health 组件但现在没了**"——即"**被移除的**"状态。
+
+看 `UnreplicateComponent` 第 62-67 行：
+
+```62:67:scripts/entityreplica.lua
+function EntityScript:UnreplicateComponent(name)
+    if rawget(self.replica, "_")[name] ~= nil and TheWorld.ismastersim then
+        self:RemoveTag("_"..name)
+        self:AddTag("__"..name)
+    end
+end
+```
+
+**逻辑**：移除 `_health`，加上 `__health`——这是一种"**墓碑标记**"：告诉世界"这个实体**曾经**有 health，但现在没了"。
+
+#### 第三步：`__health` 为什么要存在？
+
+看起来很奇怪：既然都没了，为什么不干脆删除 tag？答案在 `ReplicateComponent` 第 41-44 行：
+
+```lua
+if TheWorld.ismastersim then
+    self:AddTag("_"..name)
+    if self:HasTag("__"..name) then
+        self:RemoveTag("__"..name)
+        return  -- ← 关键：碰到墓碑就 return，不再真正创建 replica
+    end
+end
+```
+
+**场景**：玩家实体**先被添加 health → 然后移除 health → 又再次添加 health**。
+
+- **第一次 Add**：加 `_health` tag，创建 replica
+- **Remove**：移除 `_health`，加 `__health`（墓碑）
+- **第二次 Add**：加 `_health`（重新标记活跃），检测到 `__health` 存在 → 移除墓碑 → **直接 return，不再创建 replica 实例**！
+
+**为什么不再创建？** 因为 replica 实例**已经存在于 `rawget(self.replica._, name)` 里**（没被删除过）——直接复用它即可。节省内存、避免对象重建。
+
+#### 第四步：`PrereplicateComponent` 的用途
+
+还有一个特殊函数 `PrereplicateComponent`（第 69-72 行）：
+
+```69:72:scripts/entityreplica.lua
+function EntityScript:PrereplicateComponent(name)
+    self:ReplicateComponent(name)
+    self:UnreplicateComponent(name)
+end
+```
+
+**看起来很怪**——加了又立刻删？作用是**只留下墓碑 `__health` tag 但不创建 replica**。
+
+这在**实体被延迟初始化**的场景下有用：比如某些 Prefab 在 pristine 阶段**不创建 health 组件**，但希望客户端知道"**如果后续服务端加了 health，这是合法的**"——调用 `PrereplicateComponent("health")`，就会留下 `__health` 墓碑，未来正式添加时就能走"**复用已有 replica**"的路径。
+
+这属于比较少见的底层机制，**普通 Mod 用不到** `PrereplicateComponent`——90% 的场景下 `AddComponent` 自动 `ReplicateComponent` 就够了。
+
+#### 第五步：tag 状态转换图
+
+把三种状态的转换画出来：
+
+```
+初始状态：实体刚创建
+  │
+  │  ReplicateComponent("health")
+  ▼
+┌────────────────┐
+│  +_health tag  │  ← "活跃中"
+│  replica 实例存在 │
+└────────────────┘
+  │
+  │  UnreplicateComponent
+  ▼
+┌────────────────┐
+│  -_health tag  │
+│  +__health tag │  ← "已移除（墓碑）"
+│  replica 实例仍存在（复用）│
+└────────────────┘
+  │
+  │  再次 ReplicateComponent
+  ▼
+┌────────────────┐
+│  +_health tag  │
+│  -__health tag │  ← "重新活跃"（复用旧实例）
+└────────────────┘
+```
+
+**这是 Klei 用 tag 做"状态机"的经典案例**——两个简单的 tag 组合出 4 种状态（都没 / 只有 _ / 只有 __ / 都没），覆盖所有可能的生命周期阶段。
+
+> **开发逻辑**：为什么用 tag 而不是用组件内部的 bool 字段？因为 **tag 会自动同步到客户端**——服务端的 bool 字段客户端看不到。tag 是跨端的"状态广告板"，是饥荒联机版最高效的跨端状态传递方式。
+
+---
+
+### 6.2.6 进阶：Replica 里的三种数据来源
+
+同一个 replica 文件里，你会看到字段的读取路径有**三种不同来源**。理解它们的区别是写好 replica 的关键。
+
+#### 来源 ①：服务端真组件字段
+
+```100:108:scripts/components/health_replica.lua
+function Health:GetCurrent()
+    if self.inst.components.health ~= nil then
+        return self.inst.components.health.currenthealth
+    elseif self.classified ~= nil then
+        return self.classified.currenthealth:value()
+    else
+        return 100
+    end
+end
+```
+
+**第一行分支 `self.inst.components.health`**——直接读真组件字段。
+
+**特点**：
+- **只能在服务端生效**（客户端 `inst.components.health == nil`）
+- **实时、准确**——没有网络延迟
+- **不占任何网络带宽**
+
+#### 来源 ②：classified 的 net 变量
+
+```lua
+return self.classified.currenthealth:value()
+```
+
+**`classified` 是一个独立的联网实体**（或玩家共享的 `player_classified`），上面挂了一堆 `net_bool` / `net_uint` / `net_hash` 等 net 变量。
+
+**特点**：
+- **客户端专用**
+- **有延迟**（网络包过来才更新）
+- **只读**——客户端不能 set，只能 read value
+
+#### 来源 ③：tag 直接存状态
+
+```130:140:scripts/components/health_replica.lua
+function Health:SetIsDead(isdead)
+    if isdead then
+        self.inst:AddTag("isdead")
+    else
+        self.inst:RemoveTag("isdead")
+    end
+end
+
+function Health:IsDead()
+    return self.inst:HasTag("isdead")
+end
+```
+
+**`AddTag / HasTag` 自动跨端同步**。
+
+**特点**：
+- **最轻量**——tag 是 C++ 实现的字符串哈希
+- **只适合布尔状态**
+- **服务端 AddTag 后客户端立即能 HasTag**
+
+#### 三种来源的选择决策树
+
+```
+问：这个字段客户端需不需要知道？
+├─ 不需要 → 不写 replica 方法，放在主组件里就够
+└─ 需要 → 下一步
+   │
+   问：这是一个布尔量吗？
+   ├─ 是 → 用 tag（来源 ③）
+   └─ 不是 → 下一步
+      │
+      问：数值范围小（能塞进 8/16/32 位）吗？
+      ├─ 是 → net_byte / net_smallbyte / net_ushortint（来源 ②）
+      └─ 不是 → net_uint / net_string（来源 ②）
+```
+
+#### 几个实战示例
+
+**① "是否无敌"**（布尔量）→ **用 tag**：
+
+```lua
+-- health.lua 第 52-60 行
+local function oninvincible(self, invincible)
+    if CHEATS_ENABLED then
+        if invincible then
+            self.inst:AddTag("invincible")
+        else
+            self.inst:RemoveTag("invincible")
+        end
+    end
+end
+```
+
+**② "当前血量"**（0-999 的整数）→ **net 变量**：
+
+```lua
+-- player_classified.lua 里
+inst.currenthealth = net_ushortint(inst.GUID, "health.currenthealth", "currenthealthdirty")
+```
+
+**③ "最大血量"**（0-999）→ 同样 net 变量。
+
+**④ "血量百分比"**（0-1 浮点数）→ **不同步**！客户端用 currenthealth / maxhealth **现算**：
+
+```lua
+-- health_replica.lua 第 90-98 行
+function Health:GetPercent()
+    if self.inst.components.health ~= nil then
+        return self.inst.components.health:GetPercent()
+    elseif self.classified ~= nil then
+        return self.classified.currenthealth:value() / self.classified.maxhealth:value()
+    else
+        return 1
+    end
+end
+```
+
+**这是典型的"派生字段不同步"优化**——百分比是由 current/max 推导的，同步它是浪费。
+
+> **开发逻辑**：**能不同步就不同步，能派生就不存储**。写 replica 时每加一个 net 变量，你就是在"掏玩家的网络带宽"——一定要问自己"这个数据客户端真的需要吗？能不能从已有数据推出来？"
+
+---
+
+### 6.2.7 老手进阶：Replica 的完整生命周期
+
+Replica 组件也有生命周期——虽然它的钩子没有主组件那么多（`OnSave/OnLoad/OnEntitySleep/Wake` 都不适用），但诞生、存活、销毁三阶段依然清晰。
+
+#### A. 诞生阶段：服务端 + 客户端各走一次
+
+```
+【服务端】
+AddComponent("health")
+  ├── ReplicateComponent("health")
+  │     ├── REPLICATABLE_COMPONENTS["health"] == true  ✓
+  │     ├── AddTag("_health")                    ← 告诉客户端"我有 health replica"
+  │     ├── require("components/health_replica")  （第一次才加载）
+  │     ├── rawset(self.replica._, "health", Health(inst))  ← 创建实例
+  │     └── 构造函数里 self.classified = inst.player_classified
+  │
+  └── 继续原版 AddComponent 流程（构造真 Health、AttributePostInit 等）
+
+【客户端】
+实体反序列化完成
+  ├── 所有 tag 已同步（包括 _health）
+  │
+  └── ReplicateEntity()（entityreplica.lua 第 75-85 行）
+        └── 遍历 REPLICATABLE_COMPONENTS，发现 _health tag 存在
+              └── ReplicateComponent("health")
+                    ├── require("components/health_replica")
+                    ├── 创建 Health(inst) 实例
+                    └── 构造函数里走 else 支：
+                          if inst.player_classified ~= nil then
+                              self:AttachClassified(inst.player_classified)
+```
+
+**关键点**：客户端的 replica **不是**在 `AddComponent` 时创建的——是在**实体反序列化完成**后，通过 `ReplicateEntity` 根据 `_<name>` tag **批量创建**的。
+
+看 `entityreplica.lua` 第 75-85 行：
+
+```75:85:scripts/entityreplica.lua
+--Triggered on clients immediately after initial deserialization of tags from construction
+function EntityScript:ReplicateEntity()
+    for k, v in pairs(REPLICATABLE_COMPONENTS) do
+        if v and (self:HasTag("_"..k) or self:HasTag("__"..k)) then
+            self:ReplicateComponent(k)
+        end
+    end
+
+    if self.OnEntityReplicated ~= nil then
+        self:OnEntityReplicated()
+    end
+end
+```
+
+**末尾的 `OnEntityReplicated` 钩子**——5.2.4 节介绍过。这是**客户端专属的"实体刚同步完"事件**，非常适合做客户端的一次性初始化。
+
+#### B. 存活阶段：数据同步透明进行
+
+- 服务端改 `health.currenthealth` → onset 回调触发 → `replica.health:SetCurrent(current)` → `classified:SetValue` → net 变量脏标记 → 下一帧同步
+- 客户端 net 变量脏标记 dispatch → listener 处理 → UI 重绘
+
+**这一阶段 replica 实例本身几乎不做事**——它只是一个"门面"（façade pattern），所有工作都由引擎的 net 变量系统自动完成。
+
+#### C. 销毁阶段：replica 随实体一起销毁
+
+看 `entityscript.lua` 第 1729-1733 行：
+
+```1729:1733:scripts/entityscript.lua
+    for k, v in pairs(rawget(self.replica, "_")) do
+        if v and type(v) == "table" and v.OnRemoveEntity then
+            v:OnRemoveEntity()
+        end
+    end
+```
+
+**实体销毁时遍历所有 replica，如果它们有 `OnRemoveEntity` 方法就调用**——让 replica 有机会清理自己的 classified。
+
+看 `inventoryitem_replica.lua` 第 64-69 行：
+
+```64:69:scripts/components/inventoryitem_replica.lua
+function InventoryItem:OnRemoveEntity()
+	if self.classified and TheWorld.ismastersim then
+		self.classified:Remove()
+		self.classified = nil
+	end
+end
+```
+
+**关键**：**只在服务端清理 classified**——因为 classified 本身是联网实体，服务端销毁它后客户端会自动收到 `onremove` 事件。
+
+#### D. 对比：health_replica 为什么没有 OnRemoveEntity？
+
+看 `health_replica.lua` 第 13-25 行的**注释掉**的代码：
+
+```13:25:scripts/components/health_replica.lua
+--V2C: OnRemoveFromEntity not supported
+--[[function Health:OnRemoveFromEntity()
+    if self.classified ~= nil then
+        if TheWorld.ismastersim then
+            self.classified = nil
+        else
+            self.inst:RemoveEventCallback("onremove", self.ondetachclassified, self.classified)
+            self:DetachClassified()
+        end
+    end
+end
+
+Health.OnRemoveEntity = Health.OnRemoveFromEntity]]
+```
+
+**为什么注释掉？** 因为 `health_replica` 用的是 `inst.player_classified`——**整个玩家共享的**，health replica 本身不拥有这个 classified。如果 health replica 移除时把 player_classified 清掉，会影响玩家实体上的其他 replica（sanity、hunger、inventory 等）。
+
+**老版本**可能支持过，但 V2C（Klei 的一位核心开发）在 `// V2C:` 注释里明确说**不再支持**——让 player_classified 随玩家实体整体管理，replica 不干涉。
+
+---
+
+### 6.2.8 老手进阶：`AddReplicableComponent` 与自定义 Replica 的六个陷阱
+
+#### 第一步：自定义 Replica 的基本流程
+
+假设你自己写了一个 `myability` 组件（主组件），想让客户端也能读它的"当前魔力值 / 最大魔力值"。步骤：
+
+1. **声明为可复刻**：`modmain.lua` 里加 `AddReplicableComponent("myability")`
+2. **写 replica 文件**：创建 `scripts/components/myability_replica.lua`
+3. **在主组件里写 onset 回调**：让字段变化自动触发 replica 同步
+4. **决定 classified 方案**：是用独立 classified、还是共享（如 `player_classified`）
+
+下面是一个最小范例的四件套：
+
+**① `modmain.lua`**：
+
+```lua
+AddReplicableComponent("myability")
+```
+
+**② `scripts/components/myability.lua`（主组件）**：
+
+```lua
+local function onmanamax(self, manamax)
+    self.inst.replica.myability:SetManaMax(manamax)
+end
+
+local function oncurrentmana(self, currentmana)
+    self.inst.replica.myability:SetCurrentMana(currentmana)
+end
+
+local MyAbility = Class(function(self, inst)
+    self.inst = inst
+    self.manamax = 100
+    self.currentmana = 100
+end,
+nil,
+{
+    manamax = onmanamax,
+    currentmana = oncurrentmana,
+})
+
+return MyAbility
+```
+
+注意 **Class 的第三个参数 `{manamax = onmanamax, ...}`**——这是 Lua Class 的 **onset 机制**：设置字段时自动调用回调（不是赋值就执行，而是 `__newindex` 里识别并调用）。
+
+**③ `scripts/components/myability_replica.lua`**：
+
+```lua
+local MyAbility = Class(function(self, inst)
+    self.inst = inst
+
+    self._manamax = net_ushortint(inst.GUID, "myability._manamax", "manamaxdirty")
+    self._currentmana = net_ushortint(inst.GUID, "myability._currentmana", "currentmanadirty")
+end)
+
+function MyAbility:SetManaMax(manamax)
+    self._manamax:set(manamax)
+end
+
+function MyAbility:SetCurrentMana(currentmana)
+    self._currentmana:set(currentmana)
+end
+
+function MyAbility:GetManaMax()
+    if self.inst.components.myability ~= nil then
+        return self.inst.components.myability.manamax
+    else
+        return self._manamax:value()
+    end
+end
+
+function MyAbility:GetCurrentMana()
+    if self.inst.components.myability ~= nil then
+        return self.inst.components.myability.currentmana
+    else
+        return self._currentmana:value()
+    end
+end
+
+return MyAbility
+```
+
+**注意**：这里用的是**直接挂 net 变量**（不是通过 classified 实体）。对于简单的数据、不需要玩家共享的场景，这种写法最简单。复杂场景（如物品的 `inventoryitem_replica`）才需要独立 classified 实体。
+
+**④ 实体在服务端使用**：
+
+```lua
+inst:AddComponent("myability")
+inst.components.myability.manamax = 200  -- 触发 onmanamax → replica:SetManaMax → net 变量同步
+```
+
+#### 第二步：六个常见陷阱
+
+**陷阱 1：忘了 `AddReplicableComponent`**
+
+```lua
+-- ❌ 错：不加这行，ReplicateComponent 在白名单检查时直接 return
+-- AddReplicableComponent("myability")
+
+inst:AddComponent("myability")
+-- 客户端 inst.replica.myability == nil
+```
+
+**症状**：客户端 `inst.replica.myability` 永远是 nil，即便 replica 文件写得再好。
+
+---
+
+**陷阱 2：主组件字段改了但没触发 replica 同步**
+
+```lua
+-- ❌ 错：直接赋值，没有 onset 回调
+inst.components.myability.currentmana = 50
+
+-- ✅ 对：在 Class 里声明 onset
+local MyAbility = Class(..., nil, {currentmana = oncurrentmana})
+inst.components.myability.currentmana = 50  -- 这次会触发 oncurrentmana
+```
+
+**原理**：Lua Class 的 onset 是通过 `__newindex` 实现的——必须在 Class 定义时声明，后续字段赋值才会触发。
+
+---
+
+**陷阱 3：客户端代码用 `components` 而不是 `replica`**
+
+```lua
+-- ❌ 错：客户端代码里这样写
+local mana = inst.components.myability.currentmana   -- 客户端这里是 nil
+
+-- ✅ 对：通过 replica
+local mana = inst.replica.myability:GetCurrentMana()
+```
+
+记住 6.2.1 节的铁律——**客户端要读数据一律走 replica**。
+
+---
+
+**陷阱 4：net 变量名字冲突**
+
+```lua
+-- myability_replica.lua
+self._mana = net_ushortint(inst.GUID, "myability.mana", ...)
+
+-- 某个老的 component_replica.lua 也用了同样的名字
+self._mana = net_ushortint(inst.GUID, "myability.mana", ...)  -- 崩溃！
+```
+
+**net 变量的第二个参数是字符串名字——必须全实体唯一**。Klei 的约定是 `<组件名>.<字段名>`——你的 Mod 也应该这么做（前面加上 Mod 前缀更稳妥，如 `"mymod.myability._mana"`）。
+
+---
+
+**陷阱 5：在 replica 里尝试 set 服务端独有字段**
+
+```lua
+-- replica 里
+function MyAbility:DoSomething()
+    self._currentmana:set(100)   -- 只在服务端有效——客户端 set 会崩或被忽略
+end
+```
+
+**net 变量的 `:set`** 只在服务端生效——客户端调用会报错或静默失败。**正确的做法**：客户端通过 RPC（Remote Procedure Call）向服务端发请求，由服务端 set。
+
+---
+
+**陷阱 6：数据更新太频繁**
+
+```lua
+-- 主组件里
+function MyAbility:OnUpdate(dt)
+    self.currentmana = self.currentmana + dt * 1.0  -- 每帧都触发一次同步！
+end
+```
+
+**每帧更新 net 变量 = 带宽灾难**。正确的做法：
+
+```lua
+-- 只在跨越整数阈值时才同步
+function MyAbility:OnUpdate(dt)
+    local old = math.floor(self.currentmana)
+    self.currentmana = self.currentmana + dt * 1.0
+    if math.floor(self.currentmana) ~= old then
+        -- 只在整数值改变时触发（onset 里再 set net 变量）
+    end
+end
+```
+
+官方 `health.lua` 对 `currenthealth` 的处理就是**只在值实际变化时才赋值**——而不是连续的浮点数更新。这避免了每帧发网络包。
+
+#### 第三步：什么时候不用 classified 实体？
+
+这是最常见的架构决策。判断标准：
+
+| 场景 | 选择 |
+|------|------|
+| 所有玩家都能看到的**少量字段**（< 5） | 直接 net 变量（挂在实体本身） |
+| 只有自己（owner）能看到的字段（如背包内容） | **独立 classified 实体**（SetParent 到 owner，用 `Classified` 的网络过滤） |
+| 数据量大且玩家共享 | 挂在 `player_classified` 上（看 `player_classified.lua`） |
+| 物品通用数据（可拾起、可堆叠、可装备等） | 独立 classified（见 `inventoryitem_classified.lua`） |
+
+这部分我们会在 6.3 节 Classified 专题详细讲。
+
+---
+
+### 6.2.9 小结
+
+- **Replica 是"客户端看不到服务端真组件时的唯一入口"**——客户端的 `inst.components` 几乎空，必须通过 `inst.replica.<组件名>` 访问数据。
+- **`inst.replica` 的 metatable 机制**：访问 `inst.replica.health` 会触发 `ValidateReplicaComponent`，检查 `_health` tag 是否存在——确保只有"活跃的" replica 才能被访问。
+- **`*_replica.lua` 文件骨架**：Class 构造函数里分服务端/客户端两路（`if TheWorld.ismastersim`），服务端引用真组件，客户端挂 classified 并监听 onremove。
+- **Replica 方法三段式**：① 服务端有真组件直接读 → ② 客户端有 classified 读 net 变量 → ③ 兜底默认值。每个 Getter 方法都应该遵循。
+- **`REPLICATABLE_COMPONENTS` 白名单**：原版 20 个组件，Mod 通过 `AddReplicableComponent(name)` 加入——不在白名单里的组件，`ReplicateComponent` 直接 return 不做事。
+- **`_health` vs `__health` tag 双标机制**：前者是"活跃"，后者是"墓碑"。服务端通过这两个 tag 广播 replica 的生命周期状态，客户端据此决定是否创建 replica。
+- **三种数据来源**：① 服务端真组件字段（服务端专用）、② classified 的 net 变量（跨端同步）、③ tag（布尔量的最轻同步）。能用 tag 的别开 net，能派生的别存储。
+- **Replica 生命周期**：服务端 AddComponent 时同步创建；客户端在实体反序列化后通过 `ReplicateEntity` 批量创建（根据 `_<name>` tag）；销毁时通过 `OnRemoveEntity` 清理 classified。
+- **自定义 Replica 六陷阱**：没 `AddReplicableComponent`、主组件字段没 onset、客户端误用 `components`、net 变量名冲突、客户端 set、更新频率太高——每个都是自己写组件时的血的教训。
+
+> **下一节预告**：6.3 节我们进入 **Classified 实体**——它本质是一个"**只为承载 net 变量而存在的"隐形联网实体**。`player_classified` 为什么能承载 50+ 字段？物品 classified 是怎么做"只给 owner 看"的可见性过滤？Classified 如何成为 replica 背后的真正"同步引擎"——一切答案在下一节。
 
 ## 6.3 Classified 实体——网络同步的桥梁
 
