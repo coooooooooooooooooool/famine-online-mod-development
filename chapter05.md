@@ -1054,7 +1054,606 @@ inst.incineratesound = SoundPath(inst, "die")
 
 ## 5.3 实体的创建流程：MakePlayerCharacter / MakeInventoryPhysics 等辅助函数
 
-（待编写）
+### 本节导读
+
+5.2 节我们拆开了一个 Prefab 文件的结构，反复提到"`MakeInventoryPhysics`、`MakeSmallBurnable`、`MakeInventoryFloatable` 这些 `MakeXxx` 函数把一整段配置打包成了一行调用"。这一节就聚焦它们——**饥荒联机版官方有一套系统性的"辅助函数"**，绝大部分集中在 `scripts/standardcomponents.lua`（约 1900 行）和 `scripts/prefabs/player_common.lua` 里的 `MakePlayerCharacter`。
+
+读懂这些辅助函数，等于**读懂了"做一个新物品/新怪物/新角色"的八成套路**。
+
+> **新手**只需要记住"见到 `MakeXxx` 就知道是在'一键套用官方配方'"，掌握最常用的三五个就够写 Mod；**进阶读者**应该顺着本节的分类表去 `standardcomponents.lua` 里对照读一遍，看每个辅助函数内部到底做了什么，这样 Mod 中需要"略微改一改"时你能手动展开；**老手**可以直接跳到 `MakePlayerCharacter` 部分，理解官方为什么要用"高阶工厂 + common_postinit / master_postinit 回调"这种设计模式，并学会把它应用到自己的大型 Mod 里。
+
+---
+
+### 5.3.1 快速入门：为什么需要辅助函数？
+
+回忆 5.2 节的例子——`scripts/prefabs/log.lua`（木头）第 13 行只写了一行：
+
+```lua
+MakeInventoryPhysics(inst)
+```
+
+如果不借助辅助函数，你就得手写一堆等价的底层调用：
+
+```lua
+-- 手动展开 MakeInventoryPhysics 的等价代码
+local phys = inst.entity:AddPhysics()
+phys:SetMass(1)
+phys:SetFriction(.1)
+phys:SetDamping(0)
+phys:SetRestitution(.5)
+phys:SetCollisionGroup(COLLISION.ITEMS)
+phys:SetCollisionMask(
+    COLLISION.WORLD,
+    COLLISION.OBSTACLES,
+    COLLISION.SMALLOBSTACLES
+)
+phys:SetSphere(.5)
+```
+
+这就是 `MakeInventoryPhysics` 内部的全部内容（见 `scripts/standardcomponents.lua` 第 370-386 行）。**它做的事就三件**：
+
+1. 给实体挂上物理组件 `AddPhysics()`
+2. 设置质量、摩擦力、阻尼、弹性等物理参数
+3. 配好碰撞组与碰撞掩码（决定它能撞到什么、被什么撞）
+
+一个物品写一遍可以接受；**游戏里几百件物品都要写一遍，就是灾难**——不仅啰嗦，还容易不同物品参数不一致。把"可拾起物品应有的物理配置"抽成一个函数叫 `MakeInventoryPhysics`，大家都调它，再也没人写错参数。
+
+> **新手理解**：`MakeXxx` 是**一组"行业术语"**——"我的物品是可以被捡起来的小物品" → `MakeInventoryPhysics`。官方已经把"可被捡起来的小物品"应该有的物理参数调好了，你直接用这个名字喊出需求就行。
+
+---
+
+### 5.3.2 快速入门：三个最常用的物理辅助函数
+
+写 Mod 遇到的第一个问题永远是"这东西的物理应该怎么配？"——下面这三个函数覆盖了 90% 的场景：
+
+| 函数 | 适用对象 | 典型例子 |
+|------|---------|---------|
+| `MakeInventoryPhysics(inst, mass, rad)` | **可拾起的小物品** | 木头、燧石、长矛、食物 |
+| `MakeCharacterPhysics(inst, mass, rad)` | **活的生物** | 蜘蛛、猪人、玩家角色 |
+| `MakeObstaclePhysics(inst, rad, height)` | **静态建筑/障碍物** | 科学机器、箱子、墙 |
+
+它们的核心差异是**碰撞组**：
+
+- `MakeInventoryPhysics` 属于 `COLLISION.ITEMS`——能和世界、障碍物碰撞，不会卡住生物
+- `MakeCharacterPhysics` 属于 `COLLISION.CHARACTERS`——生物之间会互相推挤，能走路
+- `MakeObstaclePhysics` 属于 `COLLISION.OBSTACLES`，**质量为 0**——不会被推动，是"墙"
+
+看 `scripts/standardcomponents.lua` 第 402-417 行 `MakeCharacterPhysics`：
+
+```lua
+function MakeCharacterPhysics(inst, mass, rad)
+    local phys = inst.entity:AddPhysics()
+    phys:SetMass(mass)
+    phys:SetFriction(0)
+    phys:SetDamping(5)
+    phys:SetCollisionGroup(COLLISION.CHARACTERS)
+    phys:SetCollisionMask(
+        COLLISION.WORLD,
+        COLLISION.OBSTACLES,
+        COLLISION.SMALLOBSTACLES,
+        COLLISION.CHARACTERS,
+        COLLISION.GIANTS
+    )
+    phys:SetCapsule(rad, 1)
+    return phys
+end
+```
+
+注意三个细节：
+1. **没有 `mass = mass or 1` 这样的默认值**——生物必须显式传质量（蜘蛛是 10、玩家是 75）。 
+2. **用 `SetCapsule` 而不是 `SetSphere`**——生物是竖着的胶囊形状，物品是球形。
+3. **碰撞掩码包含 `COLLISION.CHARACTERS` 本身**——所以生物之间会互相挡。
+
+**实战经验**：
+
+- 做一个"可以扔在地上的新物品"？→ `MakeInventoryPhysics(inst)`
+- 做一只新的小怪物？→ `MakeCharacterPhysics(inst, 10, .5)`（参考蜘蛛）
+- 做一个"玩家可以靠到但不能穿过"的新建筑？→ `MakeObstaclePhysics(inst, 1)`（半径 1）
+- 做一个"可以被玩家'扛起来'搬动"的大型建筑？→ `MakeHeavyObstaclePhysics(inst, 1)`，再配合 `heavyobstaclephysics` 组件
+
+---
+
+### 5.3.3 进阶：辅助函数全家福（按功能分类）
+
+`scripts/standardcomponents.lua` 里的 `MakeXxx` 函数有七十多个。直接按"我要做什么"分类整理如下——**这张表就是你写 Prefab 时的查找索引**。
+
+#### ① 物理类（对应 `AddPhysics`）
+
+| 函数 | 适用 | 典型 prefab |
+|------|------|-------------|
+| `MakeInventoryPhysics(inst, mass, rad)` | 可拾起的小物品 | `log.lua`（第 13 行） |
+| `MakeProjectilePhysics(inst, mass, rad)` | 弹射物（只碰地面，不挡生物） | `spider_web_spit` 等 |
+| `MakeCharacterPhysics(inst, mass, rad)` | 普通生物 | `spider.lua`（第 581 行） |
+| `MakeFlyingCharacterPhysics(inst, mass, rad)` | 飞行生物 | `crow.lua`、`bee.lua` |
+| `MakeGiantCharacterPhysics(inst, mass, rad)` | 巨型生物 | `deerclops.lua`、`beequeen.lua` |
+| `MakeGhostPhysics(inst, mass, rad)` | 幽灵 | `ghost.lua` |
+| `MakeObstaclePhysics(inst, rad, height)` | 静态大型障碍 | 科学机器、墙 |
+| `MakeWaterObstaclePhysics(inst, rad, height, restitution)` | 水上障碍（挡船） | 灯塔、浮标 |
+| `MakeSmallObstaclePhysics(inst, rad, height)` | 小型障碍（不挡 giant） | 花盆、矮栅栏 |
+| `MakeHeavyObstaclePhysics(inst, rad, height)` | 可"扛起"的重型建筑 | 脚架、雕像 |
+| `MakePondPhysics(inst, rad, height)` | 池塘类型（玩家不能进） | `pond.lua` |
+
+源码入口在 `scripts/standardcomponents.lua` 第 370-769 行。**这些函数的区别就在 `SetCollisionGroup` 和 `SetCollisionMask` 的不同组合**——不同碰撞组决定"谁能撞到谁"。
+
+> **开发逻辑**：饥荒的碰撞体系是分层的（`COLLISION.WORLD / OBSTACLES / SMALLOBSTACLES / CHARACTERS / GIANTS / ITEMS / FLYERS / LIMITS`）。一个 giant（比如巨鹿）踩小障碍物（花朵）是踩扁的，但撞到大障碍物（科学机器）会被挡——这种"体型感"就是靠这些辅助函数的碰撞组合表达的。
+
+#### ② 燃烧与传播类（对应 `burnable` + `propagator` 组件）
+
+| 函数 | 效果 | 典型 prefab |
+|------|------|-------------|
+| `MakeSmallBurnable(inst, time, offset, structure, sym)` | 小型可燃烧物（10 秒） | 木头、草 |
+| `MakeMediumBurnable(inst, time, offset, structure, sym)` | 中型可燃烧物（20 秒） | 箱子、帐篷 |
+| `MakeLargeBurnable(inst, time, offset, structure, sym)` | 大型可燃烧物（30 秒） | 树、篝火 |
+| `MakeSmallBurnableCharacter(inst, sym, offset)` | 小型生物（可被烧但不传播热源） | 兔子、仓鼠 |
+| `MakeMediumBurnableCharacter(inst, sym, offset)` | 中型生物 | 蜘蛛、猪人 |
+| `MakeLargeBurnableCharacter(inst, sym, offset, scale)` | 大型生物 | 牛、独眼巨鹿 |
+| `MakeSmallPropagator(inst)` | 小型火势传播源 | 木头、草 |
+| `MakeMediumPropagator(inst)` | 中型火势传播源 | 树、箱子 |
+| `MakeLargePropagator(inst)` | 大型火势传播源 | 篝火、锅 |
+
+**`Burnable` vs `Propagator` 的区别**：`Burnable` 是"我自己会烧"，`Propagator` 是"我旁边有火就会被引燃 / 我烧起来会点燃旁边"。**二者通常配对使用**。
+
+看 `scripts/prefabs/log.lua` 第 41-42 行：
+
+```lua
+MakeSmallBurnable(inst, TUNING.MED_BURNTIME)
+MakeSmallPropagator(inst)
+```
+
+这两行合起来的效果是：木头会被旁边的火点燃（propagator），被点燃后会自己烧 `MED_BURNTIME` 秒（burnable），烧的时候旁边的易燃物也会被点燃（propagator 反向传播）。
+
+`xxxBurnableCharacter` 系列专门针对**生物**：它只加 burnable（生物不加 propagator，因为生物跑来跑去不会"引燃"空气），且不会产生炭化尸体。看 `scripts/standardcomponents.lua` 第 244-255 行：
+
+```lua
+function MakeSmallBurnableCharacter(inst, sym, offset)
+    local burnable = inst:AddComponent("burnable")
+    burnable:SetFXLevel(1)
+    burnable:SetBurnTime(6)
+    burnable.canlight = false  -- 生物身上不能被手动点火（不能拿火把戳）
+    burnable:AddBurnFX(burnfx.character, offset or ..., sym)
+
+    local propagator = MakeSmallPropagator(inst)
+    propagator.acceptsheat = false  -- 生物不会被旁边的火自动引燃
+
+    return burnable, propagator
+end
+```
+
+注意 `propagator.acceptsheat = false`——生物不会"因为旁边着火就自燃"，必须被直接攻击（比如被火枪射中）。
+
+#### ③ 冰冻类（对应 `freezable` 组件）
+
+| 函数 | 抗冻等级 | 典型 prefab |
+|------|----------|-------------|
+| `MakeTinyFreezableCharacter` | 1（最容易冻） | 小蜘蛛、小雀 |
+| `MakeSmallFreezableCharacter` | 2 | 中等怪物 |
+| `MakeMediumFreezableCharacter` | 3（`SetResistance(2)`） | 蜘蛛 |
+| `MakeLargeFreezableCharacter` | 4（`SetResistance(3)`） | 猪人、高血怪 |
+| `MakeHugeFreezableCharacter` | 5（`SetResistance(4)`） | boss 级 |
+
+参数 `SetResistance(n)` 的意义：**需要被冰冻攻击击中 n+1 次才会被冻住**。Boss 级怪物往往要打 5 下冰冻手杖才能冰住。
+
+#### ④ 鬼附身类（对应 `hauntable` 组件）
+
+这是饥荒联机版独有的机制——玩家死亡后变成鬼，可以"附身"物品触发特殊效果（让长矛被弹飞、让书烧掉、让种子变成作物等）。`scripts/standardcomponents.lua` 第 987-1454 行定义了近 20 种 `MakeHauntableXxx`。
+
+| 函数 | 效果 | 典型 |
+|------|------|------|
+| `MakeHauntable(inst)` | 基础：仅增加 cooldown（什么都不做） | |
+| `MakeHauntableLaunch(inst)` | 被附身时飞出去 | `spear.lua` 第 74 行 |
+| `MakeHauntableLaunchAndSmash(inst)` | 飞出去 + 落地碎裂 | 石头 |
+| `MakeHauntableLaunchAndIgnite(inst)` | 飞出去 + 点燃 | `log.lua` 第 44 行 |
+| `MakeHauntableWork(inst)` | 触发一次砍伐/挖掘（自己对自己 work） | 树、矿石 |
+| `MakeHauntableIgnite(inst)` | 被附身后原地燃烧 | 易燃物 |
+| `MakeHauntableFreeze(inst)` | 被附身后冻住 | 水 |
+| `MakeHauntableChangePrefab(inst, newprefab)` | 变成另一种物品 | 种子 → 作物 |
+| `MakeHauntablePerish(inst)` | 加速腐烂 | 食物 |
+| `MakeHauntablePanic(inst)` | 让生物恐慌逃跑 | 中性生物 |
+| `MakeHauntablePlayAnim(inst, ...)` | 播放动画 | 书、摆件 |
+| `MakeHauntableGoToState(inst, state)` | 让实体切到指定 StateGraph 状态 | 需要 SG 的生物 |
+| `MakeHauntableDropFirstItem(inst)` | 掉落第一件背包物品 | 容器 |
+
+看 `scripts/standardcomponents.lua` 第 993-1009 行：
+
+```lua
+function MakeHauntableLaunch(inst, chance, speed, cooldown, haunt_value)
+    if not inst.components.hauntable then inst:AddComponent("hauntable") end
+    inst.components.hauntable.cooldown = cooldown or TUNING.HAUNT_COOLDOWN_SMALL
+    inst.components.hauntable:SetOnHauntFn(function(inst, haunter)
+        chance = chance or TUNING.HAUNT_CHANCE_ALWAYS
+        if math.random() <= chance then
+            Launch(inst, haunter, speed or TUNING.LAUNCH_SPEED_SMALL)
+            inst.components.hauntable.hauntvalue = haunt_value or TUNING.HAUNT_TINY
+            -- ...
+            return true
+        end
+        return false
+    end)
+end
+```
+
+逻辑很简单：**加组件 → 配置 cooldown → 给组件注入一个 `OnHauntFn` 回调**，回调里按概率触发"弹飞"效果。其他 `MakeHauntableXxx` 都是换一个回调函数而已。
+
+#### ⑤ 漂浮类（对应 `floater` 组件）
+
+```lua
+MakeInventoryFloatable(inst, size, offset, scale, swap_bank, float_index, swap_data)
+```
+
+**实现**（`scripts/standardcomponents.lua` 第 1700-1719 行）：
+
+```lua
+function MakeInventoryFloatable(inst, size, offset, scale, swap_bank, float_index, swap_data)
+    local floater = inst:AddComponent("floater")
+    floater:SetSize(size or "small")
+    if offset then floater:SetVerticalOffset(offset) end
+    if scale then floater:SetScale(scale) end
+    if swap_bank then
+        floater:SetBankSwapOnFloat(swap_bank, float_index, swap_data)
+    elseif swap_data then
+        floater:SetSwapData(swap_data)
+    end
+    return floater
+end
+```
+
+这个是**可拾起物品掉进水里能漂浮**的机制——饥荒联机版新增海洋玩法后，所有能进水的物品都要加它（不然会直接沉底消失）。`log.lua` 第 23 行：
+
+```lua
+MakeInventoryFloatable(inst, "med", 0.1, 0.75)
+```
+
+`size`（`"small" / "med" / "large"`）影响漂浮幅度；后面几个可选参数是"漂在水里时切换动画库"的设定。
+
+#### ⑥ 雪覆盖类（对应 `SnowCovered` 标签 + `lunarhailbuildup` 组件）
+
+| 函数 | 效果 |
+|------|------|
+| `MakeSnowCoveredPristine(inst)` | 客户端视觉："冬天下雪时会积雪"的动画符号 |
+| `MakeSnowCovered(inst)` | 等价于 `Pristine` + 监听世界雪状态 + 月球陨冰堆积（联机新机制） |
+| `MakeNoGrowInWinter(inst)` | 冬天不再长出浆果/作物 |
+
+#### ⑦ 宠物化/腐烂类（对应 `perishable` + `eater` + `inventoryitem` 组件）
+
+| 函数 | 效果 |
+|------|------|
+| `MakeSmallPerishableCreaturePristine(inst)` | 客户端预告：可以被放进背包当"生鲜"保存 |
+| `MakeSmallPerishableCreature(inst, starvetime, oninventory, ondropped)` | 完整配置：会饿死的小生物 |
+| `MakeFeedableSmallLivestockPristine(inst)` | 在 Pristine 版基础上加 `"small_livestock"` 标签 |
+| `MakeFeedableSmallLivestock(inst, starvetime, ...)` | 完整配置：可以被喂食、放进笼子的小生物（比如蝴蝶、青蛙、小猪） |
+
+看 `scripts/standardcomponents.lua` 第 958-973 行：
+
+```lua
+function MakeFeedableSmallLivestockPristine(inst)
+    MakeSmallPerishableCreaturePristine(inst)
+    inst:AddTag("small_livestock")
+end
+
+function MakeFeedableSmallLivestock(inst, starvetime, oninventory, ondropped)
+    MakeFeedableSmallLivestockPristine(inst)  -- 套用 Pristine 版
+
+    if inst.components.eater == nil then
+        inst:AddComponent("eater")
+    end
+    inst.components.eater:SetOnEatFn(oneat)
+    MakeSmallPerishableCreature(inst, starvetime, oninventory, ondropped)
+end
+```
+
+注意这里的嵌套：**非 Pristine 版会先调用 Pristine 版**，再加上组件。这揭示了 5.3.5 节要讲的重要模式。
+
+#### ⑧ 其他实用辅助函数
+
+| 函数 | 用途 |
+|------|------|
+| `MakeForgeRepairable(inst, material, onbroken, onrepaired)` | 武器/装备可以用特定材料（布鲁 / 月石）在锤子工作站修复 |
+| `MakeWaxablePlant(inst)` | 植物可以被蜂蜡永久保鲜 |
+| `MakeDeployableFertilizerPristine` + `MakeDeployableFertilizer` | 可以被"放置"在土地上的肥料（而不是扔进桶里） |
+| `MakeCraftingMaterialRecycler(inst, data)` | 可以被"拆解"还原成合成材料 |
+| `MakeHermitCrabAreaListener(inst, callbackfn)` | 和月岛隐士老奶奶任务挂钩（某物被破坏时让她不高兴） |
+| `MakeCollidesWithElectricField(inst)` | 会被电围栏电到 |
+
+---
+
+### 5.3.4 进阶：辅助函数内部到底做了什么
+
+辅助函数通常做以下几件事的组合：
+
+| 步骤 | 内容 | 例子 |
+|------|------|------|
+| ① | 加底层引擎组件 | `inst.entity:AddPhysics()` |
+| ② | 加 Lua 组件 | `inst:AddComponent("burnable")` |
+| ③ | 配参数 | `burnable:SetBurnTime(10)` |
+| ④ | 加标签（优化或功能） | `inst:AddTag("small_livestock")` |
+| ⑤ | 注入回调 | `burnable:SetOnBurntFn(DefaultBurntFn)` |
+| ⑥ | 监听事件/世界状态 | `inst:ListenForEvent(...)`、`inst:WatchWorldState(...)` |
+
+并不是每个辅助函数都 6 步全做，但这 6 步是共同词汇表。**理解这一点很重要**——当你 Mod 中想"略微改一改"一个 `MakeXxx` 函数的行为时，你知道该去看它内部的哪几步。
+
+**举个具体场景**：你做了一把 Mod 武器，想让它"被附身时弹飞，**但只有 30% 概率**弹飞"。展开 `MakeHauntableLaunch` 的源码（5.3.3 节 ④ 的代码块），你会看到：
+
+- 第 2 步：加 `hauntable` 组件
+- 第 3 步：配 `cooldown`
+- 第 5 步：注入 `OnHauntFn`（里面 `chance = chance or TUNING.HAUNT_CHANCE_ALWAYS`）
+
+于是你直接调用 `MakeHauntableLaunch(inst, 0.3)` 就行——第一个参数就是 `chance`，它会覆盖默认的"100% 概率"。
+
+**再来一个场景**：你想让你的新怪物"被烧 20 秒才倒下"（而不是 `MakeMediumBurnableCharacter` 默认的 8 秒）。展开源码发现 `MakeMediumBurnableCharacter` 没有暴露 `time` 参数（写死成 8 秒）。这时你有两个选择：
+
+1. **手动展开**：不调用辅助函数，自己写那 5 行代码，把 `SetBurnTime(8)` 改成 `SetBurnTime(20)`。
+2. **先调用再修改**：`MakeMediumBurnableCharacter(inst, "body")` 后立刻 `inst.components.burnable:SetBurnTime(20)`——因为辅助函数只是把组件配好了，后续你完全可以继续修改参数。
+
+第二种更简洁。看 `scripts/prefabs/player_common.lua` 第 2644-2646 行就是这么做的：
+
+```lua
+MakeMediumBurnableCharacter(inst, "torso")
+inst.components.burnable:SetBurnTime(TUNING.PLAYER_BURN_TIME)
+inst.components.burnable.nocharring = true
+```
+
+官方自己也是"套用辅助函数，再按需覆盖"。
+
+---
+
+### 5.3.5 进阶：Pristine 版本与非 Pristine 版本
+
+你可能注意到一些辅助函数**成对出现**：
+
+- `MakeSnowCoveredPristine` ↔ `MakeSnowCovered`
+- `MakeSmallPerishableCreaturePristine` ↔ `MakeSmallPerishableCreature`
+- `MakeFeedableSmallLivestockPristine` ↔ `MakeFeedableSmallLivestock`
+- `MakeDeployableFertilizerPristine` ↔ `MakeDeployableFertilizer`
+
+**区别是什么？** 回忆 5.2.2 节的"五段式"——工厂函数被 `SetPristine()` 切成两半：
+
+- 上半段：**客户端和服务端都执行**（只能放客户端也需要的东西——引擎组件、动画、标签）
+- 下半段：**仅服务端执行**（Lua 组件、业务逻辑）
+
+**Pristine 版本 = 只做上半段应该做的事**（加标签、加动画 override、改 AnimState），不加 Lua 组件。
+**非 Pristine 版本 = 先调 Pristine 版本，再补加 Lua 组件和逻辑**。
+
+对照 `MakeFeedableSmallLivestock` 源码（前面已列出）就能看到：
+
+```lua
+function MakeFeedableSmallLivestock(inst, starvetime, oninventory, ondropped)
+    MakeFeedableSmallLivestockPristine(inst)  -- 先做客户端也要的
+    -- 然后才加 eater 组件（服务端才用）
+    if inst.components.eater == nil then
+        inst:AddComponent("eater")
+    end
+    -- ...
+end
+```
+
+**使用时的正确姿势**：
+
+```lua
+local function fn()
+    local inst = CreateEntity()
+    -- ... 三件套组件 ...
+    MakeCharacterPhysics(inst, 1, .5)
+    
+    MakeFeedableSmallLivestockPristine(inst)  -- ← Pristine 前调 Pristine 版
+    
+    -- ... 其他客户端共享内容 ...
+    
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+    
+    -- 仅服务端
+    MakeFeedableSmallLivestock(inst, 30 * 60)  -- ← Pristine 后调非 Pristine 版？
+    -- 但这会重复加标签、重复调 Pristine 版本里的东西...
+end
+```
+
+**实际上 `MakeFeedableSmallLivestock` 已经会检查并跳过重复工作**（内部调用的 `MakeFeedableSmallLivestockPristine` 里只加标签和符号 override，这些是幂等的——重复加标签不会出错）。所以**两种写法都能用**：
+
+- **推荐写法**：只在服务端写一次 `MakeFeedableSmallLivestock(inst, 30 * 60)`（它内部会补上 Pristine 部分）
+- **严格写法**：`MakeXxxPristine` 写在 Pristine 前，`MakeXxx` 写在 Pristine 后（这样客户端也能提前看到必要的标签/符号，减少 replica 带宽）
+
+官方在对性能敏感的 prefab（如 `player_common.lua`）里会用严格写法，普通生物 prefab 就懒一点只写一次。
+
+> **新手记忆**：对带 Pristine 后缀的函数**不要慌**——它和对应的非 Pristine 版是亲兄弟，区别是"只处理客户端也要看到的那部分"。你大多数时候只需要用非 Pristine 版，写在 `SetPristine` 之后即可。
+
+---
+
+### 5.3.6 老手进阶：`MakePlayerCharacter` —— 真正的高阶工厂
+
+`scripts/standardcomponents.lua` 里的 `MakeXxx` 都是"**向实体追加一个功能**"。而 `scripts/prefabs/player_common.lua` 里的 `MakePlayerCharacter` 是**完全不同量级**的东西——它一次性产出一个完整的玩家角色 Prefab。
+
+**函数签名**（`scripts/prefabs/player_common.lua` 第 1905 行）：
+
+```lua
+local function MakePlayerCharacter(name, customprefabs, customassets, common_postinit, master_postinit, starting_inventory)
+```
+
+六个参数的含义：
+
+| 参数 | 含义 | 是否必填 |
+|------|------|---------|
+| `name` | 角色 prefab 名（`"wilson"`、`"wolfgang"`） | 必填 |
+| `customprefabs` | 该角色额外依赖的 prefab 列表（技能树、特效） | 可选 |
+| `customassets` | 该角色额外的美术资源（角色专属贴图/动画） | 可选 |
+| `common_postinit` | 在 `SetPristine` **之前**被调用的回调 | 可选 |
+| `master_postinit` | 在 `SetPristine` **之后**（仅服务端）被调用的回调 | 可选 |
+| `starting_inventory` | 初始背包（已弃用，改用 `inst.starting_inventory`） | 已弃用 |
+
+返回值是一个 `Prefab` 对象——所以用法就是"定义两个回调，扔给 `MakePlayerCharacter`"：
+
+看 `scripts/prefabs/wolfgang.lua` 最后一行（第 785 行）：
+
+```lua
+return MakePlayerCharacter("wolfgang", prefabs, assets, common_postinit, master_postinit),
+       -- ... 其他角色形态 prefab ...
+```
+
+`MakePlayerCharacter` 的内部会生成一个长达 1000 多行的工厂函数（`scripts/prefabs/player_common.lua` 第 2300 行开始），里面**加了大约 60 个组件、处理了 20+ 个事件、写入了所有玩家共有的技能树 / 皮肤 / 装备 / 背包等等机制**。任何一个新角色如果从零开始写，就要把这 1000 行复制粘贴一遍——灾难。
+
+所以官方的办法是：**把 1000 行的工厂函数写在 `player_common.lua`，在其中两个关键位置预留回调**：
+
+#### `common_postinit` —— 客户端也要执行的定制
+
+它在工厂函数的 `SetPristine` **之前**被调用（`player_common.lua` 第 2471-2473 行）：
+
+```lua
+if common_postinit ~= nil then
+    common_postinit(inst)
+end
+
+-- ...几行之后...
+inst.entity:SetPristine()
+```
+
+这个位置放**客户端也需要知道的东西**——比如 `wolfgang.lua` 第 595-638 行的 `common_postinit` 主要做：
+
+```lua
+local function common_postinit(inst)
+    inst:AddTag("strongman")                -- 客户端需要识别"这是强壮的沃尔夫冈"
+    inst:AddTag("mightiness_normal")         -- 客户端 replica 相关的标签
+    -- ...
+    inst.GetMightiness = GetMightiness       -- 把访问方法挂到 inst 上（客户端也要用）
+    inst.bell_percent = 0                    -- 客户端钟摆 UI 状态
+    -- ...
+end
+```
+
+#### `master_postinit` —— 仅服务端的业务逻辑
+
+它在工厂函数的主流程末尾（`player_common.lua` 第 2860-2862 行）：
+
+```lua
+if master_postinit ~= nil then
+    master_postinit(inst)
+end
+```
+
+这里放**真正的角色特色逻辑**。`wolfgang.lua` 第 640 行的 `master_postinit` 内容：
+
+```lua
+local function master_postinit(inst)
+    inst.starting_inventory = start_inv[...] or start_inv.default
+    inst.components.hunger:SetMax(TUNING.WOLFGANG_HUNGER)     -- 改饥饿值上限
+    inst.components.foodaffinity:AddPrefabAffinity("potato_cooked", ...)  -- 吃土豆增益
+
+    inst.components.health:SetMaxHealth(TUNING.WOLFGANG_HEALTH_NORMAL)
+    inst.components.sanity:SetMax(TUNING.WOLFGANG_SANITY)
+
+    inst:AddComponent("mightiness")           -- 强壮值（沃尔夫冈独有）
+    inst:AddComponent("dumbbelllifter")       -- 举哑铃
+    inst:AddComponent("strongman")            -- 大力士
+    inst:AddComponent("expertsailor")         -- 船夫
+    inst:AddComponent("coach")                -- 教练
+    -- ...
+end
+```
+
+**为什么要分两个回调？**
+
+1. **`common_postinit` 的东西要被客户端复制**——所以它必须在 `SetPristine` 之前。
+2. **`master_postinit` 涉及服务端才有的 Lua 组件**（`mightiness`、`coach` 等）——它必须在"仅服务端"区段内。
+3. **中间的那 1500 行共用代码**对所有角色都一样，不需要你关心。
+
+这种设计模式叫**"模板方法 + 钩子函数"**——父级框架定义主流程和骨架，关键节点预留钩子，子级只填写钩子。OOP 语言里类似的东西叫 `TemplateMethod`；Rails、Django 等 Web 框架里叫 `before_save` / `after_save`。**老手看懂这一点就知道官方的架构品味不差**。
+
+---
+
+### 5.3.7 老手进阶：自己设计"族函数"
+
+`MakePlayerCharacter` 的经验可以照搬到你自己的 Mod 里。举个例子：假设你的 Mod 要加 5 种"魔法卷轴"，它们都：
+
+- 可以被手握（都有 `equippable` 组件）
+- 使用时播放一段咏唱动画（都共享一段 `OnEquip` / `OnUnequip` 逻辑）
+- 使用次数用完就消失（都有 `finiteuses`）
+- **但**每个卷轴有不同的魔法效果（一个召唤怪、一个治疗、一个闪电...）
+
+**不用族函数的写法**：复制粘贴 5 份类似的 Prefab 代码，每份都有 60 行公共代码 + 10 行独有逻辑。
+
+**用族函数的写法**（模仿 `MakePlayerCharacter`）：
+
+```lua
+-- mods/yourmod/scripts/prefabs/scroll_common.lua
+local function MakeScroll(name, assets, prefabs, common_postinit, master_postinit)
+    local function fn()
+        local inst = CreateEntity()
+        inst.entity:AddTransform()
+        inst.entity:AddAnimState()
+        inst.entity:AddNetwork()
+
+        MakeInventoryPhysics(inst)
+        inst.AnimState:SetBank("scroll")
+        inst.AnimState:SetBuild("scroll")
+        inst.AnimState:PlayAnimation("idle")
+
+        inst:AddTag("scroll")  -- 公共标签
+        MakeInventoryFloatable(inst, "small")
+
+        if common_postinit then
+            common_postinit(inst)   -- 第一个钩子：客户端也要的差异
+        end
+
+        inst.entity:SetPristine()
+        if not TheWorld.ismastersim then
+            return inst
+        end
+
+        inst:AddComponent("inspectable")
+        inst:AddComponent("inventoryitem")
+        inst:AddComponent("equippable")
+        inst.components.equippable:SetOnEquip(default_on_equip)
+        inst.components.equippable:SetOnUnequip(default_on_unequip)
+        inst:AddComponent("finiteuses")
+        inst.components.finiteuses:SetOnFinished(inst.Remove)
+        MakeHauntableLaunch(inst)
+
+        if master_postinit then
+            master_postinit(inst)   -- 第二个钩子：服务端的差异逻辑
+        end
+
+        return inst
+    end
+
+    return Prefab(name, fn, assets, prefabs)
+end
+
+return MakeScroll
+```
+
+每个具体卷轴只需要：
+
+```lua
+-- mods/yourmod/scripts/prefabs/scroll_lightning.lua
+local MakeScroll = require("prefabs/scroll_common")
+
+local function master_postinit(inst)
+    inst.components.finiteuses:SetMaxUses(3)
+    inst.components.equippable:SetOnEquip(function(inst, owner)
+        -- 闪电卷轴独有的装备逻辑
+    end)
+end
+
+return MakeScroll("scroll_lightning", assets, prefabs, nil, master_postinit)
+```
+
+5 个卷轴 = 1 个 `MakeScroll`（60 行）+ 5 个具体文件（每个 10-20 行）。代码量从 5×70=350 行降到 60+5×15=135 行，并且**只要改一次 `MakeScroll` 就能同步影响所有卷轴**。
+
+---
+
+### 5.3.8 小结
+
+- **辅助函数 = 官方的"配方手册"**。写 Prefab 时遇到"要配物理 / 燃烧 / 冰冻 / 鬼附身 / 漂浮 / 雪覆盖 / 可宠养"这类需求，**第一反应应该是查 `scripts/standardcomponents.lua` 有没有对应的 `MakeXxx`**。
+- **最常用的三个物理辅助函数**：`MakeInventoryPhysics`（小物品）、`MakeCharacterPhysics`（生物）、`MakeObstaclePhysics`（建筑/障碍）。
+- **燃烧类和冰冻类**按体型分级（Small/Medium/Large/Huge），每级抗性不同。生物专用 `xxxCharacter` 版本。
+- **鬼附身类**近 20 个 `MakeHauntableXxx`——它们本质上都是"加 `hauntable` 组件 + 注入不同的 `OnHauntFn` 回调"。
+- **辅助函数内部 = 底层组件 + 参数 + 标签 + 回调 + 监听器**的组合；展开源码能让你知道"该改哪一步"。
+- **Pristine / 非 Pristine 成对的函数**：Pristine 版只放上半段（客户端也要的），非 Pristine 版包含 Pristine 版并追加下半段（服务端的）。大多数时候你只用非 Pristine 版就够了。
+- **`MakePlayerCharacter` 是"高阶工厂"**——它不是"追加功能"，而是"生成一整个 Prefab"。用 **`common_postinit`（客户端可见的差异）** + **`master_postinit`（仅服务端的差异）** 两个钩子把 1000 多行的共同初始化复用到所有 18 个角色。
+- **自己设计族函数**就照搬 `MakePlayerCharacter` 的模式：主体放在 `xxx_common.lua`，在 `SetPristine` 前后各预留一个钩子，每个具体 Prefab 文件只写差异部分。
+
+> **下一节预告**：5.4 节会聚焦**本章最核心也最容易踩坑的机制**——`SetPristine` 分界线背后的"客户端/服务端双执行"究竟意味着什么？为什么一段 Prefab 文件代码会被**同一台电脑执行两次**？replica 是什么？我们会跟着一个实体在主机和客户端的完整生命流程走一遍，彻底理解"两段式"结构的来龙去脉。
+
 
 ## 5.4 Pristine State——为什么 Prefab 有两段代码
 
