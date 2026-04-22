@@ -5026,7 +5026,1070 @@ end)
 
 ## 6.6 如何阅读和理解一个组件的源码
 
-（待编写）
+### 本节导读
+
+前面五节（6.1-6.5）我们讲了**组件系统的核心机制**——生命周期、Replica、Classified、Timer、SourceModifierList。这些是"**地基知识**"。但饥荒联机版有 **350+ 个组件**——你不可能一个一个学完。
+
+真正的高效路径是：**学会自己读组件源码**。遇到新组件不慌、改 Mod 不懵、调 bug 有思路——这是一种可迁移的能力。本节不再讲某一个具体组件，而是讲**"**阅读任何组件源码**"的通用方法论**。
+
+> **新手**从 6.6.1-6.6.3 入手，学会"**读任何组件的五步标准流程**"、以及如何识别"**三个入口**"（Class 构造函数、公开方法、生命周期钩子）——掌握这些后，**再陌生的组件也能在 10 分钟内看懂骨架**；**进阶读者**从 6.6.4-6.6.6 深入"**反向追踪使用者**"、理解"**组件间的隐式依赖**"、以及用 `print` / `c_sel` 做**实时调试和探索**的技巧；**老手**可以跳到 6.6.7，我们拿 `perishable`（食物腐烂组件）作为**完整演示案例**——一步步走完整个阅读流程，最后 6.6.8 列出读 Klei 源码的五条黄金经验。
+
+**前置**：假设你已经读过 6.1-6.5 节，对组件系统有整体认识。
+
+---
+
+### 6.6.1 快速入门：为什么要学会读组件源码？
+
+写 Mod 的人迟早要面对一个问题——**官方文档很少，几乎所有"怎么实现 X 功能"都要从源码里挖**。
+
+#### 场景 1：想写个"会漏气的气球"
+
+**问题**：你要做一个能膨胀、会随时间漏气、漏光就爆炸的气球 Prefab。
+
+**不会读源码的做法**：从零写一套"计时 + 状态机 + 爆炸效果"——可能要几百行代码。
+
+**会读源码的做法**：
+1. **意识到"漏气类似于燃料消耗"** → `fueled` 组件已经实现了"随时间消耗 + 到 0 时触发回调"
+2. **`rg "AddComponent\(\"fueled\"\)"`** 找几个用它的 Prefab（如 `torch.lua`）
+3. **10 分钟读懂** `fueled` 组件
+4. **你的气球 = fueled + 自定义 onfinished 回调** —— 30 行代码搞定
+
+**这就是学会读组件源码的第一个收益——"**偷懒**"**：不重复造轮子，直接用现成的能力。
+
+#### 场景 2：想修改原版"长矛受雨天腐蚀更快"
+
+**问题**：想让长矛在雨天耐久消耗更快。
+
+**不会读源码的做法**：硬写一段每帧检查是否下雨的代码，然后手动扣耐久——很容易和其他 Mod 冲突。
+
+**会读源码的做法**：
+1. **意识到"耐久=finiteuses 组件"** → 读 `components/finiteuses.lua`
+2. **看到它有 SourceModifierList 可以改消耗速率**（或用 `AddComponentPostInit` hook）
+3. **一个 `WatchWorldState("israining", fn)` + 一个 SetModifier** —— 10 行代码、无冲突
+
+**学会读源码的第二个收益——"**精准修改**"**：不蛮力加代码，用组件提供的正确扩展点。
+
+#### 场景 3：调试一个 Bug
+
+**问题**：玩家反馈"我的 Mod 自定义食物，放进冰箱后腐烂速度是正常的——但放进背包反而更快？"
+
+**不会读源码的做法**：猜测、调参、盲改——可能改出新 bug。
+
+**会读源码的做法**：
+1. **腐烂逻辑在 `perishable.lua`** → 直接读 `Update` 函数（第 60-154 行）
+2. **搜索 "fridge"、"modifier"** → 发现 `owner:HasTag("fridge")` 决定了冰箱 buff
+3. **发现默认背包里的 modifier = 1**（没被 fridge tag 触发），而 "地上" 用的是 `TUNING.PERISH_GROUND_MULT`（0.5，更慢）
+4. **原来"放地上反而更慢"是设计意图**——地上腐烂×0.5，背包里腐烂×1.0。这是 Klei 故意的！
+
+**学会读源码的第三个收益——"**理解设计意图**"**：不被表面行为迷惑，看清内在设计。
+
+#### 这三个场景的共同模式
+
+| 能力 | 收益 |
+|------|------|
+| **知道有哪些组件可用** | 不重复造轮子 |
+| **读懂组件的接口和扩展点** | 精准、无冲突的修改 |
+| **理解组件的设计意图** | 真正"懂游戏"，能做出符合 Klei 风格的 Mod |
+
+> **新手记忆**：**饥荒联机版的"文档"就在源码里**——你不看源码就等于蒙眼写代码。但好消息是：**Klei 的源码风格很规整，读起来比想象中容易**。
+
+---
+
+### 6.6.2 快速入门：读组件的五步法
+
+面对一个陌生的组件文件，**按这个五步走一遍，90% 的组件都能在 15 分钟内搞懂**。
+
+#### 第一步：扫一眼行数，判断复杂度
+
+```bash
+# 在项目根目录用 ripgrep 或直接看文件行数
+wc -l scripts/components/perishable.lua
+# 输出：354
+```
+
+| 行数 | 复杂度 | 典型例子 |
+|------|--------|---------|
+| < 100 | 简单 | `bait.lua`, `snowmandecor.lua` |
+| 100-400 | 中等 | `perishable.lua`（354）, `fueled.lua`（300+） |
+| 400-1000 | 复杂 | `health.lua`（800+）, `sanity.lua`（600+） |
+| 1000+ | 核心 | `inventory.lua`（1400+）, `combat.lua`（1300+） |
+
+**策略**：
+- **< 100 行**：直接通读
+- **100-400 行**：按下面五步法
+- **400+ 行**：先读构造函数和公开方法签名，挑感兴趣的函数深入
+
+#### 第二步：读第一段（Class 构造函数）
+
+**构造函数告诉你："这个组件管理什么状态"**。
+
+看 `perishable.lua` 第 29-48 行：
+
+```29:48:scripts/components/perishable.lua
+local Perishable = Class(function(self, inst)
+    self.inst = inst
+    self.perishfn = nil
+    --self.perishtime = nil
+
+    self.frozenfiremult = false
+
+    self.targettime = nil
+    --self.perishremainingtime = nil
+    self.updatetask = nil
+    self.dt = nil
+    self.onperishreplacement = nil
+
+    self.localPerishMultiplyer = 1
+end,
+nil,
+{
+    perishtime = onpercent,
+    perishremainingtime = onpercent,
+})
+```
+
+**从中得到的信息**：
+
+| 字段 | 能推断 |
+|------|--------|
+| `self.perishfn` | 有**回调函数**机制（谁设置它的？`SetOnPerishFn`） |
+| `self.frozenfiremult` | 有"**冷冻+火**"特殊逻辑——值得关注 |
+| `self.perishremainingtime`（注释掉）| 用 nil 表示"**未开始计时**" |
+| `self.updatetask` | 有**定时任务**——挂在组件上 |
+| `self.localPerishMultiplyer` | 有**本地倍率**机制（拼写是个 typo 但原版就这么写） |
+
+**最后的第三个参数 `{perishtime = onpercent, perishremainingtime = onpercent}`**——这是 **onset 回调**（6.1.8 讲过）：每次给 `perishtime` 或 `perishremainingtime` 赋值时，自动调用 `onpercent` 函数更新相关 tag。
+
+**光读构造函数**，你已经知道 `perishable` 管 "**腐烂时间 + 状态标签 + 回调 + 倍率**" 四件事。
+
+#### 第三步：列出所有公开方法（API 导览）
+
+用 `rg "^function Perishable:"` 或直接浏览一遍：
+
+```
+function Perishable:OnRemoveFromEntity()      -- 清理
+function Perishable:OnRemoveEntity()           -- 清理
+function Perishable:IsFresh()                  -- 查询
+function Perishable:IsStale()                  -- 查询
+function Perishable:IsSpoiled()                -- 查询
+function Perishable:Dilute(number, timeleft)   -- 堆叠时的时间平均
+function Perishable:AddTime(time)              -- 延长腐烂时间
+function Perishable:SetPerishTime(time)        -- 初始化设定
+function Perishable:SetLocalMultiplier(newMult) -- 倍率
+function Perishable:GetLocalMultiplier()        -- 查询
+function Perishable:SetNewMaxPerishTime(newtime) -- 调整总时长
+function Perishable:SetOnPerishFn(fn)          -- 设置回调
+function Perishable:GetPercent()               -- 核心查询
+function Perishable:SetPercent(percent)        -- 手动设置
+function Perishable:ReducePercent(amount)      -- 扣除百分比
+function Perishable:GetDebugString()           -- 调试输出
+function Perishable:LongUpdate(dt)             -- 时间快进
+function Perishable:StartPerishing()           -- 启动
+function Perishable:IsPerishing()              -- 查询
+function Perishable:Perish()                   -- 执行腐烂
+function Perishable:StopPerishing()            -- 停止
+function Perishable:OnSave()                   -- 存档
+function Perishable:OnLoad(data)               -- 读档
+```
+
+**按语义分组**：
+
+- **生命周期**：`StartPerishing` / `StopPerishing` / `IsPerishing` / `Perish`
+- **时间操作**：`SetPerishTime` / `AddTime` / `SetNewMaxPerishTime` / `Dilute`
+- **百分比操作**：`GetPercent` / `SetPercent` / `ReducePercent`
+- **状态查询**：`IsFresh` / `IsStale` / `IsSpoiled`
+- **倍率**：`SetLocalMultiplier` / `GetLocalMultiplier`
+- **回调注册**：`SetOnPerishFn`
+- **系统对接**：`OnSave` / `OnLoad` / `LongUpdate` / `OnRemoveFromEntity`
+
+**光看方法名**，你已经基本知道这个组件"**能干什么**"——细节等要用的时候再查。
+
+#### 第四步：读核心函数（通常是 Update / 主流程）
+
+大多数组件的"**魂**"在一两个核心函数里。对 `perishable`，就是 `Update` 函数（第 60-154 行）——每次 tick 执行的腐烂计算。
+
+**读核心函数的技巧**：**从顶部往下，边读边问"这一行在算什么？"**
+
+看 `perishable.lua` 第 78-97 行：
+
+```lua
+if owner then
+    if owner.components.preserver ~= nil then
+        modifier = owner.components.preserver:GetPerishRateMultiplier(inst) or modifier
+    elseif owner:HasTag("fridge") then
+        if inst:HasTag("frozen") and not owner:HasTag("nocool") and not owner:HasTag("lowcool") then
+            modifier = TUNING.PERISH_COLD_FROZEN_MULT
+        else
+            modifier = TUNING.PERISH_FRIDGE_MULT
+        end
+    elseif owner:HasTag("foodpreserver") then
+        modifier = TUNING.PERISH_FOOD_PRESERVER_MULT
+    elseif owner:HasTag("cage") and inst:HasTag("small_livestock") then
+        modifier = TUNING.PERISH_CAGE_MULT
+    end
+
+    if owner:HasTag("spoiler") then
+        modifier = modifier * TUNING.PERISH_GROUND_MULT
+    end
+else
+    modifier = TUNING.PERISH_GROUND_MULT
+    ...
+end
+```
+
+**一眼看出设计意图**：**"物品在哪里决定腐烂倍率"**——冰箱、食物保鲜箱、笼子、地上、`preserver` 组件等。这就是 Klei 的"**环境感知腐烂系统**"。
+
+#### 第五步：读生命周期钩子（OnSave / OnLoad / OnRemoveFromEntity）
+
+这些钩子揭示了组件的"**状态持久化**"边界——哪些数据必存、哪些不存、读档时如何重建。
+
+看 `perishable.lua` 第 331-351 行：
+
+```331:351:scripts/components/perishable.lua
+function Perishable:OnSave()
+    return
+    {
+        paused = self.updatetask == nil or nil,
+        time = self.perishremainingtime,
+    }
+end
+
+function Perishable:OnLoad(data)
+    if data ~= nil then
+		if data.time ~= nil then
+	        self.perishremainingtime = data.time
+		end
+
+        if data.paused then
+            self:StopPerishing()
+		elseif data.time ~= nil then
+            self:StartPerishing()
+        end
+    end
+end
+```
+
+**只保存两个字段**：`paused`（是否暂停中）和 `time`（剩余时间）。**不保存 `perishtime`**（假设 Prefab 工厂函数每次都会设定它）、**不保存 `updatetask`**（运行时对象重建就行）。
+
+**读档逻辑**：有 `time` 就恢复它，根据 `paused` 决定是 `StopPerishing` 还是 `StartPerishing`——简单清晰。
+
+#### 五步法总结
+
+| 步骤 | 目的 | 耗时 |
+|------|------|------|
+| ① 扫行数 | 判断复杂度 | 1 秒 |
+| ② 读构造函数 | 知道"管什么状态" | 1-2 分钟 |
+| ③ 列公开方法 | 知道"能干什么" | 2-3 分钟 |
+| ④ 读核心函数 | 知道"怎么工作" | 5-10 分钟 |
+| ⑤ 读生命周期钩子 | 知道"持久化边界" | 1-2 分钟 |
+| **总计** | **从 0 到看懂骨架** | **10-15 分钟** |
+
+**这个流程对 90% 的组件都适用**——核心组件（`inventory`、`combat`）可能要 30-60 分钟，但方法不变。
+
+---
+
+### 6.6.3 快速入门：识别"三个入口"
+
+除了五步法，我们还要学会识别**组件的"三个入口"**——这是快速定位关键代码的技巧。
+
+#### 入口 ①：Class 构造函数
+
+**位置**：组件文件的中上部，形如 `local XXX = Class(function(self, inst) ... end)`。
+
+**告诉你**：
+- **组件的状态字段清单**（所有 `self.xxx = ...`）
+- **默认值**（推断使用模式）
+- **onset 回调**（Class 的第三个参数，触发网络同步）
+
+**读完构造函数，你就有了"组件的状态模型图"**。
+
+#### 入口 ②：公开方法（`function XXX:YYY()`）
+
+**位置**：构造函数下面的一连串 `function Perishable:Xxx(...)`。
+
+**告诉你**：
+- **组件对外提供什么能力**
+- **有哪些事件回调可以注册**（`SetOnXxxFn`）
+- **有哪些查询方法**（`IsXxx` / `GetXxx`）
+
+**Klei 的命名约定**：
+
+| 前缀 | 含义 |
+|------|------|
+| `Set` | 修改状态 |
+| `Get` | 查询状态 |
+| `Is` | 布尔查询 |
+| `Has` | 布尔查询（存在性） |
+| `Start / Stop` | 状态机控制 |
+| `Can` | 权限/能力查询 |
+| `SetOnXxxFn` | 注册回调 |
+| `Do` | 动作触发 |
+| `OnXxx` | 事件钩子 |
+
+**看名字猜作用**——90% 准确。
+
+#### 入口 ③：生命周期钩子和事件
+
+**位置**：组件文件各处，但是有固定命名：
+
+| 钩子 | 作用 |
+|------|------|
+| `Class(function(self, inst) end)` | 构造函数 |
+| `function XXX:OnRemoveFromEntity()` | 组件被移除（6.1.6 节） |
+| `function XXX:OnRemoveEntity()` | 实体被销毁 |
+| `function XXX:OnEntitySleep()` / `OnEntityWake()` | 休眠 / 唤醒（6.1.5 节） |
+| `function XXX:OnSave()` / `OnLoad(data)` | 存档 / 读档 |
+| `function XXX:LongUpdate(dt)` | 离散时间补偿（玩家睡觉等） |
+| `function XXX:TransferComponent(newinst)` | 实体形态切换 |
+
+**事件监听**：通过 `inst:ListenForEvent("xxx", fn)` 或 `inst:PushEvent("xxx", data)` 可以找到组件会响应 / 触发的事件。
+
+#### 三个入口的搜索命令（ripgrep 实战）
+
+在终端里快速定位：
+
+```bash
+# ① 找构造函数
+rg "^local Perishable = Class" scripts/components/perishable.lua
+
+# ② 列所有公开方法
+rg "^function Perishable:" scripts/components/perishable.lua
+
+# ③ 列所有生命周期钩子
+rg "^function Perishable:(On|Long|Transfer)" scripts/components/perishable.lua
+```
+
+**三个命令下去**，就掌握了组件的全部入口。
+
+#### 对比一：简单组件 `bait`
+
+看 `scripts/components/bait.lua`——极短（才 27 行左右）：
+
+```lua
+local Bait = Class(function(self, inst)
+    self.inst = inst
+end)
+```
+
+**构造函数空**——没有状态字段，只是一个"标记"。
+
+**然后一两个方法**——比如 `SetTrap`、`GetTrap`。
+
+**简单组件 = "空 Class + 几个方法"**——很多时候只是为了挂一个标签给其他组件识别用。
+
+#### 对比二：核心组件 `health`
+
+`scripts/components/health.lua` 有 800+ 行，构造函数：
+
+```lua
+local Health = Class(function(self, inst)
+    self.inst = inst
+    self.maxhealth = 100
+    self.minhealth = 0
+    self.currenthealth = self.maxhealth
+    self.invincible = false
+    self.takingfiredamage = false
+    self.takingfiredamagetime = 0
+    self.fire_damage_scale = 1
+    self.externalabsorbmodifiers = SourceModifierList(self.inst, 0, SourceModifierList.additive)
+    self.absorb = 0
+    self.playerabsorb = 0
+    self.canmurder = true
+    self.canheal = true
+    -- ...
+end)
+```
+
+**20+ 个字段**——覆盖"血量、燃烧、吸收、伤害缩放、复活、禁止治疗/屠杀、月伤、充能区间等"——每个字段对应一整套方法和逻辑。
+
+**复杂组件 = "状态字段越多，方法越多"**——一般看名字就知道职责。
+
+> **新手记忆**：**复杂度和功能数是成正比的**——300 行组件约 20 个方法，900 行组件约 50 个方法。**行数是复杂度的直接指标**。
+
+---
+
+### 6.6.4 进阶：反向追踪 —— 找到"谁用了这个组件"
+
+**光读组件自己的代码不够**——要理解它"怎么被用"。
+
+#### 反向追踪的两种工具
+
+**工具 1：`rg "components\.<组件名>"`**
+
+找所有**使用者**（调用这个组件方法的代码）：
+
+```bash
+# 找谁在用 perishable 组件
+rg "components\.perishable" scripts/
+
+# 示例输出（精简版）：
+# scripts/components/edible.lua:52:    local perish = self.inst.components.perishable
+# scripts/prefabs/spoiledfood.lua:18:  if inst.components.perishable ~= nil then
+# scripts/components/stewer.lua:139:   local perish = items[i].components.perishable
+```
+
+**工具 2：`rg "AddComponent\(\"<组件名>\"\)"`**
+
+找所有**添加者**（哪些 Prefab 给实体加了这个组件）：
+
+```bash
+# 找哪些 Prefab 加了 perishable
+rg 'AddComponent\("perishable"\)' scripts/prefabs/
+
+# 示例输出：
+# scripts/prefabs/berries.lua:83:     inst:AddComponent("perishable")
+# scripts/prefabs/meat.lua:55:        inst:AddComponent("perishable")
+# scripts/prefabs/preparedfoods.lua:67: inst:AddComponent("perishable")
+```
+
+#### 反向追踪的三个问题
+
+对任何组件，追踪以下三个问题：
+
+**Q1：谁加了这个组件？**
+
+回答你"**这个组件挂在哪些实体上**"——知道它的"**受众**"。
+
+```bash
+rg 'AddComponent\("perishable"\)' scripts/prefabs/ | wc -l
+# 输出：~80 个 Prefab 使用了 perishable
+```
+
+80 个——主要是食物类实体（莓果、肉、料理、蘑菇等）。**这说明 perishable 是一个"窄而深"的组件**——专门给食物用，但食物里几乎必备。
+
+**Q2：谁调用了这个组件的方法？**
+
+回答你"**组件的哪些方法最常用**"——从使用频率看哪些是核心接口。
+
+```bash
+# 找 perishable 被调用的所有方法
+rg "components\.perishable:" scripts/ | awk -F'perishable:' '{print $2}' | awk -F'(' '{print $1}' | sort | uniq -c | sort -rn
+```
+
+**假设输出**：
+
+```
+45 GetPercent
+32 SetPercent
+28 IsFresh
+22 StartPerishing
+18 IsStale
+15 IsSpoiled
+10 SetPerishTime
+...
+```
+
+**解读**：
+- `GetPercent` 被调用 45 次——**最常用的查询**
+- `SetPercent` / `StartPerishing` / `IsFresh` / `IsStale` / `IsSpoiled` 也是高频
+- 说明这个组件的**"主用法"是获取/设置百分比 + 查询新鲜度状态**
+
+**Q3：这个组件响应哪些事件？它发出哪些事件？**
+
+```bash
+# 它响应的事件（ListenForEvent）
+rg 'ListenForEvent\("[^"]+"' scripts/components/perishable.lua
+
+# 它发出的事件（PushEvent）
+rg 'PushEvent\("[^"]+"' scripts/components/perishable.lua
+```
+
+对 `perishable`：
+
+```bash
+# PushEvent 找到的：
+# "forceperishchange"  - tag 变化时
+# "perishchange"       - 百分比变化时
+# "perished"           - 完全腐烂时
+```
+
+**这三个事件就是组件的"对外广播"**——其他组件或 Prefab 可以监听这些事件做响应（UI 刷新、音效、连锁反应）。
+
+#### 实战案例：追踪 `perishable` 的完整使用链
+
+```
+1. 追踪 AddComponent
+   → berries.lua / meat.lua / preparedfoods.lua 等 80 个食物 Prefab
+   → 几乎所有"会变质的东西"
+
+2. 追踪调用
+   → edible.lua（被吃掉时检查新鲜度，影响效果）
+   → stewer.lua（煮饭时影响结果）
+   → inventoryitem_replica（UI 显示腐烂度 icon）
+
+3. 追踪事件
+   → UI 监听 "perishchange" 重绘 icon
+   → edible 组件监听 "perished" 自我销毁或变 spoiledfood
+```
+
+**整个"食物腐烂生态"的图景一下就清晰了**——perishable 不是孤立的，它和 edible、stewer、inventoryitem 深度联动。
+
+#### 在 Cursor 里的快捷玩法
+
+作为 Cursor 用户，可以用 **SemanticSearch 或 Grep 快速完成这些搜索**——比终端 rg 还方便。
+
+> **开发逻辑**：**组件不是孤岛**——它的价值在于"**和谁配合**"。反向追踪帮你看清组件在整个游戏系统中的"社交网络"——这是写优秀 Mod 的必备能力。
+
+---
+
+### 6.6.5 进阶：理解组件间的隐式依赖
+
+很多组件"**看似独立**"，实际上**隐式依赖其他组件**才能工作。这种依赖在源码里有明显的痕迹。
+
+#### 依赖痕迹 1：`self.inst.components.xxx` 引用
+
+看 `perishable.lua` 第 68-71 行：
+
+```lua
+local owner = inst.components.inventoryitem and inst.components.inventoryitem.owner or nil
+if not owner and inst.components.occupier then
+    owner = inst.components.occupier:GetOwner()
+end
+```
+
+**关键词**：`inst.components.inventoryitem`、`inst.components.occupier`——**perishable 依赖这两个组件**。
+
+**说明**：perishable 的完整工作需要 `inventoryitem`（可以被拿起）或 `occupier`（占位符——用于蜂巢等）。如果你给一个没有 `inventoryitem` 的实体加 perishable，**owner 永远是 nil**，行为会不完整。
+
+#### 依赖痕迹 2：`self.inst:HasTag` 检查
+
+同文件第 82 行：
+
+```lua
+if inst:HasTag("frozen") and not owner:HasTag("nocool") and not owner:HasTag("lowcool") then
+```
+
+**关键词**：`HasTag("frozen")` / `HasTag("nocool")` / `HasTag("lowcool")`——**perishable 依赖这些 tag**。
+
+**说明**：如果你的实体要用到"frozen"加成，必须先给实体加 `"frozen"` tag（通常是 `freezable` 组件加上去的）。**Tag 是组件间的"通信协议"**（回顾 5.5 节）。
+
+#### 依赖痕迹 3：`PushEvent` 触发
+
+同文件第 176 行：
+
+```lua
+self.inst:PushEvent("perishchange", {percent = self:GetPercent()})
+```
+
+**说明**：perishable 发出 `"perishchange"` 事件——**谁在监听这个事件**？`rg 'ListenForEvent\("perishchange"'`：
+
+```bash
+# 结果：
+# scripts/components/inventoryitem_replica.lua: inst:ListenForEvent("perishchange", ...)
+# scripts/components/edible.lua: 可能也监听（用于显示 UI）
+```
+
+**这意味着**：perishable 的 perishchange 事件被 `inventoryitem_replica` 消费——所以**perishable 的网络同步依赖于 inventoryitem_replica**。如果你给一个没有 inventoryitem 的实体加 perishable，UI 显示会有问题。
+
+#### 依赖痕迹 4：TUNING 常量
+
+同文件第 83 行：
+
+```lua
+modifier = TUNING.PERISH_COLD_FROZEN_MULT
+```
+
+**关键词**：`TUNING.PERISH_XXX_MULT`——**perishable 依赖 TUNING 表的配置**。
+
+**说明**：所有腐烂倍率都在 `scripts/tuning.lua` 里定义。如果你想"**整体调整腐烂节奏**"，改 TUNING 常量一次改所有——不用改组件本身。
+
+#### 依赖梳理表
+
+对一个中等复杂度组件（perishable），整理的依赖关系：
+
+| 依赖 | 具体项 | 关键性 |
+|------|--------|--------|
+| 组件（硬依赖）| `inventoryitem` 或 `occupier` | 高——没它 owner 相关逻辑失效 |
+| 组件（软依赖）| `stackable`（仅 Dilute 用）| 低 |
+| Tag | `"frozen"`, `"fresh"`, `"stale"`, `"spoiled"` | 高——tag 是状态广播 |
+| 容器 Tag | `"fridge"`, `"foodpreserver"`, `"cage"`, `"spoiler"` | 高——改变倍率 |
+| 事件 | `"perishchange"` / `"perished"` / `"forceperishchange"` | 高——UI 同步 |
+| TUNING 常量 | `PERISH_GROUND_MULT` / `PERISH_FRIDGE_MULT` 等 | 高——行为配置 |
+| World 状态 | `TheWorld.state.temperature` / `israining` | 中——环境感知 |
+
+**这张表就是 perishable 的"**生态依赖图**"**——写 Mod 扩展/改造 perishable 时，必须了解这些依赖点。
+
+#### Mod 实战建议
+
+根据依赖梳理得到几个 Mod 开发经验：
+
+1. **加 perishable 前先加 inventoryitem**（或 occupier）
+2. **想改腐烂倍率，**先改 TUNING**（用 modmain 的 `TUNING.PERISH_GROUND_MULT = 2.0`），而不是 hook Update 函数
+3. **自己的"**类冰箱容器**"**—— 加上 `"fridge"` tag 就能自动让里面食物减慢腐烂
+4. **自己的"**加速腐烂设备**"**—— 加上 `"spoiler"` tag 就能让里面食物腐烂更快
+
+**这些都是基于对"组件依赖 + 扩展点"的理解**——没读组件源码根本想不到。
+
+---
+
+### 6.6.6 进阶：用 `print` / `c_sel` 实时探索
+
+光读代码是"**静态理解**"——要真正搞懂一个组件，还要**运行时看它的实际行为**。饥荒联机版的控制台给了我们极强的实时探索工具。
+
+#### 工具 1：`c_sel` —— 选中当前鼠标指向的实体
+
+打开控制台（默认 **`~` 键**），输入：
+
+```
+c_sel()
+```
+
+鼠标指向一个实体时它会被"选中"——后续用 `c_sel()` 引用。**这是所有调试的起点**。
+
+如果已经选中，再次 `c_sel()` 返回这个实体对象。
+
+#### 工具 2：检查组件字段
+
+```lua
+c_sel().components.perishable.perishremainingtime
+-- 输出：280.5（秒）
+
+c_sel().components.perishable.perishtime
+-- 输出：960
+
+c_sel().components.perishable:GetPercent()
+-- 输出：0.29
+```
+
+**一秒钟看清当前腐烂状态**——比读代码更直观。
+
+#### 工具 3：动态修改
+
+```lua
+c_sel().components.perishable:SetPercent(0.5)
+-- 腐烂度立刻变成 50%
+
+c_sel().components.perishable:Perish()
+-- 立刻让它完全腐烂（触发 perishfn 回调）
+```
+
+**这是调试 Prefab 的最快方式**——把组件"**拨到特定状态**"看后续行为。
+
+#### 工具 4：给组件加 print 监听
+
+**想实时看某个事件**：
+
+```lua
+-- 在控制台粘贴
+local inst = c_sel()
+inst:ListenForEvent("perishchange", function(_, data)
+    print("[DEBUG] perishchange", data.percent)
+end)
+```
+
+**之后每次腐烂度变化都会 print**——放桌子上看几分钟就知道 tick 频率和变化幅度。
+
+#### 工具 5：临时 hook 方法
+
+```lua
+-- 临时 hook GetPercent，看谁在调用
+local inst = c_sel()
+local old_GetPercent = inst.components.perishable.GetPercent
+inst.components.perishable.GetPercent = function(self)
+    print("[DEBUG] GetPercent called", debug.traceback())
+    return old_GetPercent(self)
+end
+```
+
+**你能看到调用堆栈**——一目了然地看"**谁在调用 GetPercent**"。调完 5 分钟后记得恢复或重启游戏。
+
+#### 工具 6：`GetDebugString` —— 组件自备的调试输出
+
+很多组件有 `GetDebugString()` 方法。看 `perishable.lua` 第 242-251 行：
+
+```242:251:scripts/components/perishable.lua
+function Perishable:GetDebugString()
+	if self.perishremainingtime and  self.perishremainingtime > 0 then
+        return string.format("%s %2.2fs %s",
+            self.updatetask and "Perishing" or "Paused",
+            self.perishremainingtime,
+            self.frozenfiremult and "frozenfiremult" or "")
+	else
+		return "perished"
+	end
+end
+```
+
+按 **Ctrl + Tab**（默认键位，可能不同）打开实体调试面板——它会自动调用 `GetDebugString` 显示信息，**一次看完所有关键字段**。
+
+**`GetDebugString` 是 Klei 留给开发者的"**仪表盘**"**——大多数核心组件都有。
+
+#### 工具 7：`rg` + `print` 组合找调用链
+
+**问题**："为什么我的食物刚放进背包就腐烂了？"
+
+**侦探式调试**：
+
+```
+1. c_sel() 选中食物
+2. c_sel().components.perishable.perishremainingtime
+   → 发现只剩 5 秒
+3. 在控制台 hook SetPercent：
+   inst.components.perishable.SetPercent = function(self, p)
+       print("[DEBUG] SetPercent", p, debug.traceback())
+       -- 继续原逻辑
+   end
+4. 放进背包 → 观察堆栈
+5. 发现是某个 Mod 调用了 SetPercent(0.01) → 找到元凶
+```
+
+**这种"**运行时侦探**"能力非常强**——源码读千遍不如 print 一次。
+
+#### 工具 8：临时打开 godmode / 切时间观察
+
+```
+c_godmode()        -- 开启无敌
+c_speedmult(5)     -- 5 倍速度
+LongUpdate(3600)   -- 时间快进 1 小时
+```
+
+**快进时间能快速看到"**长期演变**"**——比如腐烂、成长、日夜循环。
+
+#### 综合调试流程
+
+组合起来，一个"**调试陌生组件**"的完整流程：
+
+```
+①  读源码（6.6.2 五步法）——了解基本结构
+②  反向追踪（6.6.4）——了解使用场景
+③  游戏中 c_spawn 一个相关实体
+④  c_sel() 选中
+⑤  敲几个 inst.components.xxx 查询
+⑥  按 Ctrl + Tab 看 GetDebugString
+⑦  临时 hook 关键方法 + print
+⑧  操作触发场景（吃、烧、砍、冻）
+⑨  对照 print 输出和源码逻辑
+⑩  搞清楚 → 写 Mod
+```
+
+**整个过程 20-30 分钟**——比盲写 Mod 调半天 bug 快得多。
+
+> **开发逻辑**：**饥荒的控制台 + 组件系统是"**可探索游戏世界**"的极佳组合**——你可以像实验室一样操作游戏对象，实时观察结果。这种**探索式学习**比"读书式学习"快 10 倍。学会用它，你就从"Mod 新手"变成"Mod 侦探"。
+
+---
+
+### 6.6.7 老手进阶：完整案例 —— 逐行读懂 `perishable.lua`
+
+现在我们把前面所有技巧**综合运用**，完整地"**走一遍**"`perishable.lua` 的阅读过程——就像真实遇到这个陌生组件时一样。
+
+#### Step 1：情境 & 扫行数
+
+**情境**：你想写一个 Mod "**夏天腐烂更快的食物**"，怀疑要 hook `perishable`。
+
+**扫行数**：
+
+```bash
+wc -l scripts/components/perishable.lua
+# 354
+```
+
+**预估 10-15 分钟读完**——中等复杂度。
+
+#### Step 2：读构造函数（1 分钟）
+
+看第 29-48 行（已在 6.6.2 第二步贴过）——**8 个字段 + 2 个 onset**。推断这是"**有定时任务 + 管百分比 + 有回调**"的组件。
+
+#### Step 3：列所有公开方法（2 分钟）
+
+已经在 6.6.2 第三步整理过——**23 个方法**，分为 7 组。其中核心是：
+
+- `StartPerishing / StopPerishing / Perish` —— 生命周期
+- `GetPercent / SetPercent` —— 主查询/设置
+- `OnSave / OnLoad / LongUpdate` —— 存档/离散时间
+
+#### Step 4：跳到 `Update`（核心函数）（8 分钟）
+
+第 60-154 行。按块阅读：
+
+**块 1（60-67 行）**：初始化
+
+```lua
+local function Update(inst, dt)
+	local self = inst.components.perishable
+    if self ~= nil then
+		dt = self.start_dt or dt or (10 + math.random()*FRAMES*8)
+		self.start_dt = nil
+
+        local additional_decay = 0
+		local modifier = 1
+```
+
+- `dt` 的三级 fallback——`start_dt`（启动时延迟）、参数传入、默认随机
+- `modifier` 初始 1（乘法中性元素）
+- `additional_decay` 额外衰减量（用于酸雨）
+
+**块 2（68-76 行）**：获取 owner 和环境
+
+```lua
+local owner = inst.components.inventoryitem and inst.components.inventoryitem.owner or nil
+if not owner and inst.components.occupier then
+    owner = inst.components.occupier:GetOwner()
+end
+
+local pos = owner ~= nil and owner:GetPosition() or self.inst:GetPosition()
+local inside_pocket_container = owner ~= nil and owner:HasTag("pocketdimension_container")
+
+local ambient_temperature = inside_pocket_container and TheWorld.state.temperature or GetTemperatureAtXZ(pos.x, pos.z)
+```
+
+**关键发现**：
+- owner 可能来自 `inventoryitem.owner` 或 `occupier` 组件——**依赖这两个组件之一**
+- 温度来自 **世界坐标处的温度**（不是全局温度）——**地点相关**
+- 口袋容器特殊处理——**用世界整体温度**
+
+**块 3（78-105 行）**：容器倍率（已在 6.6.2 贴过）
+
+- `preserver` 组件 > `"fridge"` tag > `"foodpreserver"` tag > `"cage"` tag
+- 无 owner 时用 `GROUND_MULT`
+- 酸雨时额外衰减
+
+**块 4（107-130 行）**：各种环境因素
+
+```lua
+if inst:GetIsWet() and not self.ignorewentness then
+    modifier = modifier * TUNING.PERISH_WET_MULT
+end
+
+if ambient_temperature < 0 then
+    if inst:HasTag("frozen") and not self.frozenfiremult then
+        modifier = TUNING.PERISH_COLD_FROZEN_MULT
+    else
+        modifier = modifier * TUNING.PERISH_WINTER_MULT
+    end
+end
+-- ... summer mult / frozen fire mult ...
+
+modifier = modifier * self.localPerishMultiplyer
+modifier = modifier * TUNING.PERISH_GLOBAL_MULT
+```
+
+**关键发现**：
+- 湿的加速腐烂
+- 低温减速 / 冷冻+火 的特殊处理
+- 高温加速
+- **本地倍率 + 全局倍率最后乘进来**
+
+**块 5（131-137 行）**：更新 remainingtime
+
+```lua
+local old_val = self.perishremainingtime
+if self.perishremainingtime then
+    self.perishremainingtime = math.min(self.perishtime, self.perishremainingtime - dt * modifier - additional_decay)
+    if math.floor(old_val*100) ~= math.floor(self.perishremainingtime*100) then
+        inst:PushEvent("perishchange", {percent = self:GetPercent()})
+    end
+end
+```
+
+**核心一步**——扣除 `dt * modifier + additional_decay`，限制在 `[0, perishtime]` 范围。`math.floor(x*100)` 是**百分位级粒度**——只在百分比变化时才触发事件（节省带宽）。
+
+**块 6（139-147 行）**：食物降温
+
+```lua
+if inst.components.edible ~= nil and inst.components.edible.temperaturedelta ~= nil and ... then
+    if owner ~= nil and owner:HasTag("fridge") then
+        inst.components.edible:AddChill(1)
+    elseif ambient_temperature < TUNING.OVERHEAT_TEMP - 5 then
+        inst.components.edible:AddChill(.25)
+    end
+end
+```
+
+**不是腐烂相关的事**——**hot food 在 Perishable 里处理冷却**！这是**"**和 edible 组件协作**"**的典型表现。
+
+**块 7（149-153 行）**：触发腐烂
+
+```lua
+if self.perishremainingtime and self.perishremainingtime <= 0 then
+    self:Perish()
+end
+```
+
+**结束条件**——降到 0 时调 `Perish()` 结束游戏。
+
+#### Step 5：读 OnSave / OnLoad（2 分钟）
+
+已在 6.6.2 第五步分析过——**只存 `time` 和 `paused`**，简洁清晰。
+
+#### Step 6：回到"夏天腐烂更快"的 Mod 设计
+
+现在你已经完整理解了 `perishable`，可以设计 Mod 了：
+
+**思路 1**：Mod 直接提高 `TUNING.PERISH_SUMMER_MULT`
+
+```lua
+-- modmain.lua
+TUNING.PERISH_SUMMER_MULT = TUNING.PERISH_SUMMER_MULT * 1.5  -- 夏天腐烂 1.5 倍更快
+```
+
+**优点**：一行代码、不破坏任何逻辑。
+
+**缺点**：影响所有物品（不能针对特定 Prefab）。
+
+**思路 2**：hook 特定 Prefab 的 perishable 组件
+
+```lua
+AddPrefabPostInit("meat", function(inst)
+    if not TheWorld.ismastersim then return end
+
+    if inst.components.perishable then
+        local old_Update = inst.components.perishable.Update  -- 啊，Update 是 local function，拿不到
+        -- ...
+    end
+end)
+```
+
+**发现问题**：`Update` 是 **`local function`**——外部拿不到！只能 hook 组件的公开方法。
+
+**思路 3**：用 `SetLocalMultiplier`
+
+查方法表：**`SetLocalMultiplier(newMult)` 是公开方法！**——可以通过它乘一个额外倍率：
+
+```lua
+AddPrefabPostInit("meat", function(inst)
+    if not TheWorld.ismastersim then return end
+
+    if inst.components.perishable then
+        inst:WatchWorldState("season", function(inst, season)
+            if season == "summer" then
+                inst.components.perishable:SetLocalMultiplier(2.0)
+            else
+                inst.components.perishable:SetLocalMultiplier(1.0)
+            end
+        end)
+    end
+end)
+```
+
+**完美**——10 行代码实现"夏天腐烂 2 倍"效果，只影响 meat。
+
+#### Step 7：总结流程
+
+通过 6 步阅读 + 1 步 Mod 设计，**30 分钟内**：
+
+- 看懂了 `perishable.lua` 的完整设计
+- 发现了 `localPerishMultiplyer` 这个贴心扩展点
+- 写出了一个无冲突、无副作用的 Mod
+
+**这就是"**学会读源码**"的实战价值**——不是为了读而读，而是为了更好地 Mod。
+
+---
+
+### 6.6.8 老手进阶：阅读 Klei 源码的五条黄金经验
+
+经过 6.1-6.6 这一大圈学习，总结出读 Klei 源码的"**元经验**"——这些对读任何 Lua 游戏代码都适用。
+
+#### 经验 1：**命名规律是阅读的"路标"**
+
+Klei 的命名**非常规整**，掌握几条规则能大幅加速阅读：
+
+| 命名 | 含义 |
+|------|------|
+| `XxxYyyFn` | 回调函数字段 |
+| `SetOnXxxYyy` | 设置回调 |
+| `_privateXxx` | 私有字段（下划线前缀） |
+| `XxxYyy_replica` | replica 文件 |
+| `Xxx_classified` | classified Prefab |
+| `MakeXxx` | 辅助函数（5.3 节的 `MakeInventoryPhysics` 等）|
+| `TUNING.XXX_YYY` | 配置常量 |
+
+**看到名字就知道角色**——不用每次看实现。
+
+#### 经验 2：**注释是金子，别跳过**
+
+Klei 代码里的注释分三种，都值得关注：
+
+**① 普通 `--` 注释**：一般是逻辑说明，直接读。
+
+**② `--V2C:` 注释**：**V2C 是 Klei 一位核心开发的签名**——V2C 留下的注释通常是"**关键设计决策**"或"**坑的说明**"。
+
+看 `inventoryitem_classified.lua` 第 37-41 行：
+
+```lua
+--V2C: used to force color refresh when spoilage changes around 50%/20%
+local function ForcePerishDirty(inst)
+    inst.perish:set_local(inst.perish:value())
+    inst.perish:set(inst.perish:value())
+end
+```
+
+这种看似奇怪的"自己 set 自己"代码，V2C 解释了原因——**不看注释永远搞不懂**。
+
+**③ 注释掉的代码块（`--[[ ... ]]`）**：可能是**历史版本、废弃 API、或特殊情况的说明**——值得一读，因为它反映了代码演化。
+
+#### 经验 3：**TUNING 是"配置大全"**
+
+`scripts/tuning.lua` 有 **8000+ 行**——包含游戏几乎所有数值。
+
+**技巧**：遇到 `TUNING.XXX` 常量就去 `tuning.lua` 里搜 —— 能看到**原始设计数值**和**设计者意图**（通过常量的分组可以看出）。
+
+**应用**：
+- 想调整 Mod 数值：优先改 TUNING（全局一致性）
+- 想知道"这个数值为什么是 60"：搜 TUNING 可能有注释
+
+#### 经验 4：**`require "debugtools"` 是宝藏**
+
+游戏内控制台里 `c_xxx` 命令大多定义在 `scripts/debugcommands.lua` 里。**读它**可以发现**隐藏的调试能力**：
+
+```bash
+rg "^function c_" scripts/debugcommands.lua
+```
+
+**精选输出**：
+
+- `c_spawn("prefab")` —— 生成实体
+- `c_give("prefab")` —— 直接放进背包
+- `c_sel()` —— 选中
+- `c_goto(x, y, z)` —— 传送
+- `c_godmode()` —— 无敌
+- `c_speedmult(x)` —— 速度倍率
+- `c_heal()` / `c_setminimap(true)` —— 各种开挂命令
+
+**为 Mod 开发者提供的无尽便利**——你甚至可以自己用 `AddGlobal` 加自己的 `c_xxx` 命令。
+
+#### 经验 5：**注意"两种 Klei 风格"**
+
+Klei 不同时期的代码风格不同，能从中推断时期：
+
+| 风格特征 | 时期 | 示例 |
+|----------|------|------|
+| 大量 `_private` 字段 + metatable | 新 | `health_replica` |
+| 直接 `self.xxx = net_bool(...)` | 新 | `inventoryitem_classified` |
+| 手写 `_externalspeedmultipliers` 表 | 老 | `locomotor` |
+| 用 `SourceModifierList` | 新 | `fueled`, `sanity` |
+| 用 `SetFn` 风格注册回调 | 新 | 几乎所有新组件 |
+| 硬编码 if-else | 老 | 部分 Prefab 文件 |
+
+**读代码时留意这些信号**——新风格代码更规整、更容易模仿；老风格有历史包袱，模仿前想想"**是不是有新的方式可以用**"。
+
+**具体**：想做"多来源叠加"时，**不要模仿 locomotor 的手写方式**——用 SourceModifierList。
+
+#### 额外经验：善用 Cursor / AI 辅助
+
+最后一条——既然你在用 Cursor，**充分利用 AI 的帮助**：
+
+- 遇到看不懂的 50 行代码：**让 AI 总结**
+- 想找某个功能在哪实现：**用 SemanticSearch 问**
+- 想对比新老实现：**让 AI 列出差异**
+
+**但记住**：AI 可能出错。对于**关键细节**要**自己对源码验证**一遍——这是"信任但验证"的态度。
+
+---
+
+### 6.6.9 小结
+
+- **学会读组件源码是写好 Mod 的核心能力**——三大收益：不重复造轮子、精准无冲突修改、理解 Klei 设计意图。
+- **五步读法**：① 扫行数（判断复杂度）→ ② 读构造函数（理解状态模型）→ ③ 列公开方法（了解能力）→ ④ 读核心函数（掌握主流程）→ ⑤ 读生命周期钩子（存档边界）。**中等组件 15 分钟搞定**。
+- **组件的"三个入口"**：Class 构造函数（状态模型）、公开方法（对外能力）、生命周期钩子（系统集成）——用 `rg "^function Xxx:"` 可以快速列出所有方法。
+- **命名前缀速查**：`Set/Get/Is/Has/Can` 是查询/修改、`SetOnXxxFn` 是注册回调、`Start/Stop` 是状态机——看名字猜功能 90% 准确。
+- **反向追踪三问**：谁加了这个组件（`rg AddComponent`）、谁用了它的方法（`rg components.xxx`）、它响应/发出哪些事件（`rg ListenForEvent/PushEvent`）——画出组件的"**社交网络**"。
+- **组件间的隐式依赖**：通过 `self.inst.components.xxx` 引用、`HasTag` 检查、`PushEvent` 事件、`TUNING.XXX` 常量——这四类痕迹揭示了组件的依赖图。
+- **实时探索工具**：`c_sel()` 选中实体、`c_sel().components.xxx` 查字段、`Ctrl+Tab` 看 `GetDebugString`、临时 hook 方法加 `print`——**"**运行时侦探**"比静态读代码快 10 倍**。
+- **完整案例（perishable）演示**：30 分钟从"听说过 perishable"到"写出夏天加速腐烂的 Mod"——读+Mod 设计一气呵成。
+- **五条黄金经验**：命名规律是路标、V2C 注释是金子、TUNING 是配置大全、`debugcommands.lua` 藏宝、区分新老 Klei 风格——加上用 AI 加速但要验证。
+
+> **下一节预告**：最后一节 6.7——**实战**：从零开始写一个**带 Replica 的自定义组件**。我们会把 6.1-6.6 所有知识点串起来——组件生命周期、Replica、Classified、net 变量、SourceModifierList、Timer⋯⋯写一个可用于真实 Mod 的"灵能"组件（对应 5.7 节的"灵能短剑"）。
+
 
 ## 6.7 实战：编写一个自定义组件（含 Replica）
 
