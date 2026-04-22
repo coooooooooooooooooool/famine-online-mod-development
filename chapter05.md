@@ -2824,7 +2824,646 @@ end
 
 ## 5.6 Asset 声明与资源加载机制（RegisterPrefabs 流程）
 
-（待编写）
+### 本节导读
+
+前面五节我们反复见到 Prefab 文件顶部的 `local assets = { Asset("ANIM", "anim/log.zip"), ... }`——你知道它"告诉引擎要加载什么美术资源"，但具体：
+
+- `Asset` 对象到底存了什么？
+- `"anim/log.zip"` 这个相对路径是怎么被引擎找到真实文件的？
+- 游戏启动时"加载 Prefab"和"加载资源"是同一件事吗？
+- 专用服务器为什么不下载音效？
+- Mod 的 `modmain.lua` 里的 `Assets = { ... }` 和 Prefab 文件里的 `assets` 什么关系？
+
+这一节把这些问题一次讲透。
+
+> **新手**看 5.6.1-5.6.3 就够：认识 `Asset` 每种类型的用途、Prefab 文件里怎么写；**进阶读者**要理解从 `LoadPrefabFile` → `RegisterPrefabsImpl` → `resolvefilepath` 的完整注册流程，以及 `package.assetpath` 搜索路径的作用；**老手**可以重点看 5.6.7 和 5.6.8：Mod 的 `PrefabFiles / Assets` 是怎么挂到 `"MOD_xxx"` 虚拟 Prefab 上的，以及避免"找不到资源"、"资源冲突"、"专用服务器报错"的实战经验。
+
+---
+
+### 5.6.1 快速入门：Asset 是什么？
+
+**一句话：`Asset` 是一个描述"美术资源依赖"的小对象。**
+
+回顾 5.1 节，`Asset` 类的定义只有 4 行（`scripts/prefabs.lua` 第 25-29 行）：
+
+```lua
+Asset = Class( function(self, type, file, param)
+    self.type = type
+    self.file = file
+    self.param = param
+end)
+```
+
+它只存三个字段：
+
+| 字段 | 含义 | 例子 |
+|------|------|------|
+| `type` | 资源类型（大写字符串） | `"ANIM"`、`"IMAGE"`、`"ATLAS"`、`"SOUND"` |
+| `file` | 资源文件的相对路径 | `"anim/log.zip"`、`"images/wilson.tex"` |
+| `param` | 某些类型需要的额外参数（多数不用） | 可选，默认 `nil` |
+
+Prefab 文件顶部的 `local assets = { ... }` 就是一个 `Asset` 数组。举几个真实例子：
+
+```lua
+-- scripts/prefabs/log.lua（木头）
+local assets =
+{
+    Asset("ANIM", "anim/log.zip"),           -- 一个动画文件
+}
+
+-- scripts/prefabs/spear.lua（长矛）
+local assets =
+{
+    Asset("ANIM", "anim/spear.zip"),          -- 地上形态的动画
+    Asset("ANIM", "anim/swap_spear.zip"),     -- 手握形态的动画
+}
+```
+
+玩家角色的 assets 能到几十上百条（`scripts/prefabs/player_common.lua` 第 1906-2088 行有 180 多个 `Asset`），因为玩家动画非常复杂——走、跑、攻击、砍树、挖矿、炼药、吃饭…… 每种行为一个 `.zip` 文件。
+
+**assets 和工厂函数的关系**：
+
+- `assets` 是**告诉引擎"请把这些文件加载到内存里，我等下要用"**
+- 工厂函数里写 `inst.AnimState:SetBank("log")` / `SetBuild("log")` 时用的"log"就是从 `anim/log.zip` 里的构建项（build）名
+
+没在 assets 里声明过的资源，`SetBuild("xxx")` 会直接失败（客户端表现：白色方块 / 不可见）。
+
+---
+
+### 5.6.2 快速入门：常见的 Asset 类型
+
+按使用频率从高到低：
+
+| 类型 | 文件后缀 | 含义 | 典型用途 |
+|------|---------|------|---------|
+| `"ANIM"` | `.zip` | 动画资源（Spriter 导出的动画 + 贴图的打包文件） | 所有实体的模型、动画 |
+| `"IMAGE"` | `.tex` | 单张贴图 | UI 图标、小地图图标 |
+| `"ATLAS"` | `.xml` | **图集**（描述一张大贴图里各个小图的位置） | UI 按钮、物品栏 slot |
+| `"SOUND"` | `.fsb` | 音效包（FMOD Sound Bank） | 怪物叫声、技能音效 |
+| `"SOUNDPACKAGE"` | `.fev` | FMOD 声音工程描述 | 声音包的入口元数据 |
+| `"SHADER"` | `.ksh` | Klei 自定义着色器 | 阴影、发光、水面效果 |
+| `"PKGREF"` | 同多种 | "**引用而不加载**"——告诉引擎"这个文件存在，可能会被远端/皮肤系统用到" | 皮肤动画、事件主题 |
+| `"SCRIPT"` | `.lua` | 声明依赖的 Lua 文件 | 共享代码（如 `prefabs/wx78_common.lua`） |
+| `"INV_IMAGE"` | 名字（不带路径） | 背包里的物品图标 | 物品展示 |
+| `"MINIMAP_IMAGE"` | 名字（不带路径） | 小地图上的图标 | 建筑、特殊地点 |
+
+**几点常见疑惑**：
+
+#### Q: `ATLAS` 和 `IMAGE` 为什么常常成对出现？
+
+很多 UI 贴图是用"大图集"格式导出的——一张 `images/buttons.tex`（大贴图）里打包了几十个小按钮，每个按钮在大图中的位置由 `images/buttons.xml` 描述。所以你会在 Mod 里看到：
+
+```lua
+Asset("ATLAS", "images/medal_buff_ui.xml"),
+Asset("IMAGE", "images/medal_buff_ui.tex"),
+```
+
+**两者缺一**，UI 就会显示错乱。
+
+#### Q: `PKGREF` 和 `ANIM` 有什么区别？
+
+`ANIM` 是"**加载进内存、立刻可用**"；`PKGREF` 是"**只做引用登记，真正加载交给别的系统**"。典型场景是**皮肤系统**——皮肤文件 `.zip` 特别多、每个玩家只会用到其中几个，全部预加载就是浪费。所以皮肤用 `PKGREF` 登记依赖，只有玩家真正选择某个皮肤时才动态加载。
+
+看 `scripts/prefabs/event_deps.lua` 第 74-103 行，整页都是 `PKGREF`——这些是**节日特供菜单动画**，每年只用几次，完全没必要加进内存。
+
+#### Q: `SCRIPT` 类型是什么用？
+
+`SCRIPT` 声明 Lua 源代码依赖。看 `scripts/prefabs/wx78_backupbody.lua` 第 5 行：
+
+```lua
+Asset("SCRIPT", "scripts/prefabs/wx78_common.lua"),
+```
+
+这告诉打包系统"这个 Prefab 依赖 `wx78_common.lua`"——联机版客户端首次连入服务器时，如果本地没这个 Lua 脚本，会自动下载。对 Mod 来说这在 `modmain.lua` 定义的 `assets` 列表里是很重要的——保证每个客户端都能拿到必须的代码文件。
+
+---
+
+### 5.6.3 进阶：Asset 数据如何挂到 Prefab 上
+
+回顾 5.1 节的 `Prefab` 类（`scripts/prefabs.lua` 第 6-19 行）：
+
+```lua
+Prefab = Class( function(self, name, fn, assets, deps, force_path_search)
+    self.name = string.sub(name, string.find(name, "[^/]*$"))
+    self.desc = ""
+    self.fn = fn
+    self.assets = assets or {}
+    self.deps = deps or {}
+    self.force_path_search = force_path_search or false
+
+    if PREFAB_SKINS[self.name] ~= nil then
+        for _,prefab_skin in pairs(PREFAB_SKINS[self.name]) do
+            table.insert( self.deps, prefab_skin )
+        end
+    end
+end)
+```
+
+Prefab 的构造函数只是**把 assets 数组原样存到 `self.assets`**。注意最后一块关于 `PREFAB_SKINS` 的代码——如果这个 Prefab 有皮肤，皮肤 Prefab 名会被**自动塞进 `self.deps`**。
+
+**`assets` 和 `deps` 的区别**：
+
+- `assets`：**这个 Prefab 要用的具体资源文件**（`.zip / .tex / .xml`）
+- `deps`：**这个 Prefab 依赖的其他 Prefab 的名字**（字符串）
+
+比如 `spider.lua` 第 69-84 行：
+
+```lua
+local prefabs =
+{
+    "spidergland",
+    "monstermeat",
+    "silk",
+    "spider_web_spit",
+    "spider_web_spit_acidinfused",
+    "moonspider_spike",
+    -- ...
+}
+```
+
+这是蜘蛛的 `deps`——蜘蛛打死会掉"蜘蛛腺"、"怪物肉"、"蜘蛛丝"，生成"蜘蛛网弹射物"。这些都是**其他 Prefab 的名字**。引擎在加载 `spider` Prefab 时，会自动把这些 Prefab 也标记为"需要加载"，避免运行时 `SpawnPrefab("spidergland")` 出现"资源没加载"。
+
+文件末尾传给 `Prefab(...)`：
+
+```lua
+return Prefab("spider", create_spider, assets, prefabs)
+```
+
+`prefabs`（deps）是第 4 个参数。
+
+---
+
+### 5.6.4 进阶：资源加载的完整流程
+
+游戏启动时，每个 Prefab 文件经过一条"注册 → 解析 → 加载"的流水线。我们把它拆开看。
+
+#### 第一步：`LoadPrefabFile` 读取 Prefab 文件
+
+回顾 5.1.6 节——`scripts/mainfunctions.lua` 第 145-180 行：
+
+```lua
+function LoadPrefabFile( filename, async_batch_validation, search_asset_first_path )
+    local fn, r = loadfile(filename)
+    assert(fn, "Could not load file ".. filename)
+    -- ...
+    local ret = {fn()}         -- 执行文件，拿到 return 的 Prefab 对象们
+
+    if ret then
+        for i,val in ipairs(ret) do
+            if type(val)=="table" and val.is_a and val:is_a(Prefab) then
+                val.search_asset_first_path = search_asset_first_path
+                if async_batch_validation then
+                    RegisterPrefabsImpl(val, VerifyPrefabAssetExistsAsync)
+                else
+                    RegisterSinglePrefab(val)
+                end
+                PREFABDEFINITIONS[val.name] = val
+            end
+        end
+    end
+    return ret
+end
+```
+
+关键动作：
+
+1. `loadfile` + `fn()`：执行 Prefab 文件，拿到所有 `Prefab` 对象
+2. 给每个 Prefab 打上 `search_asset_first_path`（**Mod 的 Prefab 会有这个字段——后面详细讲**）
+3. 调用 `RegisterSinglePrefab` 注册
+
+#### 第二步：`RegisterSinglePrefab` / `RegisterPrefabsImpl`
+
+`scripts/mainfunctions.lua` 第 103-117 行：
+
+```lua
+function RegisterPrefabsImpl(prefab, resolve_fn)
+    for i,asset in ipairs(prefab.assets) do
+        if not ShouldIgnoreResolve(asset.file, asset.type) then
+            resolve_fn(prefab, asset)
+        end
+    end
+
+    modprefabinitfns[prefab.name] = ModManager:GetPostInitFns("PrefabPostInit", prefab.name)
+    Prefabs[prefab.name] = prefab
+
+    TheSim:RegisterPrefab(prefab.name, prefab.assets, prefab.deps)
+end
+```
+
+四件事：
+
+1. **遍历 assets**，对每个资源调用 `resolve_fn`——**这是把相对路径解析成绝对路径的地方**
+2. **预取 Mod PostInit**：把所有 Mod 注册的 `PrefabPostInit` 函数先收集进 `modprefabinitfns`——这样每次 `SpawnPrefab` 时可以直接索引，不用再查（回顾 5.1.5 节的 Spawn 流程）
+3. **登记到全局 `Prefabs` 表**（`Prefabs[prefab.name] = prefab`）
+4. **通知 C++ 引擎**：`TheSim:RegisterPrefab(...)` 告诉底层"**从现在起，这个 name 对应的资源清单是这些**"
+
+#### 第三步：`resolve_fn` —— 路径解析
+
+实际的 `resolve_fn` 是 `RegisterPrefabsResolveAssets`（同文件第 119-125 行）：
+
+```lua
+local function RegisterPrefabsResolveAssets(prefab, asset)
+    local resolvedpath = resolvefilepath(asset.file, prefab.force_path_search, prefab.search_asset_first_path)
+    assert(resolvedpath, "Could not find "..asset.file.." required by "..prefab.name)
+    TheSim:OnAssetPathResolve(asset.file, resolvedpath)
+    asset.file = resolvedpath  -- ← 把解析后的绝对路径写回 asset
+end
+```
+
+关键：
+
+- `resolvefilepath` 把相对路径（`"anim/log.zip"`）变成绝对路径（如 `"C:/.../data/anim/log.zip"`）
+- 找不到会直接 `assert` 崩溃——**这就是游戏启动时最常见的崩溃："Could not find anim/xxx.zip required by yyy"**
+- 解析后的绝对路径**原地写回 `asset.file`**，以后不再需要解析
+
+#### 第四步：`TheSim:RegisterPrefab` —— 通知 C++ 引擎
+
+这是 C++ 接口（Lua 层看不到实现）。它做的事大致是：
+
+- 把 Prefab 名字、资源清单（现在都是绝对路径）、依赖列表都记录到引擎侧的 Prefab 注册表
+- 此时**资源还没真正加载进内存**——只是"登记了"
+- 真正的加载由 `TheSim:LoadPrefabs({"log", "spear", ...})` 触发（比如世界初始化时）
+
+#### 整体流程图
+
+```
+    scripts/prefabs/log.lua
+            ↓
+    LoadPrefabFile("scripts/prefabs/log.lua")
+            ↓
+    loadfile → fn() → return Prefab("log", fn, assets, deps)
+            ↓
+    RegisterSinglePrefab(prefab)
+            ↓
+    RegisterPrefabsImpl(prefab, RegisterPrefabsResolveAssets)
+      ├─ for each asset：
+      │   ├─ ShouldIgnoreResolve？（专用服务器跳过音效等）
+      │   └─ resolvefilepath → 绝对路径
+      │       ├─ 找不到 → assert 崩溃
+      │       └─ 写回 asset.file
+      ├─ Prefabs["log"] = prefab
+      └─ TheSim:RegisterPrefab("log", assets, deps)
+            ↓
+    游戏运行中，需要时：
+    TheSim:LoadPrefabs({"log"}) → C++ 真正把资源加载进内存
+            ↓
+    SpawnPrefab("log") → 实体被造出来，引用已加载的资源
+```
+
+---
+
+### 5.6.5 进阶：资源路径解析机制
+
+`resolvefilepath` 是**把相对路径 → 绝对路径**的核心函数（`scripts/util.lua` 第 636-643 行）：
+
+```lua
+function resolvefilepath(filepath, force_path_search, search_first_path)
+    if memoizedFilePaths[filepath] then
+        return memoizedFilePaths[filepath]
+    end
+    local resolved = resolvefilepath_internal(filepath, force_path_search, search_first_path)
+    assert(resolved ~= nil, "Could not find an asset matching "..filepath.." in any of the search paths.")
+    return resolved
+end
+```
+
+**两个关键优化 + 一个失败机制**：
+
+1. **`memoizedFilePaths` 缓存**：每个解析结果都被缓存，第二次同样请求直接返回（无论解析成功还是失败）
+2. **失败即崩溃**（`assert`）：找不到直接游戏 crash，**避免运行时出现"谜之白方块"**
+3. 对应的"软性"版本 `resolvefilepath_soft`（第 629-634 行）找不到时返回 `nil`——适用于"这个资源可能不存在，失败也没关系"的场景
+
+#### 内部的 `softresolvefilepath_internal`
+
+`scripts/util.lua` 第 585-620 行：
+
+```lua
+local function softresolvefilepath_internal(filepath, force_path_search, search_first_path)
+    force_path_search = force_path_search or false
+
+    if IsConsole() and not force_path_search then
+        return filepath -- it's already absolute, so just send it back
+    end
+
+    --on PC platforms, search all the possible paths
+
+    --mod folders don't have "data" in them, so we strip that off if necessary. It will
+    --be added back on as one of the search paths.
+    filepath = string.gsub(filepath, "^/", "")
+
+    --sometimes from context we can know the most likely path for an asset, this can result in less time spent searching the tons of mod search paths.
+    if search_first_path then
+        local filename = search_first_path..filepath
+        if kleifileexists(filename) then
+            return filename
+        end
+    end
+
+    local searchpaths = package.assetpath
+    for i, pathdata in ipairs_reverse(searchpaths) do
+        local filename = string.gsub(pathdata.path..filepath, "\\", "/")
+        if kleifileexists(filename, pathdata.manifest, filepath) then
+            return filename
+        end
+    end
+
+    --as a last resort see if the file is an already correct path (incase this asset has already been processed)
+    if kleifileexists(filepath) then
+        return filepath
+    end
+
+    return nil
+end
+```
+
+**搜索逻辑**（自上而下）：
+
+1. **主机平台直接用绝对路径**（针对 PS4 / Xbox 等平台）
+2. **优先搜索 `search_first_path`**——这是 Mod 的根目录路径。对 Mod 的资源来说，**直接检查 `MODS_ROOT + modname + /anim/xxx.zip` 是最快的**，能命中 99% 的情况
+3. **按 `package.assetpath` 列表反向搜索**——`assetpath` 是引擎维护的"全局搜索路径"列表，包含主程序 data 目录、所有已启用 Mod 的根目录等
+4. **最后再尝试原路径作为绝对路径**（兜底，应对已解析过的情况）
+
+**`package.assetpath` 是什么？**
+它是 C++ 引擎在启动时按优先级从高到低填入的搜索路径列表：
+
+- Mod1 的根目录
+- Mod2 的根目录
+- ...
+- 游戏主程序的 `data/` 目录
+
+`ipairs_reverse` 从后往前遍历意味着**主程序路径优先命中**——如果一个 Mod 和主程序都叫 `anim/log.zip`，主程序版本会被优先使用。（有的 Mod 会利用这个规则做**替换式覆盖**，例如把自己的 `anim/log.zip` 放在 `data/` 里让原版资源被代替……但这是不推荐的侵入性做法。）
+
+---
+
+### 5.6.6 进阶：专用服务器的资源忽略
+
+有个细节在 `RegisterPrefabsImpl` 里一闪而过——`ShouldIgnoreResolve(asset.file, asset.type)`。看 `scripts/mainfunctions.lua` 第 69-98 行：
+
+```lua
+function ShouldIgnoreResolve( filename, assettype )
+    if assettype == "INV_IMAGE" then
+        return true
+    end
+    if assettype == "MINIMAP_IMAGE" then
+        return true
+    end
+    if filename:find(".dyn") and assettype == "PKGREF" then
+        return true
+    end
+
+    if TheNet:IsDedicated() then
+        if assettype == "SOUNDPACKAGE" then
+            return true
+        end
+        if assettype == "SOUND" then
+            return true
+        end
+        if filename:find(".ogv") then
+            return true
+        end
+        if filename:find(".fev") and assettype == "PKGREF" then
+            return true
+        end
+        if filename:find("fsb") then
+            return true
+        end
+    end
+    return false
+end
+```
+
+**两组规则**：
+
+#### 规则 1：所有平台都跳过的类型
+
+- **`INV_IMAGE`、`MINIMAP_IMAGE`**：这两种类型的"路径"其实不是文件路径，而是 UI 动画内部的**贴图名**——不需要真实路径解析
+- **`.dyn` 的 `PKGREF`**：动态皮肤文件，运行时按需加载
+
+#### 规则 2：专用服务器跳过的类型
+
+`TheNet:IsDedicated()` 为真时（专用服务器），**一律跳过**：
+
+- `SOUNDPACKAGE` / `SOUND` / `.fsb` / `.fev`（`PKGREF`）：服务器不需要音效
+- `.ogv`：视频文件（片头过场动画），服务器不需要
+
+这是**极其重要的优化**——专用服务器通常跑在 Linux VPS 上，没声卡、没显卡，下载音效视频就是纯浪费。这段代码让专用服务器启动速度快了一大截。
+
+> **Mod 作者启示**：你的 Mod 的 `Assets` 列表在专用服务器上会被过滤——如果你的 Mod 强依赖某些音效/视频（不太可能，但假设），要意识到专服拿不到。这也是为什么 Mod 纯**客户端 UI 增强**（如中文字体、键位提示）常会标 `client_only_mod = true`，让专服根本不参与这个 Mod。
+
+---
+
+### 5.6.7 老手进阶：Mod 的 `PrefabFiles` 与 `Assets`
+
+现在我们转到 Mod 开发者真正关心的部分：**Mod 里声明的资源到底是怎么挂到游戏里的？**
+
+在 `modmain.lua` 里你会定义两个全局表：
+
+```lua
+-- 要加载的 Prefab 文件名列表（不带 prefabs/ 前缀）
+PrefabFiles = {
+    "scroll_lightning",
+    "scroll_heal",
+    "scroll_summon",
+}
+
+-- Mod 共用的资源列表（不属于某个具体 Prefab 的资源）
+Assets = {
+    Asset("ATLAS", "images/my_ui.xml"),
+    Asset("IMAGE", "images/my_ui.tex"),
+    Asset("ANIM", "anim/my_common_fx.zip"),
+    Asset("SOUND", "sound/my_sounds.fsb"),
+}
+```
+
+它们各自会被怎样处理？
+
+#### `PrefabFiles` 的加载
+
+看 `scripts/mods.lua` 第 676-703 行的 `ModWrangler:RegisterPrefabs`：
+
+```lua
+function ModWrangler:RegisterPrefabs()
+    if not MODS_ENABLED then return end
+
+    for i,modname in ipairs(self.enabledmods) do
+        local mod = self:GetMod(modname)
+
+        mod.LoadPrefabFile = LoadPrefabFile
+        mod.RegisterPrefabs = RegisterPrefabs
+        mod.Prefabs = {}
+
+        print("Mod: "..ModInfoname(modname), "Registering prefabs")
+
+        if mod.PrefabFiles then
+            for _, prefab_path in ipairs(mod.PrefabFiles) do
+                print("Mod: "..ModInfoname(modname), "  Registering prefab file: prefabs/"..prefab_path)
+                local ret = runmodfn( mod.LoadPrefabFile, mod, "LoadPrefabFile" )(
+                    "prefabs/"..prefab_path,
+                    nil,
+                    MODS_ROOT..modname.."/"  -- ← 传入 search_first_path
+                )
+                if ret then
+                    for _, prefab in ipairs(ret) do
+                        print("Mod: "..ModInfoname(modname), "    "..prefab.name)
+                        mod.Prefabs[prefab.name] = prefab
+                    end
+                end
+            end
+        end
+
+        local prefabnames = {}
+        for name, prefab in pairs(mod.Prefabs) do
+            table.insert(prefabnames, name)
+            Prefabs[name] = prefab -- copy the prefabs back into the main environment
+        end
+```
+
+流程：
+
+1. 遍历 `mod.PrefabFiles` 里的每个名字 `name`
+2. 调用 `LoadPrefabFile("prefabs/" .. name, nil, MODS_ROOT..modname.."/")`——**关键点：第三个参数 `search_first_path` 传入了 Mod 的根目录**
+3. 每个 Prefab 被注册后，把它从 Mod 的沙箱环境复制回全局 `Prefabs` 表
+
+**第三个参数的意义**——回顾 5.6.5 节的 `softresolvefilepath_internal`：当解析资源路径时，**先用 `search_first_path + filepath` 组合尝试**。对 Mod 来说就是"**先在本 Mod 目录里找**"——因此你的 Mod 的 `anim/my_scroll.zip` 真实路径是 `MODS_ROOT + modname + /anim/my_scroll.zip`，这条规则让它第一时间命中。
+
+#### `Assets` 的加载
+
+同一个函数后半段（`scripts/mods.lua` 第 711-719 行）：
+
+```lua
+print("Mod: "..ModInfoname(modname), "  Registering default mod prefab")
+
+local pref = Prefab("MOD_"..modname, nil, mod.Assets, prefabnames, true)
+pref.search_asset_first_path = MODS_ROOT..modname.."/"
+RegisterSinglePrefab(pref)
+
+TheSim:LoadPrefabs({pref.name})
+table.insert(self.loadedprefabs, pref.name)
+```
+
+**这是最巧妙的设计**：
+
+- 创建一个**虚拟 Prefab**叫 `"MOD_<modname>"`（比如 `"MOD_medal"`）
+- 它的**工厂函数是 `nil`**（永远不会被 `SpawnPrefab`）
+- 它的 **`assets` 字段填入 `mod.Assets`**——你在 `modmain.lua` 里写的 `Assets` 全表
+- 它的 **`deps` 字段填入 Mod 的所有 Prefab 名字**——相当于说"只要这个 MOD_xxx 加载了，它的所有子 Prefab 也要加载"
+- `force_path_search = true`（第 5 个参数）——强制搜索，即使主机平台也要走完整路径解析流程
+- `search_asset_first_path = MODS_ROOT..modname.."/"`——资源优先在 Mod 目录找
+- 立刻 `TheSim:LoadPrefabs({"MOD_medal"})`——**游戏启动时立刻加载这个虚拟 Prefab，它会触发所有依赖 Prefab 和所有全局 Assets 的加载**
+
+**效果**：`modmain.lua` 里 `Assets` 声明的资源**在 Mod 启动时一次性全部加载**，不随某个具体 Prefab。这样多个 Prefab 共用的资源（UI 图集、通用特效）不需要在每个 Prefab 文件里重复声明。
+
+---
+
+### 5.6.8 老手进阶：Mod 资源声明的常见坑
+
+在 Mod 开发中和资源系统打交道是非常容易踩坑的场景。下面是八个最常见的问题和解决方案。
+
+#### 坑 1：路径写错大小写
+
+Mod 的资源路径在 Windows 上大小写不敏感，但 Linux（专用服务器的常见环境）上**大小写敏感**。常见问题：
+
+```lua
+Asset("ANIM", "anim/MyScroll.zip"),   -- ← Windows 测试没问题
+-- 真实文件名可能是 anim/myscroll.zip，Linux 专服会崩
+```
+
+**一律用小写路径**。文件名也尽量都小写。
+
+#### 坑 2：`ATLAS` 和 `IMAGE` 只声明了一个
+
+```lua
+Asset("ATLAS", "images/my_ui.xml"),   -- 只声明了 xml
+-- 忘记声明 images/my_ui.tex
+```
+
+结果：游戏启动不报错，但 UI 显示空白。**必须成对声明**。
+
+#### 坑 3：在具体 Prefab 的 `assets` 里放了全局 UI 资源
+
+```lua
+-- prefabs/my_scroll.lua
+local assets =
+{
+    Asset("ANIM", "anim/my_scroll.zip"),
+    Asset("ATLAS", "images/my_ui.xml"),   -- ← 不推荐：UI 资源放这
+    Asset("IMAGE", "images/my_ui.tex"),
+}
+```
+
+问题：UI 资源加载时机变得不稳定，且如果同 Mod 有多个 Prefab 都用这个 UI，会**重复加载警告**。
+
+**正确做法**：全局 UI 资源一律放到 `modmain.lua` 的 `Assets = { ... }` 里。具体 Prefab 的 `assets` 只放那个 Prefab 独有的资源（自己的 `anim/xxx.zip`、自己的音效）。
+
+#### 坑 4：Mod 里的资源路径带前缀 `mods/xxx/`
+
+```lua
+Asset("ANIM", "mods/my_scroll_mod/anim/my_scroll.zip"),   -- ← 错
+```
+
+Mod 里的路径都**相对于 Mod 根目录**（因为 `search_first_path = MODS_ROOT..modname.."/"`）。正确写法：
+
+```lua
+Asset("ANIM", "anim/my_scroll.zip"),   -- ← 对
+```
+
+#### 坑 5：忘了在 `PrefabFiles` 里登记新 Prefab
+
+你写了 `mods/my_mod/scripts/prefabs/my_scroll.lua`，但 `modmain.lua` 里的 `PrefabFiles` 忘了加：
+
+```lua
+PrefabFiles = {
+    "other_scroll",
+    -- "my_scroll",   ← 忘了加
+}
+```
+
+结果：游戏启动不报错，但 `SpawnPrefab("my_scroll")` 时报 "Can't find prefab my_scroll"。**所有新 Prefab 必须在 `PrefabFiles` 里登记**。
+
+#### 坑 6：打算让所有客户端也用的 Mod 没设 `all_clients_require_mod`
+
+`modinfo.lua` 里有几个重要开关：
+
+```lua
+-- modinfo.lua
+client_only_mod = false            -- 是否仅客户端使用（不影响游戏逻辑）
+all_clients_require_mod = true     -- 所有客户端是否必须装这个 Mod
+dst_compatible = true              -- 是否兼容联机版
+```
+
+- **`client_only_mod = true`**：像"中文字体增强"、"UI 改动"、"屏幕上显示 FPS"这种**不改游戏逻辑**的 Mod——主机和客户端独立启用，客户端的 Mod 不会上传到服务器
+- **`all_clients_require_mod = true`**：主机启用这个 Mod 时，客户端**必须也装同版本**才能连进来——用于**改了游戏逻辑/添加了新 Prefab**的 Mod。联机时主机会自动推送 Lua 脚本到客户端，但 Mod 的 Assets（美术资源）**客户端必须自己本地有**
+- **`dst_compatible = true`**：标记兼容联机版（单机版和联机版数据结构不同）
+
+**常见问题**：你做了一个"加 5 种魔法卷轴"的 Mod，`all_clients_require_mod` 忘了设——其他玩家进服之后能看到长矛，但看不到卷轴（因为卷轴是新 Prefab，客户端本地没有资源）。
+
+#### 坑 7：Mod 的贴图/动画更新了，但客户端没重启
+
+游戏客户端对 `memoizedFilePaths`（第一次解析成功的路径）会缓存。如果你在游戏运行中改了 Mod 的资源文件，**客户端可能还在用内存里的旧版本**。通用做法是——**客户端 + 主机都重启游戏**，别指望"reload Mod"能彻底刷新。
+
+#### 坑 8：Mod 的 `Assets` 列表过大影响启动
+
+每个 `Asset` 都要走 `resolvefilepath` 一次。如果你的 Mod 有几百个资源，启动会显著变慢。对策：
+
+- 只声明**真正会用到**的资源
+- 对**偶尔用到**的资源用 `PKGREF`——延迟加载
+- 对**皮肤系统**用 `PREFAB_SKINS` 机制（回顾 5.6.3 节的 `Prefab` 构造函数最后那段——皮肤会被自动注入到 `deps`）
+
+---
+
+### 5.6.9 小结
+
+- **`Asset` 是一个三字段小对象**（type / file / param），声明在 Prefab 顶部或 `modmain.lua` 的 `Assets` 里。它告诉引擎"我用到这些资源文件"。
+- **常见 Asset 类型**：`ANIM`（动画）、`IMAGE`（贴图）、`ATLAS`（图集，配 IMAGE）、`SOUND`（音效）、`SHADER`（着色器）、`PKGREF`（仅引用、延迟加载）、`SCRIPT`（Lua 脚本依赖）、`INV_IMAGE` / `MINIMAP_IMAGE`（UI 用的贴图名）。
+- **`Prefab` 的 `assets` 字段**存资源列表，**`deps` 字段**存依赖的其他 Prefab 名字。皮肤 Prefab 会被自动追加到 `deps`。
+- **资源注册流程**：`LoadPrefabFile` → `RegisterSinglePrefab` → `RegisterPrefabsImpl` → `resolve_fn`（`RegisterPrefabsResolveAssets`）→ `resolvefilepath` 解析相对路径为绝对路径 → `TheSim:RegisterPrefab` 通知 C++ 引擎。
+- **`resolvefilepath` 搜索策略**：先 `search_first_path`（Mod 根目录），再 `package.assetpath` 反向遍历（主程序 data 优先于 Mod），最后兜底原路径。找不到直接 `assert` 崩溃。
+- **`ShouldIgnoreResolve`** 在两种情况跳过资源：(1) `INV_IMAGE` / `MINIMAP_IMAGE` 类型（它们不是真实路径）；(2) 专用服务器跳过所有音效、视频、fev 包——大幅加快专服启动速度。
+- **Mod 的 `PrefabFiles`** 会被逐个 `LoadPrefabFile`，传入 `search_first_path = MODS_ROOT + modname + "/"`，保证 Mod 资源优先从自己目录找。
+- **Mod 的 `Assets`** 被打包进一个虚拟 Prefab `"MOD_<modname>"`（没有工厂函数，`deps` 包含 Mod 所有 Prefab 名），这个虚拟 Prefab 游戏启动时立刻加载，触发所有全局资源一次性到位。
+- **八个实战坑**：路径大小写、ATLAS + IMAGE 必须成对、全局 UI 资源不要放到具体 Prefab、Mod 路径不要带前缀、新 Prefab 必须登记到 PrefabFiles、`modinfo.lua` 的 `all_clients_require_mod` / `client_only_mod` 别忘设、客户端缓存问题要重启、Assets 列表太大影响启动速度。
+
+> **下一节预告**：前六节我们建起了 Prefab 系统的完整知识体系——从"图纸是什么"到"Mod 资源挂载"。5.7 节是本章的**实战总结**——我们从零开始写一个完整的自定义物品 Mod：一把叫"**灵能短剑**"的武器。会涵盖 Prefab 文件结构、工厂函数五段式、tag 选用、MakeXxx 辅助函数、SetPristine 两段式、replica 考虑、Mod 的 `PrefabFiles / Assets` 声明——**把前六节所有知识点过一遍**。
 
 ## 5.7 实战：创建一个全新的自定义物品
 
