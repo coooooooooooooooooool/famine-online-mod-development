@@ -1657,7 +1657,653 @@ return MakeScroll("scroll_lightning", assets, prefabs, nil, master_postinit)
 
 ## 5.4 Pristine State——为什么 Prefab 有两段代码
 
-（待编写）
+### 本节导读
+
+5.2 节我们提到工厂函数的"五段式"——`SetPristine()` + `if not TheWorld.ismastersim then return inst end` 这两行把工厂函数切成了"前半段（主客都执行）"和"后半段（只有主机执行）"。5.3 节我们见过 `MakePlayerCharacter` 用 `common_postinit / master_postinit` 两个钩子分别插入这两段。
+
+但始终有一个核心问题没被真正解释：**同一段 Prefab 文件的代码，到底是被"谁"、"在什么情况下"执行了几次？为什么非得分成两段？**
+
+这一节就彻底讲清楚。
+
+> **新手**看 5.4.1 和 5.4.2 就够——先记住"主机/客户端都会跑一遍这段代码"这个事实，以及"上半段两边都跑、下半段只有主机跑"的写法；**进阶读者**要深入理解 `pristine`（原始快照）的语义、replica 系统的工作方式、以及 `net_xxx` 变量怎么把服务端改动推到客户端；**老手**可以跟着"一把长矛的完整旅程"把每一步抽丝剥茧走一遍，并看懂"写 Mod 时最容易踩的 5 个坑"。
+
+---
+
+### 5.4.1 快速入门：同一段代码为什么被执行两次？
+
+**饥荒联机版是客户端/服务端架构的游戏**。任何联机游戏都有两类参与者：
+
+- **主机（host）**：真实跑游戏世界的一台机器（开联机时你自己的电脑，或者饥荒专用服务器）
+- **客户端（client）**：其他玩家的电脑，只是"看"这个世界（实际只跑一部分逻辑，大多数事情都由主机决定）
+
+问题来了：**Prefab 文件（比如 `scripts/prefabs/spear.lua`）在主机和客户端上都会被加载、执行**。原因很简单——客户端也要能**显示**一把长矛（贴图、动画、物理），这些逻辑不跑一遍，客户端拿什么渲染？
+
+所以，你在 `spear.lua` 里写的工厂函数 `fn`，在**主机上生成长矛时会被调用一次**，同时**每一个连进来的客户端上也会被调用一次**。这就是"一段代码被执行多次"的真相。
+
+**`TheWorld.ismastersim` 就是用来区分身份的**。打开 `scripts/prefabs/world.lua` 第 425-426 行：
+
+```lua
+inst.ismastersim = TheNet:GetIsMasterSimulation()
+inst.ismastershard = inst.ismastersim and not TheShard:IsSecondary()
+```
+
+`TheNet:GetIsMasterSimulation()` 是 C++ 引擎的接口——**主机返回 `true`，客户端返回 `false`**。所以 `TheWorld.ismastersim` 在主机上是 `true`，在客户端上是 `false`。这个值在游戏启动时被设置，整个游戏生命周期都不会变。
+
+于是你在工厂函数中写：
+
+```lua
+if not TheWorld.ismastersim then
+    return inst
+end
+-- 这下面的代码只有主机会执行
+```
+
+就等同于说："如果我不是主机，到此为止；下面的代码只有主机才往下走。"
+
+---
+
+### 5.4.2 快速入门：把工厂函数拆成两段的意义
+
+既然主机和客户端都会执行工厂函数，为什么不让两边都跑同样的代码（反正都会读到 `if not TheWorld.ismastersim`）？为什么要把代码有意识地分成两段？
+
+两个核心原因：
+
+#### 原因 1：Lua 组件（如 `health`、`weapon`）只属于主机
+
+游戏世界的**真实状态**只存在于主机——一把长矛的剩余耐久、一只蜘蛛的血量、一个玩家背包里有什么，这些都是主机算的，客户端只是被动接收。因此：
+
+- `inst:AddComponent("health")` 创建的 `health` 组件，**只在主机上有意义**
+- 客户端根本不应该也不需要创建这个组件
+
+如果你在客户端也 `AddComponent("health")`，不仅是浪费内存——**客户端上那个"health 组件"是完全隔离的、不会和主机同步的假组件**。玩家砍一下长矛，主机上 `health:DoDelta(-10)`，客户端那个 `health.currenthealth` 根本不变，UI 显示永远是错的。
+
+所以规则很明确：**凡是 `AddComponent` 开头的业务逻辑（除了少数例外），都应该放在 `SetPristine` 分界线下面**。
+
+#### 原因 2：客户端也需要"最基本的实体样貌"
+
+但反过来，客户端也不能完全一无所知——它至少要能：
+- 正确显示长矛的模型和动画（`AnimState:SetBank / SetBuild / PlayAnimation`）
+- 知道这是把"武器"（`inst:AddTag("weapon")`）以便玩家鼠标悬停提示
+- 知道它是个可以漂在水上的物品（`MakeInventoryFloatable`）
+- 配置好基本的物理，这样玩家看到它"咣当"掉在地上
+
+这些**视觉和判定信息**必须两边都执行——这就是分界线**上半段**要做的事。
+
+#### 分界线本身：`SetPristine` 的作用
+
+`inst.entity:SetPristine()` 是一个 C++ 引擎提供的接口。它做的事大致可以理解为：
+
+> "当前为止我给你看到的状态（tag、AnimState 配置、Physics 配置、引擎组件数据），请引擎把这份快照**原样保存**——以后任何新客户端连进来，只要用这份快照就能重建实体。之后我做的任何修改不再自动同步。"
+
+这份"pristine 快照"会随着实体第一次被同步给客户端一起发过去。客户端拿到这份快照后跑一遍工厂函数，跑到 `SetPristine` 时和主机达成同一个起点。此后客户端再运行到 `if not TheWorld.ismastersim then return inst end` 就退出——主机还要继续往下加各种 Lua 组件，客户端到此打住。
+
+所以两段代码的写作规则：
+
+| 段落 | 放什么 | 为什么 |
+|------|--------|--------|
+| **上半段**（`SetPristine` 之前） | `AddTransform / AddAnimState / AddNetwork`、动画 `SetBank/SetBuild`、物理 `MakeXxxPhysics`、`AddTag`、`MakeInventoryFloatable`、事件监听（客户端也要监听的）等 | 客户端需要用来**正确显示和判定**这个实体 |
+| **下半段**（`SetPristine` 之后 & `if not TheWorld.ismastersim` 过滤后） | `AddComponent` 各种业务组件、设置 `SetDamage/SetMaxUses`、`SetStateGraph`、`SetBrain`、`ListenForEvent`（仅服务端的）等 | 只在主机上跑的真实游戏逻辑 |
+
+> **新手记忆**：**"看得见的放上半段、算得出来的放下半段"**。看得见 = 模型、动画、物理、可点击性、标签；算得出来 = 血量、伤害、AI、玩家交互后果。
+
+---
+
+### 5.4.3 进阶：pristine 的字面意义
+
+"pristine" 在英文里意思是 **"原始的、未受污染的"**，也可以译成"纯净初始状态"。用到这里非常贴切：
+
+- 实体被 `CreateEntity` 刚出生时，是"空壳"
+- 你在工厂函数的**上半段**往它身上加东西，它还处于"**正在被构造**"的状态
+- `SetPristine()` 一调，"构造完成"——此时的状态是这个实体最**干净、原始的初始面貌**
+- 之后主机再往里加 Lua 组件、改状态，就进入"**运行时状态**"，不再属于"原始"
+
+为什么要区分"原始状态"和"运行时状态"？因为**网络同步效率**：
+
+- 原始状态对**所有**客户端都一样——无论哪个客户端，连进来时看到的新生成长矛都是同一个样子。所以服务端只需要序列化一份 pristine state 广播出去，不需要每个客户端单独算。
+- 运行时状态是**不断变化**的（耐久从 100 降到 99 再降到 98 …）。不同时刻连进来的客户端看到的值不一样，需要通过 replica 系统持续同步。
+
+**两份状态对应两种同步机制**：
+
+| 状态 | 同步机制 | 时机 |
+|------|----------|------|
+| Pristine state | 打包一次随实体广播（`SetPristine` 冻结） | 实体**首次被同步给客户端**时 |
+| 运行时状态 | 通过 replica 的 `net_xxx` 变量增量推送 | 状态变化时，实时（或下一次网络 tick） |
+
+这就是为什么工厂函数必须"分两段写"——**两段对应两种同步渠道**。上半段写错，客户端看到的初始长矛就是错的；下半段写错（比如塞到上半段），客户端会为"根本用不到的 Lua 组件"白白初始化一堆垃圾。
+
+---
+
+### 5.4.4 进阶：replica 系统 —— 客户端怎么"复刻"组件
+
+你会发现一个矛盾的现象：
+
+- 客户端**没有** `inst.components.health`（因为 `AddComponent("health")` 只在主机执行）
+- 但客户端的 UI 上**能正确显示血条**
+
+中间缺的就是 **replica（复制品）** 系统。打开 `scripts/entityreplica.lua` 第 5-26 行：
+
+```lua
+local REPLICATABLE_COMPONENTS =
+{
+    builder = true,
+    combat = true,
+    container = true,
+    constructionsite = true,
+    equippable = true,
+    fishingrod = true,
+    follower = true,
+    health = true,
+    hunger = true,
+    inventory = true,
+    inventoryitem = true,
+    moisture = true,
+    named = true,
+    oceanfishingrod = true,
+    rider = true,
+    sanity = true,
+    sheltered = true,
+    stackable = true,
+    writeable = true,
+}
+```
+
+**这张白名单里的组件有 18 个**——它们是"两边都需要感知"的组件。每个白名单组件都必须有两个对应文件：
+
+- `scripts/components/xxx.lua`——**服务端组件**（有真正的数据，只在主机跑）
+- `scripts/components/xxx_replica.lua`——**客户端复制品**（通过 `net_xxx` 变量镜像服务端状态）
+
+以 `health` 为例：
+
+- `scripts/components/health.lua` 存放 `currenthealth`、`maxhealth` 等字段，`DoDelta(-10)` 这种方法
+- `scripts/components/health_replica.lua` 存放 `self.classified.currenthealth`（一个 `net_xxx` 变量），只提供 `GetPercent()` / `GetCurrent()` / `IsDead()` 之类的**只读**查询方法
+
+客户端 UI 要画血条时，会查 `inst.replica.health:GetPercent()`——它实际读的是 replica 里的 net 变量的 `:value()`，而 net 变量的值是从服务端自动同步过来的。
+
+#### 自动 replicate 的流程
+
+看 `scripts/entityreplica.lua` 第 34-60 行 `ReplicateComponent`：
+
+```lua
+function EntityScript:ReplicateComponent(name)
+    if not REPLICATABLE_COMPONENTS[name] then
+        return
+    end
+
+    if TheWorld.ismastersim then
+        self:AddTag("_"..name)
+        if self:HasTag("__"..name) then
+            self:RemoveTag("__"..name)
+            return
+        end
+    end
+
+    if rawget(self.replica, "_")[name] ~= nil then
+        print("replica "..name.." already exists! "..debugstack_oneline(3))
+    end
+
+    local filename = name.."_replica"
+    local cmp = Replicas[filename]
+    if cmp == nil then
+        cmp = require("components/"..filename)
+        Replicas[filename] = cmp
+    end
+    assert(cmp ~= nil, "replica "..name.." does not exist!")
+
+    rawset(self.replica._, name, cmp(self))
+end
+```
+
+重点逻辑：
+
+1. 白名单拦截——不在 18 个组件里的就直接 return，**不会被 replicate**
+2. 如果是主机，**给实体加一个 `_xxx` 标签**（如 `_health`）——这个标签是"这个实体挂着 health 组件"的信号
+3. `require("components/xxx_replica")` 加载对应的 replica 类
+4. 用 `cmp(self)` 创建 replica 实例，挂到 `inst.replica._[name]`
+
+而这一切的触发，在 `EntityScript:AddComponent`（`scripts/entityscript.lua` 第 610-646 行）里：
+
+```lua
+function EntityScript:AddComponent(name)
+    -- ...检查是否已存在...
+    local cmp = LoadComponent(name)
+    -- ...
+    self:ReplicateComponent(name)  -- ← 每次 AddComponent，顺手 ReplicateComponent
+    local loadedcmp = cmp(self)
+    self.components[name] = loadedcmp
+    -- ...
+end
+```
+
+**关键点**：**主机每次 `AddComponent("health")`，`ReplicateComponent("health")` 都会自动跟着跑**，顺手把 `_health` 标签加到实体身上。这个标签会被同步到所有客户端。
+
+#### 客户端的 ReplicateEntity
+
+客户端首次接收到实体的 pristine state 后，引擎会调用 `scripts/entityreplica.lua` 第 75-85 行：
+
+```lua
+--Triggered on clients immediately after initial deserialization of tags from construction
+function EntityScript:ReplicateEntity()
+    for k, v in pairs(REPLICATABLE_COMPONENTS) do
+        if v and (self:HasTag("_"..k) or self:HasTag("__"..k)) then
+            self:ReplicateComponent(k)
+        end
+    end
+
+    if self.OnEntityReplicated ~= nil then
+        self:OnEntityReplicated()
+    end
+end
+```
+
+客户端做的事：
+
+1. 遍历 18 个白名单组件
+2. 如果实体有 `_health` 标签（主机上那边加的，随 pristine state 一起同步过来），就 `ReplicateComponent("health")`——**在客户端挂一个 `health_replica`**
+3. 所有 replica 挂好后，回调 `inst.OnEntityReplicated`（回顾 5.2.4 节的生命周期回调）
+
+**这条链路完美闭环**：
+
+```
+主机 AddComponent("health")
+  → ReplicateComponent("health")
+    → AddTag("_health")
+    → 主机的 inst.replica.health 实例化（以 classified 为连接点）
+
+↓ 网络同步 ↓
+
+客户端接到 pristine state（带 _health 标签）
+  → ReplicateEntity()
+    → 检测到 _health 标签
+    → ReplicateComponent("health")
+      → 客户端的 inst.replica.health 实例化
+      → health_replica 构造函数里订阅 net 变量
+```
+
+---
+
+### 5.4.5 进阶：net 变量 —— 状态变化的桥梁
+
+光有 replica 类不够，还缺最后一公里：**主机上 health 从 100 变成 90 时，客户端的 `health_replica` 怎么知道？**
+
+答案是 **net 变量**。打开 `scripts/components/stackable_replica.lua` 第 24-37 行（一个精简的 replica 示例）：
+
+```lua
+local Stackable = Class(function(self, inst)
+    self.inst = inst
+
+    self._stacksize = net_smallbyte(inst.GUID, "stackable._stacksize", "stacksizedirty")
+    self._stacksizeupper = net_smallbyte(inst.GUID, "stackable._stacksizeupper", "stacksizedirty")
+    self._ignoremaxsize = net_bool(inst.GUID, "stackable._ignoremaxsize")
+    self._maxsize = net_tinybyte(inst.GUID, "stackable._maxsize")
+
+    if not TheWorld.ismastersim then
+        inst:ListenForEvent("stacksizedirty", OnStackSizeDirty)
+    end
+end)
+```
+
+这里声明了四个 **net 变量**。`net_smallbyte / net_bool / net_tinybyte` 都是 C++ 引擎暴露的 Lua 函数——它们创建的"变量"不是普通 Lua 值，而是**一个会自动在主机和客户端之间同步的网络变量**。
+
+**net 变量常见类型**：
+
+| 类型 | 数据范围 | 典型用途 |
+|------|----------|----------|
+| `net_bool` | 1 bit | 状态开关（是否着火、是否冻住） |
+| `net_tinybyte` | 4 bit (0-15) | 很小的枚举 |
+| `net_smallbyte` | 6 bit (0-63) | 小型计数（stack size 低位） |
+| `net_byte` | 8 bit (0-255) | 一般计数 |
+| `net_shortint` | 16 bit | 百分比、血量等 |
+| `net_uint` | 32 bit | 长整型 |
+| `net_float` | 浮点 | 连续值（温度、朝向） |
+| `net_string` | 字符串 | 名字、消息 |
+| `net_entity` | 另一个实体的 GUID | 引用另一个实体 |
+| `net_hash` | 哈希值 | prefab 名、事件名 |
+| `net_event` | 仅事件信号，无值 | 触发客户端事件 |
+
+**构造参数三件套**：
+
+```lua
+net_xxx(inst.GUID, "唯一标识符", "变化时触发的事件名")
+```
+
+- `inst.GUID`：归属的实体
+- `"唯一标识符"`：在这个实体内的唯一名字（用于 C++ 引擎识别）
+- `"xxxdirty"`：**当值改变时，引擎会自动在该实体上 `PushEvent("xxxdirty")`**——客户端只需要 `ListenForEvent("xxxdirty", ...)` 就能知道"状态变了，该刷新 UI 了"
+
+#### 服务端写、客户端读
+
+以 `stackable` 为例看完整的数据流：
+
+**服务端**（`scripts/components/stackable.lua` 第 3-9 行）：
+
+```lua
+local function onstacksize(self, stacksize)
+    self.inst.replica.stackable:SetStackSize(stacksize)
+    -- ...
+end
+```
+
+当真实的 `self.stacksize` 改变时（比如 `stackable:SetStackSize(5)`），自动调用 `replica.stackable:SetStackSize(5)`。后者内部（`stackable_replica.lua` 第 47-64 行）：
+
+```lua
+function Stackable:SetStackSize(stacksize)
+    stacksize = stacksize - 1
+    if stacksize <= 63 then
+        self._stacksizeupper:set(0)
+        self._stacksize:set(stacksize)
+    -- ...
+    end
+end
+```
+
+`:set(value)` 是**写入 net 变量的专用方法**。一旦写入，C++ 引擎就会把这次变化打包发给所有客户端。
+
+**客户端**（`stackable_replica.lua` 第 11-22 行）：
+
+```lua
+local function OnStackSizeDirty(inst)
+    local self = inst.replica.stackable
+    -- ...
+    self:ClearPreviewStackSize()
+    inst:PushEvent("inventoryitem_stacksizedirty")
+end
+
+-- 构造函数里注册监听
+if not TheWorld.ismastersim then
+    inst:ListenForEvent("stacksizedirty", OnStackSizeDirty)
+end
+```
+
+客户端监听 `"stacksizedirty"` 事件——net 变量一变，引擎自动 push 这个事件，客户端跟着做必要的响应（如清理预览值、通知 inventoryitem replica 更新）。
+
+读取值也有专用方法 `:value()`——如 `stackable_replica.lua` 第 106-108 行：
+
+```lua
+function Stackable:StackSize()
+    return self:GetPreviewStackSize() or (self._stacksizeupper:value() * 64 + self._stacksize:value() + 1)
+end
+```
+
+客户端 UI 问"这堆东西有多少个？"，最终走到 net 变量的 `:value()`。
+
+---
+
+### 5.4.6 老手进阶：一把 `spear` 的完整旅程
+
+把前面所有内容串起来，跟着一把长矛走一遍完整流程：
+
+```
+═════════════════════════════════════════════════════════════════════════
+Phase 1: 主机生成长矛
+═════════════════════════════════════════════════════════════════════════
+
+玩家按下合成按钮 / 控制台 c_spawn("spear")
+         ↓
+    SpawnPrefab("spear")    [scripts/mainfunctions.lua: 403]
+         ↓
+    TheSim:SpawnPrefab → C++
+         ↓ C++ 回调
+    SpawnPrefabFromSim("spear")    [scripts/mainfunctions.lua: 347]
+         ↓
+    prefab.fn(TheSim)   ← 这就是 scripts/prefabs/spear.lua 的 fn
+         ↓
+    ┌─ 工厂函数 fn 的执行（主机版）────────────────────────────────┐
+    │   inst = CreateEntity()                                        │
+    │   inst.entity:AddTransform() / AddAnimState() / AddNetwork()   │ 上半段
+    │   MakeInventoryPhysics(inst)                                   │ 主机也跑
+    │   AnimState:SetBank("spear") / SetBuild("swap_spear")          │
+    │   inst:AddTag("sharp") / "pointy" / "weapon"                   │
+    │   MakeInventoryFloatable(inst, "med", ...)                     │
+    │                                                                 │
+    │   inst.entity:SetPristine()   ← ★ 引擎此时保存 pristine 快照  │
+    │   if not TheWorld.ismastersim then return inst end  ←  false   │
+    │     ↓ 主机继续                                                  │
+    │   inst:AddComponent("weapon")   → ReplicateComponent("weapon")  │
+    │     ↓ 但 weapon 不在白名单                                       │
+    │     → 无操作                                                     │
+    │   inst:AddComponent("finiteuses")  → 同上，无 replica           │ 下半段
+    │   inst:AddComponent("inventoryitem") → 白名单！                  │ 仅主机
+    │     → AddTag("_inventoryitem")                                  │
+    │     → 主机创建 inventoryitem_replica 实例                       │
+    │   inst:AddComponent("equippable") → 白名单！                    │
+    │     → AddTag("_equippable")                                     │
+    │     → 创建 equippable_replica                                   │
+    │   MakeHauntableLaunch(inst) → AddComponent("hauntable")         │
+    │     → hauntable 不在白名单，无 replica                          │
+    └─────────────────────────────────────────────────────────────────┘
+         ↓
+    Mod 的 AddPrefabPostInit("spear", fn) 被执行（5.1.5 节）
+         ↓
+    TheWorld:PushEvent("entity_spawned", inst)
+         ↓
+    引擎把「pristine 快照 + 标签列表」打包成网络包
+
+═════════════════════════════════════════════════════════════════════════
+Phase 2: 网络同步到客户端
+═════════════════════════════════════════════════════════════════════════
+
+主机把数据通过网络发给所有客户端
+         ↓
+    客户端 C++ 引擎收到实体创建包
+         ↓
+    在客户端也调用 SpawnPrefabFromSim("spear") ← 注意是同一段代码
+         ↓
+    ┌─ 工厂函数 fn 的执行（客户端版）──────────────────────────────┐
+    │   inst = CreateEntity()                                        │
+    │   inst.entity:AddTransform() / AddAnimState() / AddNetwork()   │ 上半段
+    │   MakeInventoryPhysics(inst)                                   │ 客户端也跑
+    │   AnimState:SetBank / SetBuild                                 │ （和主机一致）
+    │   inst:AddTag("sharp") / "pointy" / "weapon"                   │
+    │   MakeInventoryFloatable(inst, ...)                            │
+    │                                                                 │
+    │   inst.entity:SetPristine()   ← 客户端达到与主机同步的起点     │
+    │   if not TheWorld.ismastersim then return inst end  ←  true    │
+    │     ↓ 客户端到此停止                                            │
+    │   return inst                                                  │
+    └─────────────────────────────────────────────────────────────────┘
+         ↓
+    此时主机发来的 pristine state 被反序列化——包括标签 _inventoryitem、_equippable
+         ↓
+    引擎触发 ReplicateEntity()    [scripts/entityreplica.lua: 75]
+         ↓
+    遍历 REPLICATABLE_COMPONENTS 白名单
+         ↓
+    检测到 _inventoryitem 标签 → ReplicateComponent("inventoryitem")
+         → 客户端创建 inventoryitem_replica
+         → 其构造函数内部声明 net 变量订阅服务端状态
+    检测到 _equippable 标签 → ReplicateComponent("equippable")
+         → 客户端创建 equippable_replica
+         ↓
+    如果 inst.OnEntityReplicated 存在，此时被调用
+         ↓
+    客户端的长矛"完全就位"——玩家看得见、能点击
+
+═════════════════════════════════════════════════════════════════════════
+Phase 3: 运行时状态变化
+═════════════════════════════════════════════════════════════════════════
+
+玩家在主机用长矛攻击 → 消耗 1 次耐久
+         ↓
+    主机的 finiteuses:Use() 内部触发 replica 更新
+         ↓
+    net_xxx:set(new_value)   ← 写入 net 变量
+         ↓
+    C++ 引擎打包变化广播给客户端
+         ↓
+    客户端 net 变量自动更新 → 触发 "xxxdirty" 事件
+         ↓
+    客户端 UI 监听者刷新（比如耐久条）
+```
+
+**有了这张图，你就能解释所有"为什么"了**：
+
+- **为什么工厂函数要分两段写？** 因为主客双执行，而 Lua 组件只属于主机。
+- **为什么 `_health / _inventoryitem` 这种下划线标签是标准约定？** 因为它们是 replica 系统的"组件标记"，靠 pristine state 同步。
+- **为什么一些 prefab 有 `"weapon (from weapon component) added to pristine state for optimization"` 这种注释？** 看 `scripts/prefabs/spear.lua` 第 44-45 行——`weapon` 组件本来要加 `"weapon"` 标签，但 `weapon` 不在白名单，默认不会把 `"weapon"` 标签同步到客户端。但客户端又需要这个标签识别"这是武器"。所以官方**手动提前在 pristine 阶段加了 `"weapon"` 标签**，跟着 pristine state 一起同步，省了单独走 replica 的开销。类似的还有 `player_common.lua` 第 2485-2492 行手动加的 `_health / _hunger / _sanity / _builder / _combat / _moisture / _sheltered / _rider` 标签：
+
+```lua
+--Sneak these into pristine state for optimization
+inst:AddTag("_health")
+inst:AddTag("_hunger")
+inst:AddTag("_sanity")
+inst:AddTag("_builder")
+inst:AddTag("_combat")
+inst:AddTag("_moisture")
+inst:AddTag("_sheltered")
+inst:AddTag("_rider")
+```
+
+注释里写得很清楚：**"Sneak these into pristine state for optimization"（为了优化，把这些偷偷塞进 pristine 状态里）**。效果是玩家客户端一接到实体就知道要准备 `health / hunger / sanity` 这些 replica——不用等 `ReplicateComponent` 在实体到达后再加 tag 再同步。这是关键的"玩家角色预热"性能优化。
+
+---
+
+### 5.4.7 老手进阶：Mod 写 Pristine/Replica 时的陷阱
+
+理解了原理，我们来看 Mod 开发中**最容易踩的 5 个坑**：
+
+#### 陷阱 1：在客户端访问 `inst.components.xxx`
+
+```lua
+-- 错误示例
+local function OnClientUpdate(inst)
+    local hp = inst.components.health.currenthealth  -- ← 客户端上 components.health 不存在！
+end
+```
+
+**客户端没有 `inst.components.health`**——它只有 `inst.replica.health`。正确写法：
+
+```lua
+local function OnClientUpdate(inst)
+    -- 两边通用的安全写法
+    local hp = inst.replica.health:GetCurrent()       -- 同时支持主客
+    -- 或：
+    local current = (inst.components.health and inst.components.health.currenthealth)
+                    or (inst.replica.health and inst.replica.health:GetCurrent())
+                    or 0
+end
+```
+
+注意 `health_replica.lua` 第 100-108 行的 `GetCurrent` 已经内部做了双路兼容：
+
+```lua
+function Health:GetCurrent()
+    if self.inst.components.health ~= nil then
+        return self.inst.components.health.currenthealth    -- 主机走这
+    elseif self.classified ~= nil then
+        return self.classified.currenthealth:value()        -- 客户端走这
+    else
+        return 100
+    end
+end
+```
+
+所以**调用 `inst.replica.health:GetCurrent()` 在主客两边都能工作**——它是统一的查询接口。这就是为什么很多 Mod 作者推荐"能用 replica 就用 replica"。
+
+#### 陷阱 2：在 `SetPristine` 之前 `AddComponent`
+
+```lua
+-- 反例：随意乱写的顺序
+local function fn()
+    local inst = CreateEntity()
+    inst.entity:AddTransform()
+    inst.entity:AddNetwork()
+    
+    inst:AddComponent("health")    -- ← 在 SetPristine 之前就加了主机组件？
+    inst.components.health:SetMaxHealth(100)
+    
+    inst.entity:SetPristine()
+    -- ...
+end
+```
+
+两个问题：
+
+1. **客户端也会执行 `AddComponent("health")`**——但客户端根本不需要主机版的 `health` 组件，纯浪费。
+2. `ReplicateComponent("health")` 会在两边都跑一次，客户端凭空多了个 replica，但它的 classified 连接可能错乱。
+
+正确顺序：`SetPristine` → `if not ismastersim then return` → 之后才 `AddComponent`。
+
+> **例外**：官方偶尔会故意在 pristine 阶段加 Lua 组件——比如 `spear.lua` 第 49 行前就加了 `MakeInventoryFloatable`（内部 `AddComponent("floater")`）。这是因为 `floater` 是**客户端也需要看的视觉组件**——它靠覆盖动画来表现"在水上漂"，客户端必须能算出视觉。**规则不是绝对的，而是"是否客户端需要"**——需要就加在 pristine 前，不需要就加在后面。
+
+#### 陷阱 3：自定义组件想让客户端也能访问
+
+Mod 里常见场景：你加了自己的组件 `mymod_mightiness`，想让客户端的 UI 显示它的值。默认情况下这个组件**不会**被 replicate（不在白名单）。怎么做？
+
+**方案 A（推荐）：注册成可 replicated 组件 + 提供 replica 类**
+
+```lua
+-- 在 modmain.lua 里
+AddReplicableComponent("mymod_mightiness")
+```
+
+然后在 `scripts/components/mymod_mightiness_replica.lua` 里写对应的 replica 类，结构照抄 `health_replica.lua`。
+
+`AddReplicableComponent` 在 `scripts/entityreplica.lua` 第 98-100 行定义：
+
+```lua
+function AddReplicableComponent(name)
+    REPLICATABLE_COMPONENTS[name] = true
+end
+```
+
+就是把你的组件名加到白名单里。之后 `AddComponent("mymod_mightiness")` 会自动 `ReplicateComponent`。
+
+**方案 B（简单需求）：用 `net_xxx` 变量挂到 `inst` 上直接同步**
+
+不想写完整的 replica 类？只有一两个字段要同步？直接 `net_xxx`：
+
+```lua
+-- 在 pristine 前（两边都跑）
+inst._mightiness = net_shortint(inst.GUID, "mymod._mightiness", "mightinessdirty")
+
+-- 在 SetPristine 之后（仅主机）
+inst._mightiness:set(100)    -- 服务端写
+```
+
+客户端 `inst._mightiness:value()` 读即可。看 `wolfgang.lua` 的 `_isavatar = net_bool(...)` 就是这种写法。适合"单值"场景。
+
+#### 陷阱 4：在 pristine 之前用 `inst.components.xxx`
+
+有些 Mod 作者想在 pristine 之前就配置组件参数：
+
+```lua
+-- 反例
+inst:AddComponent("floater")
+inst.components.floater:SetSize("med")   -- ← 在 pristine 之前就取用组件
+inst.entity:SetPristine()
+```
+
+问题是**客户端也会跑这行**——客户端虽然也加了 `floater` 组件（前面说过 floater 是例外），但如果这个组件只存在服务端（比如 `health`），`inst.components.health` 在客户端是 `nil`，`:SetMaxHealth` 会抛 "attempt to index a nil value"。
+
+保险写法：**把需要访问 `components` 的调用一律放到 pristine 之后、`ismastersim` 判断之内**。`MakeXxx` 辅助函数除外——它们内部自己判断过了。
+
+#### 陷阱 5：以为 `inst.OnEntityReplicated` 是服务端回调
+
+```lua
+-- 反例
+inst.OnEntityReplicated = function(inst)
+    inst.components.weapon:SetDamage(100)  -- ← components.weapon 在客户端是 nil！
+end
+```
+
+回顾 5.2.4 节——`OnEntityReplicated` **只在客户端触发**。它的作用是"客户端在 replica 挂好之后做最终初始化"。这里如果要访问，应该用 `inst.replica.xxx`。
+
+---
+
+### 5.4.8 小结
+
+- **联机版的 Prefab 文件在主机和客户端上都会被加载、执行**——这就是"两段式"写法的根本原因。
+- **`TheWorld.ismastersim`** 来自 `TheNet:GetIsMasterSimulation()`：主机上 `true`，客户端上 `false`。`if not TheWorld.ismastersim then return inst end` 是两段的边界。
+- **`inst.entity:SetPristine()`** 告诉引擎"当前状态是这个实体的初始快照，保存起来发给后续加入的客户端"。此后主机的修改走 replica 系统增量同步。
+- **Pristine state 同步** = 打包快照一次性发送；**运行时状态同步** = net 变量增量推送。两种机制对应工厂函数的两段代码。
+- **Replica 系统** = 白名单（`REPLICATABLE_COMPONENTS` 共 18 个）+ `components/xxx_replica.lua` 镜像类 + `_xxx` 标签作为信号。主机 `AddComponent` 时自动 `ReplicateComponent`，客户端通过标签识别并创建 replica。
+- **net 变量**（`net_bool / net_byte / net_string / net_entity / net_event` 等）是主客之间自动同步的"桥梁变量"。`:set(v)` 写、`:value()` 读、变化时 push `xxxdirty` 事件。
+- **跟着一把长矛走一遍完整流程**：主机生成 → pristine 打包 → 广播 → 客户端执行同一段代码到 SetPristine → 客户端 `ReplicateEntity` 按标签补齐 replica → 运行时状态变化通过 net 变量推送。
+- **写 Mod 的 5 个陷阱**：(1) 客户端用 `inst.components.xxx`（应该用 `inst.replica.xxx`）；(2) 在 pristine 前 `AddComponent`（浪费 + 错乱）；(3) 自定义组件不 replicate（用 `AddReplicableComponent` 或直接 `net_xxx`）；(4) 在 pristine 前取用 `components`（客户端可能是 nil）；(5) 把 `OnEntityReplicated` 当成服务端回调（它只在客户端）。
+- **`sneak these into pristine state for optimization`** 是官方代码里反复出现的注释——**预先加标签到 pristine 状态**，可以避免标签走 replica 造成的延迟。`player_common.lua` 第 2485-2492 行的 `_health / _hunger / _sanity` 等标签就是这种优化。
+
+> **下一节预告**：5.5 节我们专门讲一下贯穿这一章反复出现的 **Tags 系统** —— 实体的"标签身份"。为什么在联机版里 tag 是比 component 更核心的机制？客户端靠 tag 判断战斗 / 交互资格是怎么工作的？`HasTag / AddTag` 和 `"_combat" / "playerghost" / "_burnable"` 这些下划线开头/普通命名的标签各自扮演什么角色？
+
 
 ## 5.5 Tags 系统——实体的"标签身份"
 
