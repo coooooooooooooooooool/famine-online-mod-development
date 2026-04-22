@@ -4006,7 +4006,1023 @@ end
 
 ## 6.5 SourceModifierList——多来源叠加的通用工具
 
-（待编写）
+### 本节导读
+
+这一节我们讲一个饥荒联机版里非常**优雅却被低估**的工具——`SourceModifierList`。它只有 **182 行**，但几乎每一个涉及"**数值受多个来源影响**"的组件都用到它：饥饿恢复速度、理智流失速度、战斗伤害倍率、电池耗能速率、buff/debuff 叠加⋯⋯
+
+**它解决的核心问题是**：当玩家同时受到**多个独立来源**的 buff/debuff 影响时，最终值怎么算？如果有一个来源消失了怎么自动清理？Mod 之间怎么不打架？这些看似琐碎的问题如果不用抽象工具，**每个组件都要重写一遍**——而 `SourceModifierList` 就是 Klei 提炼出的**"**通用多源修正器**"**。
+
+> **新手**从 6.5.1-6.5.3 入手，只要理解"**多源叠加问题**"、记住 `SetModifier / RemoveModifier / Get` 三件套 + 三种叠加函数（multiply/additive/boolean），就能在 Mod 里做 buff 系统；**进阶读者**从 6.5.4-6.5.6 深入 source 参数的双重语义（实体或字符串）、key 的分层机制、以及自动清理（`onremove` 事件）的妙处；**老手**跳到 6.5.7-6.5.8 看真实组件（`fueled` / `sanity` / `inventory` / `wx78_shield`）的实战应用，以及五个最容易栽的坑。
+
+**前置**：本节假设你已经读过 6.1 节（组件生命周期）和 6.4 节（Timer 组件）——`SourceModifierList` 和 Timer 是"一对老搭档"，配合最多。
+
+---
+
+### 6.5.1 快速入门：多来源叠加问题是什么？
+
+先看一个具体场景。玩家 Wilson 在某个时刻**同时受到以下影响**：
+
+- **鞋子（步行鞋）** → 移动速度 ×1.2
+- **喝了加速药水** → 移动速度 ×1.5（持续 60 秒）
+- **骑了一只牛** → 移动速度 ×2.0
+- **踩到蜘蛛网** → 移动速度 ×0.5
+- **Wilson 有大胡子 buff** → 移动速度 ×1.1
+
+**最终玩家的移动速度应该是多少？**
+
+按 Klei 的设计逻辑，答案是：**`基础速度 × 1.2 × 1.5 × 2.0 × 0.5 × 1.1`**——每个来源按乘法叠加。
+
+#### 这个问题的"**坏写法**"
+
+没有工具时，程序员常见的错误写法：
+
+```lua
+-- ❌ 错：一堆 if 硬编码
+function CalculateSpeed(inst)
+    local speed = BASE_SPEED
+    if inst:HasTag("boots") then speed = speed * 1.2 end
+    if inst.components.sanity:IsInsane() then speed = speed * 0.8 end
+    if inst._has_speed_potion then speed = speed * 1.5 end
+    if inst.components.rider:IsRiding() then speed = speed * 2.0 end
+    -- ... 几十行 if ...
+    return speed
+end
+```
+
+**这种写法的问题**：
+
+1. **难以扩展**：想加一个新 buff，要改这个函数
+2. **难以清理**：药水 buff 到期了，要手动把 `_has_speed_potion` 设为 false
+3. **难以查询**：UI 想显示"当前被几个 buff 影响"——拿不到列表
+4. **Mod 冲突**：Mod A 和 Mod B 都想加速，谁先谁后？
+5. **状态溢出**：临时实体（加速药水）消失后忘了清理，`_has_speed_potion` 永远是 true
+
+#### Klei 的解法：`SourceModifierList`
+
+**核心思路**：每个组件维护一个 `SourceModifierList` 实例——**所有外部 buff/debuff 只需要调用 `SetModifier / RemoveModifier`**，内部自动：
+
+- **叠加计算**（按指定函数：乘法 / 加法 / 布尔或）
+- **自动清理**（来源实体被销毁时，自动移除它的 modifier）
+- **精确查询**（"当前有哪些来源？"、"最终值是多少？"）
+- **命名隔离**（不同来源用不同的 key，互不干扰）
+
+看最简单的用法——`scripts/components/fueled.lua` 第 87-90 行：
+
+```87:90:scripts/components/fueled.lua
+    self.maxfuel = 0
+    self.currentfuel = 0
+    self.rate = 1
+	self.rate_modifiers = SourceModifierList(self.inst)
+```
+
+**一行 `SourceModifierList(self.inst)` 就搞定了一个完整的"多源修正系统"**——之后任何外部代码调 `self.rate_modifiers:SetModifier(source, multiplier, key)` 就能影响 `rate`，`SourceModifierList` 自己管理所有清理工作。
+
+#### 另一个实战使用
+
+看 `scripts/prefabs/winona_battery_high.lua` 第 42-46 行：
+
+```42:46:scripts/prefabs/winona_battery_high.lua
+	if mult ~= 1 then
+		inst.components.fueled.rate_modifiers:SetModifier(inst, mult, "efficiency")
+	else
+		inst.components.fueled.rate_modifiers:RemoveModifier(inst, "efficiency")
+	end
+```
+
+**三行代码实现了"如果倍率不是 1 就设置，否则移除"**——省了几十行 if 判断。这就是 `SourceModifierList` 的简洁之美。
+
+> **新手记忆**：**"多个来源同时影响一个数值"——用 `SourceModifierList`**。不要自己写 if 分支，也不要用布尔字段记录状态。Klei 把这个问题抽象得很干净，直接用就行。
+
+---
+
+### 6.5.2 快速入门：SourceModifierList 的核心 API
+
+打开 `scripts/util/sourcemodifierlist.lua`——只有 **182 行**，超级简洁。我们一步步拆。
+
+#### 构造函数
+
+看第 8-23 行：
+
+```8:23:scripts/util/sourcemodifierlist.lua
+SourceModifierList = Class(function(self, inst, base_value, fn, dirtycb)
+    self.inst = inst
+
+    -- Private members
+    self._modifiers = {}
+    if base_value ~= nil then
+        self._modifier = base_value
+        self._base = base_value
+    else
+        self._modifier = 1
+        self._base = 1
+    end
+
+    self._fn = fn or SourceModifierList.multiply
+	self._dirtycb = dirtycb
+end)
+```
+
+**四个参数**（前两个必填，后两个可选）：
+
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `inst` | 必填 | 归属于哪个实体（用于事件监听） |
+| `base_value` | `1` | 基础值（没有任何 modifier 时的值） |
+| `fn` | `multiply` | 叠加函数（怎么把多个 modifier 组合） |
+| `dirtycb` | `nil` | 值变化时的回调（`fn(inst, new_value)`） |
+
+**三种常用的创建方式**：
+
+```lua
+-- ① 最简单：乘法叠加，基础值 1（对应"倍率"场景）
+self.rate_modifiers = SourceModifierList(self.inst)
+
+-- ② 加法叠加，基础值 0（对应"加值"场景）
+self.externalmodifiers = SourceModifierList(self.inst, 0, SourceModifierList.additive)
+
+-- ③ 布尔或，基础值 false（对应"只要有一个来源就 true"场景）
+self.neg_aura_immune_sources = SourceModifierList(inst, false, SourceModifierList.boolean)
+```
+
+这三种你在 `scripts/components/sanity.lua` 第 78-99 行能看到全部用到——理智组件本身就用了 **7 个** `SourceModifierList` 实例处理各种修正。
+
+#### API 1：`Get` —— 获取当前值
+
+```38:40:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:Get()
+	return self._modifier
+end
+```
+
+**最常用的 API**——返回所有来源叠加后的最终值。
+
+**使用场景**：
+
+```lua
+-- 实际计算某个受 modifier 影响的值时
+local final_rate = self.rate * self.rate_modifiers:Get()
+```
+
+---
+
+#### API 2：`SetModifier` —— 设置/更新 modifier
+
+```64:99:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:SetModifier(source, m, key)
+	if source == nil then
+		return
+	end
+
+    if key == nil then
+        key = "key"
+    end
+
+    if m == nil or m == self._base then
+        self:RemoveModifier(source, key)
+        return
+    end
+
+    local src_params = self._modifiers[source]
+    if src_params == nil then
+        self._modifiers[source] = {
+            modifiers = { [key] = m },
+        }
+
+        -- If the source is an object, then add a onremove event listener to cleanup if source is removed from the game
+		if EntityScript.is_instance(source) then
+            self._modifiers[source].onremove = function(source)
+                self._modifiers[source] = nil
+				self:RecalculateModifier()
+            end
+
+            self.inst:ListenForEvent("onremove", self._modifiers[source].onremove, source)
+        end
+
+		self:RecalculateModifier()
+    elseif src_params.modifiers[key] ~= m then
+        src_params.modifiers[key] = m
+		self:RecalculateModifier()
+    end
+end
+```
+
+**签名**：`SetModifier(source, m, key)`
+
+| 参数 | 类型 | 含义 |
+|------|------|------|
+| `source` | Entity 或 string | 这个 modifier 的"来源"——可以是一个实体，也可以是一个字符串名 |
+| `m` | number/bool | 这个 modifier 的值 |
+| `key` | string（可选）| 同一来源可以有多个 modifier，用 key 区分 |
+
+**内部做了 5 件事**：
+
+1. **防御**：`source == nil` 直接返回
+2. **默认 key**：没传 key 就用 `"key"` 作为默认值
+3. **如果 m 等于 base_value 就调 `RemoveModifier`**——相当于 "setter 返回默认值就自动移除"（这是一个贴心的优化）
+4. **如果 source 是实体，自动注册 onremove 监听器**——实体销毁时 modifier 自动移除
+5. **调 `RecalculateModifier`**——重新计算 `_modifier`
+
+**实战使用**（`winona_battery_low.lua` 第 283-284 行）：
+
+```lua
+inst.components.fueled.rate_modifiers:SetModifier(inst, CalcFuelRateRescale(inst), "rescale")
+```
+
+**同一个组件可以有多个 key**——`"rescale"` / `"efficiency"` / `"shard"` 各代表一个独立的 modifier。
+
+---
+
+#### API 3：`RemoveModifier` —— 移除 modifier
+
+```103:122:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:RemoveModifier(source, key)
+    local src_params = self._modifiers[source]
+    if src_params == nil then
+        return
+    elseif key ~= nil then
+        src_params.modifiers[key] = nil
+        if next(src_params.modifiers) ~= nil then
+            --this source still has other keys
+			self:RecalculateModifier()
+            return
+        end
+    end
+
+    --remove the entire source
+    if src_params.onremove ~= nil then
+        self.inst:RemoveEventCallback("onremove", src_params.onremove, source)
+    end
+    self._modifiers[source] = nil
+	self:RecalculateModifier()
+end
+```
+
+**两种粒度**：
+
+- **`RemoveModifier(source)`**（不传 key）——移除这个 source 的**所有** modifier
+- **`RemoveModifier(source, key)`**——只移除这个 source 下的某一个 key 的 modifier，其他 key 保留
+
+**智能清理**：如果 source 下所有 key 都被移除了（`next(src_params.modifiers) == nil`），就会**解除 onremove 事件监听**、并移除整个 source——避免内存泄漏。
+
+---
+
+#### API 4：`IsEmpty / HasAnyModifiers / HasModifier` —— 存在性查询
+
+```42:44:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:IsEmpty()
+	return next(self._modifiers) == nil
+end
+```
+
+```177:179:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:HasAnyModifiers()
+	return next(self._modifiers) ~= nil
+end
+```
+
+```169:175:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:HasModifier(source, key)
+    local src_params = self._modifiers[source]
+    if src_params == nil then
+        return false
+    end
+    return src_params.modifiers[key] ~= nil
+end
+```
+
+**使用场景**：
+
+```lua
+-- 判断有没有任何 speed buff
+if self.externalmodifiers:HasAnyModifiers() then
+    -- 显示"buff 中"的 UI 图标
+end
+
+-- 判断特定来源是否有 modifier
+if self.externalmodifiers:HasModifier(inst, "potion") then
+    -- 这个实体已经喝过药水了
+end
+```
+
+---
+
+#### API 5：`Reset` —— 一次性清空
+
+```124:135:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:Reset()
+	for source, src_params in pairs(self._modifiers) do
+		if src_params.onremove then
+			self.inst:RemoveEventCallback("onremove", src_params.onremove, source)
+		end
+		self._modifiers[source] = nil
+	end
+	self._modifier = self._base
+	if self._dirtycb then
+		self._dirtycb(self.inst, self._modifier)
+	end
+end
+```
+
+**清空所有 modifier + 解除所有事件监听器 + 重置为 base_value + 触发 dirtycb**。
+
+**使用场景**：实体死亡时清空所有 buff、角色切换形态时重置属性等。
+
+---
+
+### 6.5.3 快速入门：三种叠加函数
+
+`SourceModifierList` 提供了三种内置叠加函数（定义在第 25-35 行）：
+
+```25:35:scripts/util/sourcemodifierlist.lua
+SourceModifierList.multiply = function(a, b)
+	return a * b
+end
+
+SourceModifierList.additive = function(a, b)
+	return a + b
+end
+
+SourceModifierList.boolean = function(a, b)
+    return a or b
+end
+```
+
+#### `multiply`（默认）
+
+**典型场景**：倍率类数值——**速度倍率**、**伤害倍率**、**能量消耗倍率**等。
+
+**公式**：`final = base × mod1 × mod2 × ... × modN`
+
+**举例**：Winona 电池的能量消耗倍率（`fueled.rate_modifiers`）：
+
+- **基础**：1.0（正常消耗）
+- **效率模块加成**：0.8（消耗更慢）
+- **过载惩罚**：1.5（消耗更快）
+- **最终**：1.0 × 0.8 × 1.5 = 1.2
+
+**创建方式**：`SourceModifierList(inst)` —— **不传第三个参数，默认 multiply**。
+
+#### `additive`
+
+**典型场景**：加值类数值——**外部理智回复速度**、**攻击伤害加成**等。
+
+**公式**：`final = base + mod1 + mod2 + ... + modN`
+
+**举例**：Wilson 外部理智恢复速度（`sanity.externalmodifiers`）：
+
+- **基础**：0（没有任何外部恢复）
+- **帅气发型 buff**：+1（每秒 +1 理智）
+- **读了某本书**：+0.5（每秒 +0.5 理智）
+- **最终**：0 + 1 + 0.5 = 1.5
+
+**创建方式**：`SourceModifierList(inst, 0, SourceModifierList.additive)`——**基础值 0**（加法中的中性元素）。
+
+看 `scripts/components/sanity.lua` 第 87 行：
+
+```87:87:scripts/components/sanity.lua
+	self.externalmodifiers = SourceModifierList(self.inst, 0, SourceModifierList.additive)
+```
+
+#### `boolean`
+
+**典型场景**：**"只要有一个来源说 true 就 true"**——免疫某种效果、启用某个系统等。
+
+**公式**：`final = mod1 or mod2 or ... or modN`
+
+**举例**：Wendy 对鬼魂的理智光环免疫（`sanity.player_ghost_immune_sources`）：
+
+- **基础**：false（默认不免疫）
+- **Wendy 技能树解锁免疫**：true（她免疫）
+- **其他玩家**：false（保持）
+- **Wendy 最终**：true（免疫）
+- **其他玩家最终**：false（受影响）
+
+**创建方式**：`SourceModifierList(inst, false, SourceModifierList.boolean)`——**基础值 false**（or 的中性元素）。
+
+看 `scripts/components/sanity.lua` 第 79 行：
+
+```79:79:scripts/components/sanity.lua
+	self._lunacy_sources = SourceModifierList(inst, false, SourceModifierList.boolean)
+```
+
+#### 自定义叠加函数
+
+你也可以传入**任意自定义函数**。比如想要"**取最大值**"：
+
+```lua
+local function MaxOf(a, b)
+    return math.max(a, b)
+end
+
+self.maxtaken_modifiers = SourceModifierList(inst, 0, MaxOf)
+```
+
+**典型场景**："**只取最严重的 debuff，不叠加**"——比如多种减速效果中取最强的。
+
+#### 三者对照表
+
+| 叠加类型 | 基础值 | 中性元素 | 典型场景 |
+|---------|--------|----------|---------|
+| multiply | 1 | 1（乘 1 不变）| 速度/伤害倍率 |
+| additive | 0 | 0（加 0 不变）| 加值类回复/伤害 |
+| boolean | false | false（or false 不变）| 免疫/启用标记 |
+| max | 0 or -∞ | -∞ | 取最强效果 |
+| min | ∞ | ∞ | 取最弱效果 |
+
+> **新手记忆**：**先想"**基础状态是什么**"——倍率 1.0、加值 0、免疫 false——再用对应的叠加函数**。选错叠加函数会导致数值灾难（乘法里 base 设 0 → 永远 0）。
+
+---
+
+### 6.5.4 进阶：source 参数的设计——实体引用 vs 字符串标识
+
+`SetModifier` 的第一个参数 `source` 是整个系统的灵魂——它接受两种类型：**实体（EntityScript 实例）** 或 **字符串/任意值**。
+
+#### 实体作为 source：自动清理
+
+看源码第 85-92 行的关键逻辑：
+
+```85:92:scripts/util/sourcemodifierlist.lua
+		if EntityScript.is_instance(source) then
+            self._modifiers[source].onremove = function(source)
+                self._modifiers[source] = nil
+				self:RecalculateModifier()
+            end
+
+            self.inst:ListenForEvent("onremove", self._modifiers[source].onremove, source)
+        end
+```
+
+**如果 source 是实体**，会自动：
+
+1. **创建 onremove 回调**——实体被销毁时执行
+2. **在 source 实体上 `ListenForEvent("onremove")`**——监听源实体的消失事件
+3. 销毁时自动从 `_modifiers` 中清理对应条目
+
+**使用场景**：
+
+```lua
+-- 喝了加速药水：药水实体是 source
+inst.components.locomotor.externalmodifiers:SetModifier(potion_entity, 1.5)
+
+-- 玩家丢下药水（药水实体销毁）
+-- → SourceModifierList 自动收到 potion_entity 的 onremove 事件
+-- → 自动 RemoveModifier
+-- → 玩家的加速效果消失
+```
+
+**精髓**：**你不用自己写清理代码**——Klei 已经帮你捆绑了"源实体生命周期"和"modifier 生命周期"。
+
+#### 字符串/任意值作为 source：手动管理
+
+看 `scripts/prefabs/winona_battery_high.lua` 第 42-46 行：
+
+```lua
+if mult ~= 1 then
+    inst.components.fueled.rate_modifiers:SetModifier(inst, mult, "efficiency")
+else
+    inst.components.fueled.rate_modifiers:RemoveModifier(inst, "efficiency")
+end
+```
+
+**注意这里 `source` 传的是 `inst` 本身**——电池自己作为 source，key 用 `"efficiency"` 区分。
+
+**为什么不用字符串？** 看另一个例子（`sanity.lua` 第 224 行）：
+
+```lua
+sources:SetModifier(source or self.inst, true)
+```
+
+**可以用字符串或实体**——只要是可以做 table key 的值都行。选哪个看场景：
+
+| 选择 | 适用场景 | 好处 |
+|------|---------|------|
+| **传实体** | 这个实体"拥有"这个 modifier（如药水、buff 附着物、装备） | 实体销毁时自动清理 |
+| **传实体自己** | 组件管理自己的 modifier | 方便，固定 source |
+| **传字符串** | 全局/世界级 modifier | 语义明确，方便调试 |
+
+#### 混合使用示例
+
+一个组件可能同时有**几种不同 source 来源**：
+
+```lua
+-- sanity.lua 的 externalmodifiers 可能同时有：
+sanity.externalmodifiers:SetModifier(hat_entity, 0.5)             -- 帽子（实体 source，戴上帽子时加）
+sanity.externalmodifiers:SetModifier("codex_umbra", -0.2)          -- 暗影操纵书（字符串 source，全局规则）
+sanity.externalmodifiers:SetModifier(self.inst, 1.0, "insanity")   -- 组件自己（实体 source + key）
+```
+
+**三种 source 混合**——每种都有各自的 key 空间。SourceModifierList 内部用一个 table 存所有 source（table key 可以是任意值），都能识别。
+
+#### 实体 source 的技巧：替代手动 `ListenForEvent`
+
+**对比两种写法**——同样效果，代码量差距巨大：
+
+**手写**（locomotor.lua 老代码的做法）：
+
+```lua
+-- 注册
+inst:ListenForEvent("onremove", function()
+    self._multiplier_by_potion = nil
+    self:RecalculateSpeed()
+end, potion)
+
+-- 清理（记得对称）
+inst:RemoveEventCallback("onremove", <previous_fn>, potion)
+```
+
+**用 SourceModifierList**：
+
+```lua
+self._speed_modifiers:SetModifier(potion, 1.5)
+-- 完。销毁自动清理。
+```
+
+**这就是抽象的威力**——8 行变 1 行。
+
+---
+
+### 6.5.5 进阶：key 参数 —— 同一来源多重 modifier
+
+`SetModifier` 的第三个参数 `key` 有什么用？
+
+#### 场景：同一来源多种效果
+
+想象 **Wigfrid 唱了一首"冲锋歌"**，对自己同时施加：
+
+- **速度加成** ×1.2
+- **伤害加成** ×1.5（如果这两个都挂在同一个"buff 管理器"上）
+
+Wigfrid 自己是 source，但要区分两种不同的 modifier。用 key：
+
+```lua
+inst.components.speed_modifiers:SetModifier(inst, 1.2, "song_haste")
+inst.components.damage_modifiers:SetModifier(inst, 1.5, "song_attack")
+```
+
+#### 同一 source 多个 key 的数据结构
+
+看源码第 80-82 行：
+
+```80:82:scripts/util/sourcemodifierlist.lua
+        self._modifiers[source] = {
+            modifiers = { [key] = m },
+        }
+```
+
+**内部结构**：
+
+```lua
+self._modifiers = {
+    [source1] = {
+        modifiers = {
+            key1 = modifier1,
+            key2 = modifier2,
+            ...
+        },
+        onremove = <function>,  -- 仅当 source1 是实体时存在
+    },
+    [source2] = ...,
+}
+```
+
+**两层索引**：先按 source 分组，再按 key 分支。
+
+#### RecalculateModifier 如何遍历
+
+看第 47-58 行：
+
+```47:58:scripts/util/sourcemodifierlist.lua
+function SourceModifierList:RecalculateModifier()
+	local m = self._base
+	for source, src_params in pairs(self._modifiers) do
+        for k, v in pairs(src_params.modifiers) do
+			m = self._fn(m, v)
+        end
+    end
+	self._modifier = m
+	if self._dirtycb then
+		self._dirtycb(self.inst, m)
+	end
+end
+```
+
+**双层 for**——外层遍历 source，内层遍历每个 source 的所有 key——**每个 key 的值都参与叠加**。
+
+所以如果 Wigfrid 上有：
+- source = Wigfrid, key = "song_haste" = 1.2
+- source = Wigfrid, key = "song_attack" = 1.5
+
+那 `Get()` 返回 `base × 1.2 × 1.5 = 1.8`（如果这是一个 multiply 列表）。
+
+#### key 的命名约定
+
+| 场景 | key 命名示例 |
+|------|--------------|
+| buff 类 | `"speed_boost"`, `"attack_buff"`, `"defense_up"` |
+| 装备类 | `"boots"`, `"amulet"`, `"helmet"` |
+| 技能树 | `"wilson_torch_3"`, `"wx78_lunar_affinity"` |
+| 状态类 | `"insanity"`, `"wet"`, `"frozen"` |
+| 组件子系统 | `"rescale"`, `"efficiency"`, `"shard"` |
+
+看 `winona_battery_high.lua` 用了 `"efficiency"`, `"shard"`, `"rescale"` 三个 key——**每个代表一个独立的影响源**。
+
+#### 移除特定 key
+
+**`RemoveModifier(source, key)`**（key 不为 nil）——只移除这个 key，其他 key 保留。
+
+```lua
+-- 移除冲锋歌的速度加成，但保留攻击加成
+inst.components.speed_modifiers:RemoveModifier(inst, "song_haste")
+-- "song_attack" 仍然生效
+```
+
+#### 不传 key：只有一个 modifier 的简写
+
+```lua
+-- 等价于 SetModifier(source, m, "key")
+self.externalmodifiers:SetModifier(source, 1.5)
+```
+
+看源码第 69-71 行：
+
+```lua
+if key == nil then
+    key = "key"
+end
+```
+
+**默认 key 是字符串 `"key"`**——当同一 source 只有一个 modifier 时不用 key。
+
+> **开发逻辑**：**key 参数让"同一来源的多重效果"变得优雅**。没有 key 时你需要为每个效果创建一个新 source（可能是假实体）——有了 key 可以**共享同一 source、分组管理**。这是少见的"**语义更重要**"设计——key 让代码可读性大幅提升。
+
+---
+
+### 6.5.6 进阶：自动清理机制（`onremove` event）
+
+回到 `SetModifier` 第 85-92 行：
+
+```lua
+if EntityScript.is_instance(source) then
+    self._modifiers[source].onremove = function(source)
+        self._modifiers[source] = nil
+        self:RecalculateModifier()
+    end
+
+    self.inst:ListenForEvent("onremove", self._modifiers[source].onremove, source)
+end
+```
+
+这是 `SourceModifierList` 最精妙的设计——**自动清理**。我们把它的内部细节拆开讲。
+
+#### 为什么要自动清理？
+
+考虑一个场景：
+
+```
+t=0   玩家捡起加速药水 potion_A
+t=0   speed_modifiers:SetModifier(potion_A, 1.5)
+      现在玩家速度 ×1.5
+t=10  玩家喝了药水（potion_A 实体消失）
+      但 speed_modifiers._modifiers[potion_A] 还在！
+      玩家速度永远 ×1.5
+```
+
+**这是"**幽灵 modifier**"问题**——source 实体没了，但 modifier 还挂着，永远生效。
+
+#### Klei 的方案：绑定实体生命周期
+
+**`ListenForEvent("onremove", fn, source)`**——在 source 实体上监听 onremove 事件。当 source 被销毁时：
+
+1. source 的 `Remove` 函数被调用（5.2 节讲过）
+2. 内部 `PushEvent("onremove")` 触发
+3. **监听者（自动注册的 fn）被调用**
+4. fn 里：`self._modifiers[source] = nil` + `RecalculateModifier()`
+
+这样 modifier 的生命周期就**严格绑定**在 source 实体的生命周期上——**source 没了，modifier 也自动没**。
+
+#### ListenForEvent 的三参数形式
+
+注意 `ListenForEvent` 的用法：
+
+```lua
+self.inst:ListenForEvent("onremove", fn, source)
+--                       [事件名]   [回调] [事件发射者]
+```
+
+**第三个参数 `source`** 告诉引擎"**监听的不是 self.inst 的事件，而是 source 的事件**"——这是 EntityScript 的事件系统标准用法，见 `entityscript.lua` 里的 `ListenForEvent` 实现。
+
+**注意**：回调函数挂在 `self.inst` 上（在 `self.inst.event_listeners` 里），但绑定的是 source 的事件——**source 销毁时**会触发。
+
+#### 对称地解除监听：`RemoveModifier`
+
+看源码第 117-119 行：
+
+```lua
+if src_params.onremove ~= nil then
+    self.inst:RemoveEventCallback("onremove", src_params.onremove, source)
+end
+```
+
+**手动调 `RemoveModifier` 时会对称解除事件监听**——避免残留的回调在 source 实体上累积。
+
+#### 为什么字符串 source 不自动清理？
+
+回看第 85 行：
+
+```lua
+if EntityScript.is_instance(source) then
+```
+
+**只有 `source` 是实体时才注册 onremove**——字符串 source 没有"生命周期"概念，自然不能自动清理。
+
+**用字符串 source 时，你必须手动调 RemoveModifier**——这和传实体是两种管理哲学，要注意区分。
+
+#### 一个完整的自动清理示例
+
+```lua
+-- 制作一个"给玩家上 buff 的 Prefab"
+local buff_inst = SpawnPrefab("speed_boost_buff")  -- 假设这是一个可见的 buff 实体
+player.components.locomotor.externalmodifiers:SetModifier(buff_inst, 1.3)
+
+-- 过了 30 秒
+buff_inst:Remove()  -- 销毁 buff 实体
+
+-- 下一帧：SourceModifierList 收到 buff_inst 的 onremove 事件
+-- → 自动清理 player.components.locomotor.externalmodifiers 里的对应 modifier
+-- → player 的速度回到原来的 1.0
+```
+
+**玩家的代码一行清理都没写**——全是 `SourceModifierList` 自动处理。这对 Mod 开发者意味着：**只要你用实体作为 source，就不用担心"忘了清理 buff"的 bug**。
+
+---
+
+### 6.5.7 老手进阶：SourceModifierList 的实战应用
+
+这一节看真实组件怎么用 `SourceModifierList`——每个案例都体现了一种典型模式。
+
+#### 案例 1：fueled 组件的单 SML
+
+看 `scripts/components/fueled.lua` 第 87-90 行：
+
+```87:90:scripts/components/fueled.lua
+    self.maxfuel = 0
+    self.currentfuel = 0
+    self.rate = 1
+	self.rate_modifiers = SourceModifierList(self.inst)
+```
+
+**一个组件就一个 SML**——默认 multiply，基础值 1.0。
+
+**使用方**（`winona_battery_high.lua` 第 42-46 行）：
+
+```lua
+inst.components.fueled.rate_modifiers:SetModifier(inst, mult, "efficiency")
+inst.components.fueled.rate_modifiers:SetModifier(inst, 0, "shard")
+inst.components.fueled.rate_modifiers:SetModifier(inst, CalcFuelRateRescale(inst), "rescale")
+```
+
+**同一个 source（`inst`）** + **三个不同 key** —— 这是电池的三个独立效率调整源。
+
+**关键领悟**：电池用 `inst` 自己作为 source 是一种简化——它的所有 modifier 都跟电池本身"同生共死"，不需要复杂的来源管理。
+
+#### 案例 2：sanity 组件的多 SML
+
+看 `scripts/components/sanity.lua` 第 78-116 行——**理智组件有 7 个 SourceModifierList**：
+
+```lua
+self._lunacy_sources = SourceModifierList(inst, false, SourceModifierList.boolean)      -- 月相模式
+self.externalmodifiers = SourceModifierList(self.inst, 0, SourceModifierList.additive)  -- 外部回复速度
+self.neg_aura_modifiers = SourceModifierList(self.inst)                                  -- 负光环倍率
+self.neg_aura_immune_sources = SourceModifierList(inst, false, SourceModifierList.boolean)  -- 负光环免疫
+self.sanity_aura_immune_sources = SourceModifierList(inst, false, SourceModifierList.boolean)  -- 全光环免疫
+self.player_ghost_immune_sources = SourceModifierList(inst, false, SourceModifierList.boolean)  -- 玩家鬼魂免疫
+self.light_drain_immune_sources = SourceModifierList(inst, false, SourceModifierList.boolean)  -- 黑暗流失免疫
+```
+
+**模式特征**：
+
+- **一个组件可以有任意多个 SML**——每个管理一个独立维度
+- **名字统一规范**：`_sources`（boolean 模式）、`_modifiers`（数值模式）
+- **boolean 模式大量使用**——各种"免疫"、"模式启用"状态
+
+#### 案例 3：slipperyfeet 的布尔 SML
+
+看 `scripts/components/slipperyfeet.lua` 第 54-55 行：
+
+```54:55:scripts/components/slipperyfeet.lua
+	self.inst = inst
+	self._sources = SourceModifierList(inst, false, SourceModifierList.boolean)
+```
+
+**经典的布尔 SML**——**"只要有一个来源说'踩冰上了'就启用滑倒逻辑"**。一旦所有 source 都移除（`IsEmpty`），就关闭更新任务。
+
+#### 案例 4：efficientuser 的"SML 嵌套"
+
+看 `scripts/components/efficientuser.lua` 第 18-22 行：
+
+```18:22:scripts/components/efficientuser.lua
+    if not self.actions[action] then
+        self.actions[action] = SourceModifierList(self.inst)
+    end
+
+    self.actions[action]:SetModifier(source, multiplier)
+```
+
+**每个 action 一个 SML**——这是"**二维 modifier**"的经典模式：
+
+```
+self.actions = {
+    [ACTIONS.CHOP] = SourceModifierList(...),
+    [ACTIONS.MINE] = SourceModifierList(...),
+    [ACTIONS.DIG]  = SourceModifierList(...),
+    ...
+}
+```
+
+**使用场景**：不同动作的"消耗减免"分别管理——伐木减免 ×0.8、挖矿减免 ×0.9 ⋯⋯每个动作独立计算。
+
+#### 案例 5：wx78_shield 的 additive SML
+
+看 `scripts/components/wx78_shield.lua` 第 38-39 行：
+
+```38:39:scripts/components/wx78_shield.lua
+    self.canshieldcharge = false
+    self.chargegenerationsources = SourceModifierList(inst, 0, SourceModifierList.additive)
+```
+
+**additive 模式 + 基础值 0**——充能速率的加法叠加。
+
+- 基础：0（没有任何来源时不充能）
+- 月盾碎片加成：+0.5/秒
+- 技能树解锁加成：+0.3/秒
+- 最终：0 + 0.5 + 0.3 = 0.8/秒
+
+这是典型的"**加速度叠加**"场景——默认 0、每个来源加一部分、最终总和。
+
+#### 案例 6：locomotor 的**手写实现**（反面教材）
+
+看 `scripts/components/locomotor.lua` 第 490-530 行——它**手写了 `SetExternalSpeedMultiplier / RemoveExternalSpeedMultiplier`**：
+
+```lua
+function LocoMotor:SetExternalSpeedMultiplier(source, key, m)
+    -- 40 行的手写逻辑，和 SourceModifierList 做同样的事
+end
+
+function LocoMotor:RemoveExternalSpeedMultiplier(source, key)
+    -- 20 行手写移除
+end
+```
+
+**为什么不用 SourceModifierList？** 一种可能是**早期代码**（locomotor 是饥荒最早的组件之一，SourceModifierList 可能后出现）。
+
+**但这是"反面教材"**——手写的代码和 SourceModifierList **做一样的事，但**：
+
+- **不能复用**（两套实现）
+- **容易出错**（手写 onremove 监听要小心）
+- **难以 Mod**（其他组件用 SML，locomotor 要自己写配套代码）
+
+**如果你写自定义组件，强烈建议直接用 SourceModifierList**——不要"重新发明轮子"。
+
+> **开发逻辑**：**`SourceModifierList` 的通用性是它最大的价值**——任何涉及"多来源数值叠加"的场景都能用同一套 API。Klei 在新组件（如 `wx78_shield`、`fueled`）里全部使用它；老代码（如 `locomotor`）还保留着手写实现——这是**正在进行的"**统一重构**"**的遗迹。
+
+---
+
+### 6.5.8 老手进阶：SourceModifierList 的五个陷阱
+
+#### 陷阱 1：base_value 选错导致数值灾难
+
+```lua
+-- ❌ 错：乘法列表用 0 作基础值
+self.damage_modifiers = SourceModifierList(inst, 0, SourceModifierList.multiply)
+
+-- 然后 SetModifier(source, 2) → Get() 返回 0 × 2 = 0！永远是 0
+```
+
+**原因**：乘法的中性元素是 **1 不是 0**——0 是乘法的"**零吸收元素**"。
+
+**解决**：
+- multiply → base = 1
+- additive → base = 0
+- boolean → base = false
+
+---
+
+#### 陷阱 2：忘了 RecalculateModifier 同步到组件字段
+
+`Get()` 返回的是缓存值——SourceModifierList 在 `SetModifier / RemoveModifier` 时**自动**调用 `RecalculateModifier`。但如果你**直接**改了 `self._modifiers`（不推荐！），就要手动调用：
+
+```lua
+-- ❌ 极其危险的写法
+self._modifiers[some_source] = {modifiers = {key = 1.5}}   -- 绕过了 API
+-- Get() 返回的值是旧的！
+```
+
+**解决**：**永远用 `SetModifier` / `RemoveModifier` 公开 API**，别碰 `_modifiers` 私有字段。
+
+---
+
+#### 陷阱 3：dirtycb 回调里再次 SetModifier 导致递归
+
+```lua
+-- ❌ 错：dirtycb 里改 modifier
+local function OnDirty(inst, value)
+    inst.components.health.regen_modifiers:SetModifier(inst, value * 0.5, "derived")
+    --                                   ↑ 这又会触发 RecalculateModifier → dirtycb → 递归
+end
+
+self.regen_modifiers = SourceModifierList(inst, 1, nil, OnDirty)
+```
+
+**症状**：爆栈。
+
+**解决**：**dirtycb 里不要改同一个 SML**——要改就改别的组件。
+
+---
+
+#### 陷阱 4：实体 source 复用同一个引用
+
+```lua
+-- ❌ 错：两次 Set 不同 modifier 但 source 相同
+inst.components.speed_mods:SetModifier(player, 1.5)  -- (没 key，默认 "key")
+inst.components.speed_mods:SetModifier(player, 2.0)  -- 覆盖第一次！
+-- 最终玩家速度 ×2.0（不是 ×1.5 × ×2.0）
+```
+
+**原因**：不传 key 时默认都是 `"key"`——两次 SetModifier 是**覆盖关系**，不是叠加。
+
+**解决**：**同一 source 要叠加多个 modifier 必须用不同 key**：
+
+```lua
+inst.components.speed_mods:SetModifier(player, 1.5, "potion")
+inst.components.speed_mods:SetModifier(player, 2.0, "buff")
+-- 最终 1.0 × 1.5 × 2.0 = 3.0
+```
+
+---
+
+#### 陷阱 5：字符串 source 没手动清理
+
+```lua
+-- ❌ 错：用字符串作为 source 后忘了清理
+inst.components.speed_mods:SetModifier("temp_buff", 1.5)
+-- 几分钟后 buff 应该结束，但没人调 RemoveModifier！
+-- 玩家速度永远 ×1.5
+```
+
+**原因**：字符串 source 没有 "onremove" 事件——没有自动清理。
+
+**解决**：
+
+- **能用实体就用实体**（自动清理）
+- **必须用字符串时**，配合 Timer 组件：
+
+```lua
+-- 用 Timer 管理字符串 source 的生命周期
+inst.components.speed_mods:SetModifier("temp_buff", 1.5)
+inst.components.timer:StartTimer("clear_temp_buff", 60)
+
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "clear_temp_buff" then
+        inst.components.speed_mods:RemoveModifier("temp_buff")
+    end
+end)
+```
+
+**这是 Timer + SourceModifierList 的经典配合**——一个管生命周期，一个管数值叠加。
+
+#### 总结：何时用 SML 何时不用
+
+**该用 SML**：
+
+- 数值会被**多个独立来源**影响
+- buff / debuff 的叠加
+- 组件有"多种修正源"（如电池的 efficiency / shard / rescale）
+- 多个免疫来源（boolean 模式）
+
+**不该用 SML**：
+
+- 数值只有一个来源（过度设计）
+- 需要"有序"叠加（SML 内部遍历是无序的）
+- 需要"非线性"计算（如 2 倍和 1.5 倍不一样结果——那是另一种逻辑）
+- 只是"开关"状态（直接用 bool 字段或 tag）
+
+---
+
+### 6.5.9 小结
+
+- **`SourceModifierList` 是"多来源叠加"的通用工具**——解决 buff/debuff 从多个独立来源影响同一数值时，如何叠加、如何清理、如何查询的三大问题。
+- **构造函数 4 个参数**：`inst`（归属实体）、`base_value`（基础值）、`fn`（叠加函数）、`dirtycb`（值变化回调）——选错 `base_value + fn` 组合会导致数值灾难。
+- **三大叠加函数**：`multiply`（默认，base=1，倍率）、`additive`（base=0，加值）、`boolean`（base=false，或运算）——还可以传自定义函数（如 max/min）。
+- **核心 API 五件套**：`SetModifier(source, m, key?)` / `RemoveModifier(source, key?)` / `Get()` / `HasModifier(source, key)` / `Reset()`——99% 场景用这五个就够。
+- **source 参数的双重语义**：**实体 source** 自动绑定生命周期（`onremove` 事件自动清理）；**字符串 source** 需要手动管理（配合 Timer 组件使用）。**能用实体就用实体**。
+- **key 参数实现"同一来源多重效果"**：一个 source 下可以有多个独立 key，互不干扰——命名建议用 `"speed_boost"` / `"attack_buff"` 等语义化名字。
+- **自动清理机制**：实体 source 下，SML 在 `SetModifier` 时自动 `ListenForEvent("onremove")`，source 销毁时自动移除——**0 行清理代码**。
+- **六种实战应用**：fueled 单 SML（简单倍率）、sanity 多 SML（多维度）、slipperyfeet boolean（"任一生效"）、efficientuser 嵌套（每动作独立）、wx78_shield additive（加速度）、locomotor 手写（反面教材）。
+- **五大陷阱**：base_value 和 fn 不匹配、改私有字段绕过 API、dirtycb 里递归 SetModifier、同一 source 不传 key 导致覆盖、字符串 source 忘了清理。
+- **Timer + SML 是黄金组合**：Timer 管生命周期，SML 管数值叠加——**所有 buff 系统都可以用这个组合实现**。
+
+> **下一节预告**：6.6 节我们讲 **如何阅读和理解一个组件的源码**——这是一个"**方法论**"章节，不再讲具体工具，而是教你"**看到一个陌生组件，怎么快速读懂它**"。Klei 的 350 个组件各有规律，掌握阅读技巧后你能独立理解任意组件的内部机制。
+
 
 ## 6.6 如何阅读和理解一个组件的源码
 
