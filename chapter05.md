@@ -2307,7 +2307,520 @@ end
 
 ## 5.5 Tags 系统——实体的"标签身份"
 
-（待编写）
+### 本节导读
+
+在前面四节里，你已经见过 tag 无数次——`inst:AddTag("weapon")`、`inst:HasTag("monster")`、`TheSim:FindEntities(..., nil, SPIDER_IGNORE_TAGS, SPIDER_TAGS)`、Pristine state 偷偷夹带的 `_health` 标签……
+
+Tag（标签）几乎是**饥荒联机版中出现频率最高的机制**，超过组件（component）、超过事件（event）。它看起来"简单得没什么内容"——不就是一串字符串嘛——但实际上它承担了整个游戏的**身份识别、网络同步、世界搜索**这三大职责。
+
+> **新手**只需要 5.5.1 和 5.5.2：理解 tag 是什么，为什么要用它、什么时候用它；**进阶读者**应该吃透 5.5.3-5.5.5：tag 的 API 全貌、五类典型标签、以及 tag 和 `TheSim:FindEntities` 的组合套路；**老手**直接跳到 5.5.6-5.5.7：tag 的设计品味、Mod 里如何和 tag 系统融洽相处、以及一些进阶手法。
+
+---
+
+### 5.5.1 快速入门：Tag 是什么？
+
+**Tag 就是一串字符串**。你可以把它理解成**贴在实体身上的"身份标签纸"**：
+
+- 一把长矛身上贴着 `"weapon"`、`"sharp"`、`"pointy"` 三张标签（见 `scripts/prefabs/spear.lua` 第 41-45 行）
+- 一只蜘蛛身上贴着 `"cavedweller"`、`"monster"`、`"hostile"`、`"scarytoprey"`、`"canbetrapped"`、`"smallcreature"`、`"spider"`、`"drop_inventory_onpickup"`、`"drop_inventory_onmurder"` 九张（见 `scripts/prefabs/spider.lua` 第 586-594 行）
+- 一个玩家身上贴着 `"player"`、`"scarytoprey"`、`"character"`、`"lightningtarget"`、`"_health"`、`"_hunger"`、`"_sanity"` 等二十来张
+
+**三个基础 API**（`scripts/entityscript.lua` 第 556-574 行）：
+
+```lua
+function EntityScript:AddTag(tag)
+    self.entity:AddTag(tag)
+end
+
+function EntityScript:RemoveTag(tag)
+    self.entity:RemoveTag(tag)
+end
+
+function EntityScript:HasTag(tag)
+    return self.entity:HasTag(tag)
+end
+```
+
+可以看到——Lua 层的 `AddTag / RemoveTag / HasTag` 都是**一行转发**给 C++ 层的 `self.entity:AddTag(...)`。**真正的 tag 存储和查找都在 C++ 引擎里**，Lua 只是接口。所以它极其**轻量、高效**：查一个实体有没有 `"monster"` 标签，底层就是一次哈希集合查找。
+
+**实战示例**：
+
+```lua
+-- 加标签
+inst:AddTag("weapon")
+inst:AddTag("sharp")
+
+-- 查标签
+if inst:HasTag("monster") then
+    -- 这是个怪物
+end
+
+-- 条件式加/删
+inst:AddOrRemoveTag("isdead", health_is_zero)
+
+-- 删除标签
+inst:RemoveTag("invisible")
+```
+
+除了这三个基础 API，`EntityScript` 还提供了两个复合查询（`scripts/entityscript.lua` 第 576-594 行）：
+
+```lua
+function EntityScript:HasTags(...)        -- 等价于 HasAllTags：必须同时具备所有标签
+function EntityScript:HasOneOfTags(...)   -- 等价于 HasAnyTag：只要有其中任意一个
+```
+
+用法：
+
+```lua
+-- 同时是怪物 + 能被攻击
+if inst:HasTags("monster", "_combat") then ... end
+
+-- 蜘蛛或者蜘蛛战士
+if inst:HasOneOfTags("spider", "spider_warrior") then ... end
+
+-- 列表形式（tags 是一个 table 时）
+local HOSTILE_TAGS = {"monster", "hostile", "epic"}
+if inst:HasOneOfTags(HOSTILE_TAGS) then ... end
+```
+
+---
+
+### 5.5.2 快速入门：为什么不用组件判断，要用 tag 判断？
+
+你可能会想：判断"这是不是武器"，最直接的写法不应该是 `inst.components.weapon ~= nil` 吗？为什么官方偏要先 `inst:AddTag("weapon")` 再用 `inst:HasTag("weapon")` 去查？
+
+**两个根本原因**：
+
+#### 原因 1：客户端没有 `inst.components.xxx`
+
+回顾 5.4 节的核心知识——`components` 只在主机上存在。当客户端想判断"地上这个东西能不能当武器用"时，它**根本访问不到 `inst.components.weapon`**。
+
+但 tag 是随 pristine state 一起同步到客户端的——客户端一收到这个实体就能立刻查 `inst:HasTag("weapon")`。所以 `spear.lua` 第 44-45 行才会有那句注释：
+
+```lua
+--weapon (from weapon component) added to pristine state for optimization
+inst:AddTag("weapon")
+```
+
+**翻译一下**：`weapon` 组件本来会在自身构造时给实体加 `"weapon"` 标签，但那得等客户端收到组件数据才能加（而 `weapon` 又不在 replica 白名单）。为了让客户端提前识别，官方在 pristine 阶段就手动贴上了这张标签——**一次标签同步代替一整个组件的同步**。
+
+#### 原因 2：tag 是"最轻量的身份牌"
+
+在饥荒的引擎里，每个实体的 tag 集合是一个**紧凑的哈希表**——单次查询几乎零开销。而 `inst.components.weapon` 是一个 Lua table，检查 `~= nil` 要走 Lua 的 `__index` 元表查找，成本高几十倍。
+
+更重要的是 **`TheSim:FindEntities` 的过滤是在 C++ 里用 tag 集合做的——不需要进入 Lua**。这是一次关键的性能优化：
+
+```lua
+-- 在方圆 15 格内找所有"怪物 + 可被攻击 + 不是虚化态"的实体
+local ents = TheSim:FindEntities(x, y, z, 15,
+    { "monster", "_combat" },           -- must（必须都有）
+    { "INLIMBO", "invisible" },         -- cant（不能有）
+    { "hostile", "scarytoprey" })       -- mustoneof（至少有一个）
+```
+
+如果用组件判断，得先把范围内所有实体拉到 Lua，再一个个 `if inst.components.xxx ~= nil`——性能差距是数量级的。
+
+> **新手记忆**：**"需要两端都识别的信息 = tag；只有主机算的数据 = component"**。比如"是不是武器"用 tag；"武器剩多少耐久"用 component（并通过 replica 同步到客户端）。
+
+---
+
+### 5.5.3 进阶：Tag 的 API 速查
+
+| API | 返回 | 作用 |
+|------|------|------|
+| `inst:AddTag(tag)` | — | 加一张标签 |
+| `inst:RemoveTag(tag)` | — | 删一张标签 |
+| `inst:AddOrRemoveTag(tag, cond)` | — | 根据 `cond` 加或删 |
+| `inst:HasTag(tag)` | `bool` | 有没有这张标签 |
+| `inst:HasTags(t1, t2, ...)` | `bool` | 是否**同时**具备（= `HasAllTags`） |
+| `inst:HasOneOfTags(t1, t2, ...)` | `bool` | 是否具备**其中之一**（= `HasAnyTag`） |
+
+**搜索 API**（定义于 `scripts/simutil.lua` 和 C++ 引擎）：
+
+| API | 作用 |
+|------|------|
+| `TheSim:FindEntities(x, y, z, radius, must, cant, oneof)` | **核心搜索**：在指定范围找符合 tag 条件的实体（基于 C++ 实现） |
+| `FindEntity(inst, radius, fn, must, cant, oneof)` | 以 `inst` 为中心搜一个实体，附加 Lua 判定 `fn` |
+| `FindClosestEntity(inst, radius, ignoreheight, must, cant, oneof, fn)` | 同上但返回最近的那个 |
+| `GetClosestInstWithTag(tags, inst, radius)` | 简写版：只查一个 tag（或 tag 列表），不需要 cant/oneof |
+
+`TheSim:FindEntities` 的三个 tag 参数是**组合关系**：
+
+- `must`（必须）：实体必须**同时具备这些 tag 中的所有**。空 / `nil` 表示不要求。
+- `cant`（不能）：实体**不能具备这些 tag 中的任何一个**。
+- `oneof`（至少其一）：实体必须**具备这些 tag 中的至少一个**。
+
+看 `scripts/prefabs/spider.lua` 第 102-108 行的实战例子：
+
+```lua
+local SPIDER_TAGS = { "spider" }
+local SPIDER_IGNORE_TAGS = { "FX", "NOCLICK", "DECOR", "INLIMBO", "creaturecorpse" }
+
+local function GetOtherSpiders(inst, radius, tags)
+    tags = tags or SPIDER_TAGS
+    local x, y, z = inst.Transform:GetWorldPosition()
+
+    local spiders = TheSim:FindEntities(x, y, z, radius, nil, SPIDER_IGNORE_TAGS, tags)
+    -- ...
+end
+```
+
+这段代码的意思是：
+
+- **must**：`nil`，没有强制要求
+- **cant**：不能是 `"FX"`（特效）、`"NOCLICK"`（不可点击）、`"DECOR"`（装饰）、`"INLIMBO"`（在背包里）、`"creaturecorpse"`（尸体）——这些都是"假"的实体，过滤掉
+- **oneof**：必须有 `"spider"` 标签之一（默认参数）
+
+一行 `TheSim:FindEntities` 就完成了**"排除掉所有不是真实蜘蛛的垃圾实体"**这件事。如果用纯 Lua 遍历所有实体再过滤，开销会高两个数量级。
+
+---
+
+### 5.5.4 进阶：五类典型标签
+
+看了几百个官方 prefab 的 tag 使用后，可以把**所有 tag 分成五类**——每类有不同的命名约定和作用。
+
+#### ① 身份类别（小写字母名词）
+
+这类 tag 描述"**这是什么**"，是最自然、最多的一类。它们都是小写英文名词，通常没有前缀。
+
+| Tag | 含义 |
+|------|------|
+| `"player"` / `"character"` | 玩家 / 角色 |
+| `"monster"` / `"hostile"` / `"epic"` | 怪物 / 敌对 / 巨怪 |
+| `"spider"` / `"pig"` / `"rabbit"` | 具体物种 |
+| `"animal"` / `"bird"` / `"insect"` | 大类 |
+| `"structure"` / `"plant"` / `"tree"` | 建筑 / 植物 / 树 |
+| `"fire"` / `"light"` / `"heat"` | 火 / 光源 / 热源 |
+| `"weapon"` / `"tool"` / `"armor"` | 武器 / 工具 / 盔甲 |
+| `"food"` / `"meat"` / `"veggie"` / `"raw"` | 食物类 |
+| `"scarytoprey"` / `"canbetrapped"` | 行为类别 |
+
+**使用场景**：
+
+```lua
+-- 战斗系统：只打怪物
+if target:HasTag("monster") then ... end
+
+-- 猪人：怕蜘蛛
+if threat:HasTag("spider") then ... end
+
+-- 猫头鹰：晚上对玩家恶意
+if target:HasTag("player") and TheWorld.state.isnight then ... end
+```
+
+#### ② 下划线前缀标签（`_health`、`_combat`...）—— Replica 信号
+
+这类以**单下划线**开头。它们是 **replica 系统的组件标记**——上一节详细讲过（见 5.4.4 节），每个可 replicated 的组件在实体上对应一个 `_组件名` 标签。
+
+| Tag | 对应组件 | 含义 |
+|------|---------|------|
+| `"_health"` | `health` | 这个实体有血量 |
+| `"_combat"` | `combat` | 能参与战斗 |
+| `"_inventory"` | `inventory` | 能装东西 |
+| `"_inventoryitem"` | `inventoryitem` | 是个可捡起的物品 |
+| `"_equippable"` | `equippable` | 可装备 |
+| `"_hunger"` / `"_sanity"` | `hunger` / `sanity` | 有饥饿/理智 |
+| `"_builder"` | `builder` | 能制造 |
+| `"_stackable"` | `stackable` | 可堆叠 |
+| `"_container"` | `container` | 是容器 |
+
+客户端常常用这些查组件是否"能用"：
+
+```lua
+-- 客户端判断 target 能不能战斗
+if target:HasTag("_combat") and not target:HasTag("notarget") then
+    -- 能攻击
+end
+```
+
+**注意**：`"__健康"`（**双下划线**）是"曾经有但被移除"的标记——当你主动 `UnreplicateComponent("health")` 时，引擎会把 `_health` 换成 `__health`，以免客户端错误地认为实体从来没有过 health（见 `scripts/entityreplica.lua` 第 39-44 行）。
+
+#### ③ 大写特殊状态（`INLIMBO`、`FX`、`NOCLICK`）—— 引擎级状态
+
+这类全大写，通常是**引擎级的行为开关**——被引擎或核心系统特殊处理。
+
+| Tag | 含义 | 触发时机 |
+|------|------|---------|
+| `"INLIMBO"` | 实体"不在场景中" | 进入背包/容器时自动加（`scripts/entityscript.lua` 第 349 行 `RemoveFromScene`） |
+| `"CLASSIFIED"` | 只用于网络同步的辅助实体 | 如 `player_classified`、`inventoryitem_classified` |
+| `"FX"` | 纯视觉特效 | 由开发者显式添加 |
+| `"NOCLICK"` | 玩家鼠标点不到 | 特效、弹射物、隐藏物 |
+| `"NOBLOCK"` | 不阻挡视线/选择 | 辅助识别 |
+| `"DECOR"` | 纯装饰元素 | 地形装饰 |
+| `"NOTARGET"` / `"notarget"` | 不被锁定为目标 | 战斗临时失效时 |
+| `"invisible"` | 看不见 | 隐身效果 |
+| `"playerghost"` | 玩家鬼魂形态 | 死亡后 |
+
+**关键例子**——`scripts/entityscript.lua` 第 348-376 行的 `RemoveFromScene`：
+
+```lua
+function EntityScript:RemoveFromScene()
+    self.entity:AddTag("INLIMBO")       -- 加 INLIMBO 标签
+    self.entity:SetInLimbo(not self.forcedoutoflimbo)
+    self.inlimbo = true
+    self.entity:Hide()                  -- 不再渲染
+    self:_DisableBrain_Internal()       -- 禁用 AI
+    if self.sg then self.sg:Stop() end  -- 状态机停止
+    -- ... 物理、光影、动画、小地图全部暂停 ...
+    self:PushEvent("enterlimbo")
+end
+```
+
+**一把被放进背包的长矛**：它进入 limbo 后，`"INLIMBO"` 标签一加，世界上所有 `TheSim:FindEntities` 的 `cant` 参数如果包含 `"INLIMBO"`，就会忽略它。所以蜘蛛不会去"攻击"玩家背包里的长矛——物品进入背包，"从世界上消失"。
+
+**同理**，`NOCLICK` 让特效和弹射物不挡玩家鼠标；`FX` 让特效不被战斗系统扫描到；`CLASSIFIED` 防止网络辅助实体被误选中——这些都是引擎级的"开关"。
+
+#### ④ 能力标签（`sharp`、`deployable`、`stackable`）—— "会什么"
+
+这类描述实体"**会做什么**"——往往被"别的系统"用来判断交互资格。
+
+| Tag | 含义 | 谁来查 |
+|------|------|--------|
+| `"sharp"` / `"pointy"` | 锋利、尖锐 | 未来可能的耐久互动、皮肤特效 |
+| `"deployable"` | 可以被"放置"到地上 | `deployable` 组件的 placer |
+| `"tile_deploy"` | 基于地块的放置 | 农田、地毯 |
+| `"heavy"` | 重物（需双手扛） | `heavyobstaclephysics` |
+| `"fridge"` / `"cooker"` / `"stewer"` | 冰箱 / 烹饪器 / 炖锅 | 放入食物时检查 |
+| `"burnable"` / `"freezable"` | 能被烧 / 能被冻 | 火焰 / 冰冻手杖 |
+| `"pickable"` / `"workable"` | 能被采摘 / 能被采集 | `pickable` / `workable` 组件 |
+| `"flying"` | 飞行生物 | 攻击 / 视觉 |
+| `"hasmagic"` | 有魔法属性 | 某些装备 / 仪式 |
+
+这类 tag 是 **Mod 扩展最活跃的领域**——如果你的 Mod 要判断"这把武器是不是有毒"，你可以定义一个 `"poisonweapon"` 标签；然后在 `PrefabPostInit` 里给原版武器动态加上这个标签，再在你的"中毒"组件里 `HasTag("poisonweapon")` 判断。
+
+#### ⑤ 状态标签（`burnt`、`frozen`、`isdead`）—— "当前处于什么状态"
+
+这类描述**当前状态**，会随运行时动态变化。
+
+| Tag | 含义 | 变化时机 |
+|------|------|---------|
+| `"burnt"` | 已烧成灰 | `burnable` 组件触发 |
+| `"frozen"` | 被冰冻 | `freezable` 组件触发 |
+| `"isdead"` | 死了 | `health` 组件（见 `health_replica.lua` 第 130-140 行） |
+| `"hungry"` / `"crazy"` / `"hassleep"` | 状态机暂时状态 | StateGraph 添加 |
+| `"wet"` / `"moist"` | 被雨淋湿 | 环境系统 |
+| `"fire"` | 正在燃烧 | `burnable` |
+| `"sleeping"` | 正在睡觉 | `sleeper` 组件 |
+| `"attack"` | 正在攻击 | StateGraph |
+| `"invisible"` | 当前隐身 | 隐身效果 |
+
+**`health_replica.lua` 第 130-140 行的经典例子**：
+
+```lua
+function Health:SetIsDead(isdead)
+    if isdead then
+        self.inst:AddTag("isdead")
+    else
+        self.inst:RemoveTag("isdead")
+    end
+end
+
+function Health:IsDead()
+    return self.inst:HasTag("isdead")
+end
+```
+
+**为什么连"是否死亡"都用 tag 表示？** 因为客户端也需要知道这个状态（画死亡 UI、停止互动提示等）——而 tag 天然会同步到客户端，无需单独的 net 变量。这是饥荒联机版**把状态用 tag 承载**的典型优化手法。
+
+---
+
+### 5.5.5 进阶：tag 在世界搜索中的核心作用
+
+Tag 最强大的用处就是跟 `TheSim:FindEntities` 配合——**在"每帧扫整个世界"这种性能敏感的场景下尤其关键**。
+
+#### 经典查找模式
+
+**(1) "找到附近的怪物，排除假的"**（`scripts/prefabs/spider.lua` 第 208-223 行）：
+
+```lua
+local TARGET_MUST_TAGS = { "_combat", "character" }
+local TARGET_CANT_TAGS = { "spiderwhisperer", "spiderdisguise", "INLIMBO" }
+
+local function FindTarget(inst, radius)
+    if not inst.no_targeting then
+        return FindEntity(
+            inst,
+            SpringCombatMod(radius),
+            function(guy)
+                return (not inst.bedazzled and (guy.isplayer or not guy:HasTag("monster")))
+                    and inst.components.combat:CanTarget(guy)
+                    and not IsSpiderAlly(inst, guy)
+            end,
+            TARGET_MUST_TAGS,
+            TARGET_CANT_TAGS
+        )
+    end
+end
+```
+
+搜索条件：
+
+- **must**：`_combat`（能战斗）+ `character`（是角色/生物）
+- **cant**：`spiderwhisperer`（蛛语者，蜘蛛不打）、`spiderdisguise`（蛛蛹伪装）、`INLIMBO`（在背包里）
+- **Lua 回调**：再加更精细的判断（bedazzled、是玩家但不是怪物、不是盟友）
+
+注意 `TARGET_MUST_TAGS` 和 `TARGET_CANT_TAGS` 都是**模块级常量**——不在函数里临时构造 table，避免每次调用都 GC。
+
+**(2) "找到特定 tag 的所有实体"**（`GetClosestInstWithTag`）：
+
+```lua
+local SPIDERDEN_TAGS = {"spiderden"}
+local function SummonFriends(inst, attacker)
+    local den = GetClosestInstWithTag(SPIDERDEN_TAGS, inst, 30)
+    if den ~= nil and den.components.combat ~= nil then
+        den.components.combat.onhitfn(den, attacker)
+    end
+end
+```
+
+一行找到最近的蜘蛛巢穴，让它呼唤援军。
+
+#### 两阶段筛选：tag 粗筛 + Lua 精筛
+
+一个非常重要的性能模式——**"先用 tag 在 C++ 里粗筛，再用 Lua 回调精筛"**。Lua 回调（上面示例里的 `function(guy) ... end`）**只会在 tag 粗筛通过的实体上执行**。所以：
+
+- 先 tag 过滤："不要 FX、NOCLICK、INLIMBO、尸体"——一下砍掉 90% 的无关实体
+- 再 Lua 过滤："必须是正在移动的、必须没被沙暴挡住、必须在视野内"——少量判断，不卡帧
+
+这个模式贯穿全游戏：蜘蛛 AI、奶牛寻找玩家、风滚草搜集掉落物、食人花锁定目标……全都是这个套路。**Mod 作者自己写 AI 时也应该照搬**——**尽量把判断压到 tag 上，实在压不下去才走 Lua 回调**。
+
+---
+
+### 5.5.6 老手进阶：Tag 的设计原则
+
+#### 命名约定速查
+
+| 前缀/形式 | 代表 | 例子 |
+|----------|------|------|
+| 全小写英文名词 | 身份类别、能力 | `monster`、`weapon`、`sharp` |
+| 单下划线开头 | Replica 组件标记 | `_health`、`_combat` |
+| 双下划线开头 | 已移除的 replica 标记 | `__health` |
+| 全大写 | 引擎级特殊状态 | `INLIMBO`、`FX`、`NOCLICK` |
+| 小写名词 + 形容词 | 能力 / 可交互属性 | `pickable`、`deployable` |
+| 描述当前状态 | 运行时状态 | `burnt`、`isdead`、`wet` |
+
+#### 命名建议（Mod 开发者）
+
+1. **给 Mod 的自定义 tag 加**一个**不容易撞车**的前缀——比如你 Mod 叫 `arcane_scrolls`，tag 就用 `arcane_weapon` 而不是直接 `weapon`。否则和原版 / 其他 Mod 冲突时极难排查。
+
+2. **描述"是什么"用小写名词，描述"状态/能力"用小写形容词**——保持和官方一致的可读性。
+
+3. **不要用下划线开头的 tag 名**（除非你**确实**在实现 replica）——避免被 replica 系统当作组件标记处理。
+
+4. **不要发明大写的 tag 名**——大写 tag 都是引擎级语义，乱加可能触发未知行为。
+
+#### 为什么不建议在运行时"批量添加"/"批量删除"tag？
+
+Tag 的添加/删除会**触发网络同步**——每一次 `AddTag` 都可能产生一个"标签变化"的网络包（实际上引擎会做一些合并）。如果你每帧都 `AddTag / RemoveTag` 切换一个状态，就是在**白白占用网络带宽**。
+
+**正确做法**：
+
+- 能用 `inst.persistent_flag = true` 这种纯 Lua 字段搞定的，不要用 tag
+- 只有**需要客户端也知道**或**需要在 `FindEntities` 里被搜到**的情况，才用 tag
+
+#### Pristine 之前加 tag VS 之后加 tag
+
+- **Pristine 之前加**：会被存入 pristine state，**随实体首次同步发给所有新客户端**——"开局就有"
+- **Pristine 之后加**：会走"标签变更同步"通道——**稍后才到客户端**
+
+对"**开局就需要**"的身份类别标签（`"monster"`、`"weapon"`、`"spider"`），**一律在 Pristine 之前加**。对"**运行时状态**"标签（`"isdead"`、`"burnt"`、`"frozen"`），在 Pristine 之后由业务逻辑动态加。
+
+这就是为什么 `scripts/prefabs/player_common.lua` 第 2485-2492 行会把 `_health / _hunger / _sanity` 偷偷塞到 pristine state——玩家角色生成的**那一瞬间**，其他实体（比如猪人）如果要扫描附近的玩家，已经能查到 `_combat` 标签。如果走 replica 标签同步，会延迟几帧。
+
+---
+
+### 5.5.7 老手进阶：Mod 里的高级 tag 技巧
+
+#### 技巧 1：用 `AddPrefabPostInit` 给原版 prefab 加标签
+
+想让所有蜘蛛都被识别为"某种特殊群体"？
+
+```lua
+-- modmain.lua
+AddPrefabPostInit("spider", function(inst)
+    inst:AddTag("my_mod_marked_monster")
+end)
+AddPrefabPostInit("spider_warrior", function(inst)
+    inst:AddTag("my_mod_marked_monster")
+end)
+```
+
+然后你的新武器在击杀时只对带这个 tag 的生物产生效果：
+
+```lua
+local function onattacked(inst, data)
+    if data.attacker and data.attacker:HasTag("my_mod_marked_monster") then
+        -- 特殊效果
+    end
+end
+```
+
+**关键点**：因为这个 tag 是在 `AddPrefabPostInit` 里加的——**它必然跑在主机上**，且**也会跑在客户端上**（因为 `AddPrefabPostInit` 对客户端的 Prefab 也生效）。所以这张 tag 客户端也能识别。但**具体它是走 pristine 还是 replica 同步**取决于你加的时机：
+
+- 如果 `AddPrefabPostInit` 回调在 `SetPristine` 之前运行——跟着 pristine 走
+- 如果在之后——走 replica
+
+`AddPrefabPostInit` 的时机在 5.1.5 节讨论过：**它在工厂函数返回之后**被调用——这意味着 `SetPristine` 已经触发了。所以按原理，这里加的 tag 会走 replica 同步。
+
+不过实际上饥荒引擎做了优化——在 Pristine state 还未被最终固化前，`AddPrefabPostInit` 的修改可能也会被合并进去（具体行为和版本有关）。**保险的做法**是：如果你确定这个 tag 是"原生身份类"，应该用 `AddPrefabPostInitAny` 在更早的时机加。
+
+#### 技巧 2：用 tag 代替自己写 replica
+
+前面说过"自定义组件要客户端也能访问，需要写 replica"——但**如果你只是想让客户端知道"有还是没有"这种二元状态**，直接用 tag 就够了：
+
+```lua
+-- 服务端业务逻辑
+function MyComponent:SetPoisoned(poisoned)
+    self.poisoned = poisoned
+    self.inst:AddOrRemoveTag("mymod_poisoned", poisoned)  -- ← tag 自动同步到客户端
+end
+
+-- 客户端查询
+if inst:HasTag("mymod_poisoned") then
+    -- 显示特效
+end
+```
+
+**一行代码解决网络同步**，不用写 net 变量、不用写 replica 类、不用搞事件监听。适用于"非此即彼"的状态（有毒/无毒、点燃/未点燃、被拘束/未被拘束）。
+
+#### 技巧 3：tag 是 FSM 的辅助条件
+
+很多 prefab 的状态机（StateGraph）会根据 tag 决定转移——比如生物"看到有 `fire` 标签的实体就逃跑"。这和传统 FSM 的"带条件转移"完全一致，只是条件是 tag。
+
+#### 技巧 4：tag 作为"懒加载的组件缓存"
+
+官方玩法：**一些组件在加载时会给实体加一个"能力 tag"，这样其他系统不需要去访问 `inst.components.xxx`（也可能不在客户端）就能判断**。比如 `eater` 组件会给食物实体加 `"eater"` 之类的标签。
+
+Mod 里可以照做：你的 `MyCustomComponent` 构造时加一个 `"mycomponent_ready"` 标签，其他 Mod 想知道是否安装，不用 `inst.components.mycomponent ~= nil`，直接 `HasTag` 即可。
+
+#### 技巧 5：tag 永远先于组件加载完成
+
+**Pristine state 里的 tag 在客户端上生效时机比 replica 组件要早**——这就是为什么在 `OnEntityReplicated` 里用 tag 做初始化决策比用 replica 对象更可靠：
+
+```lua
+function inst.OnEntityReplicated(inst)
+    -- replica 此时已经就位
+    if inst:HasTag("_combat") then
+        -- 准备战斗相关 UI
+    end
+    -- 但如果用 inst.replica.combat 直接访问...
+    -- 有些情况 classified 连接可能还没建立，.replica.combat 可能是 nil
+end
+```
+
+---
+
+### 5.5.8 小结
+
+- **Tag = 贴在实体上的字符串标签纸**。三个基础 API：`AddTag / HasTag / RemoveTag`，加复合的 `HasTags`（所有）和 `HasOneOfTags`（任一）。底层是 C++ 哈希集合，单次查询几乎零开销。
+- **为什么 tag 比组件判断更常用**：(1) 客户端没有 `inst.components.xxx`，只有 tag；(2) 每个 tag 极其轻量，查询超快；(3) `TheSim:FindEntities` 原生支持三个 tag 参数筛选，在 C++ 层一次过滤，性能甩 Lua 几十条街。
+- **五类典型标签**：①身份类别（小写名词：monster、spider、weapon）②下划线组件标记（`_health / _combat`）③大写引擎级状态（`INLIMBO / FX / NOCLICK / CLASSIFIED`）④能力标签（sharp、deployable、fridge）⑤运行时状态（isdead、burnt、frozen）。
+- **`TheSim:FindEntities` 的黄金模式**：tag 粗筛（C++ 里快速过滤）+ Lua 回调精筛（细节判断）。`must + cant + oneof` 三参数组合+ 常量 table 复用 = 官方标准用法。
+- **Tag 设计原则**：Mod 自定义 tag 加前缀避免撞车；小写名词表身份、大写保留给引擎、下划线保留给 replica；运行时尽量少频繁切换 tag，因为会产生网络同步。
+- **Pristine 前加 vs. 后加**：身份类 / 预知类标签放 pristine 前（随实体首次到达），运行时状态标签放 pristine 后（动态变化）。`player_common.lua` 里 "Sneak these into pristine state" 就是这种优化。
+- **Mod 里的五个高级技巧**：(1) `AddPrefabPostInit` 动态加 tag 给原版 prefab；(2) 用 tag 代替简单的 replica 同步；(3) tag 作为 FSM 转移条件；(4) 组件加载时加能力 tag 供其他系统探测；(5) 在 `OnEntityReplicated` 里用 tag 做决策比直接访问 replica 对象更稳。
+
+> **下一节预告**：5.6 节我们会把视角转到资源系统——`Asset` 声明到底是什么？`anim/log.zip` 这种文件怎么被加载？`RegisterPrefabsImpl` 内部的 `resolve_fn` 在做什么？Mod 怎么正确地声明自己的资源，避免"找不到素材"或"资源冲突"？ 我们会用官方的 `log.lua` 配合 `mods.lua` 里的 Mod 资源挂载流程走一遍。
 
 ## 5.6 Asset 声明与资源加载机制（RegisterPrefabs 流程）
 
