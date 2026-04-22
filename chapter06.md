@@ -2019,7 +2019,1006 @@ end
 
 ## 6.3 Classified 实体——网络同步的桥梁
 
-（待编写）
+### 本节导读
+
+6.2 节我们看到 `health_replica.lua` 里反复出现一个字段叫 `self.classified`——这个神秘的"联网对象"到底是什么？为什么客户端要通过它才能读到服务端的数据？本节我们把 **Classified 实体**从里到外拆开——**它是什么、为什么要用独立实体来承载 net 变量、父子关系怎么设计、可见性怎么过滤、自己写一个要注意什么**。
+
+> **新手**从 6.3.1-6.3.3 入手，理解「classified 就是一个专门承载 net 变量的隐形实体」，看懂 `player_classified.lua` 和 `inventoryitem_classified.lua` 的基本骨架，记住 `CLASSIFIED` tag 的意义；**进阶读者**从 6.3.4 开始深入 CLASSIFIED tag 的网络可见性过滤、`SetParent` 父子关系、以及 `Serialize/Deserialize` 双向模式（如 `SerializePercentUsed` / `DeserializePercentUsed`）；**老手**跳到 6.3.7-6.3.8 看 `player_classified` 1600 多行的整体架构——为什么 50+ 个字段还能这么组织、六个自己写 classified 时最容易栽的坑。
+
+**前置**：建议先读过 6.2 节的 Replica 机制，本节假设你已经知道 replica 里 `self.classified.xxx:value()` 是在干什么。
+
+---
+
+### 6.3.1 快速入门：Classified 到底是什么？
+
+**一句话定义**：**Classified 是一个"没有身体、只为承载 net 变量而存在的隐形联网实体"**。
+
+这听起来抽象，我们从"**为什么非要用一个独立实体来承载 net 变量**"这个问题切入。
+
+#### 第一个问题：为什么不把 net 变量直接挂在主实体上？
+
+事实上**可以**。看 `inventoryitem_replica.lua` 第 7-10 行：
+
+```7:10:scripts/components/inventoryitem_replica.lua
+    self._cannotbepickedup = net_bool(inst.GUID, "inventoryitem._cannotbepickedup")
+    self._iswet = net_bool(inst.GUID, "inventoryitem._iswet", "iswetdirty")
+    self._isacidsizzling = net_bool(inst.GUID, "inventoryitem._isacidsizzling", "isacidsizzlingdirty")
+    self._grabbableoverridetag = net_hash(inst.GUID, "inventoryitem._grabbableoverridetag")
+```
+
+这四个 net 变量用的都是 `inst.GUID`——**挂在物品自己身上**的。对于简单的字段，这种"**直接挂实体**"的方式就够用。
+
+**但当字段很多、或需要单独管理生命周期时，问题就来了**。想象 `player_classified` 上挂着：
+
+- health 相关：currenthealth、maxhealth、healthpenalty、istakingfiredamage、lunarburnflags... 10+ 个
+- hunger 相关：currenthunger、maxhunger、ishungerpulseup... 5+ 个
+- sanity 相关：currentsanity、maxsanity、sanitypenalty... 10+ 个
+- 临时状态：pausepredictionframes、oldagerrate、bathingpoolcamera... 20+ 个
+- 其他：inspiration、wereness、skilltree、moonstorm... 几十个
+
+**50+ 个 net 变量**全塞到玩家实体上，会带来几个严重问题：
+
+1. **字段命名冲突**：`inst.maxhealth` 和 `inst.components.health.maxhealth` 名字相同，访问时要加前缀容易搞错
+2. **可见性控制困难**：如果某些字段"**只给 owner（主人）看**"（如玩家背包明细），混在一起难做过滤
+3. **生命周期耦合**：主实体销毁、复活、传送时，这些字段全混在一起，要分别处理很麻烦
+
+#### 第二个问题：用独立实体承载有什么好处？
+
+把所有 net 变量搬到一个**专属的独立实体**上（就是 classified），**立即解决三个问题**：
+
+1. **命名空间独立**：`inst.classified.maxhealth` 明确指明是网络同步值，不和 `inst.components.health.maxhealth` 混淆
+2. **可见性一键控制**：整个 classified 实体打上一个可见性标记（通过 `Network` 系统），所有字段跟着走
+3. **独立销毁**：classified 可以单独 `Remove`——主实体还活着，但 classified 清零 → 相当于"**断开所有网络同步**"
+
+这就是 Classified 的设计初衷——**用"**子实体**"的方式管理一组相关的 net 变量**。
+
+#### 第三步：一个生动的类比
+
+可以把 Classified 想象成**"网络快递包裹"**：
+
+- **主实体**（玩家 / 物品） = 大客户，**要寄东西**
+- **Classified** = 快递包裹，**装着要寄的内容**（net 变量）
+- **父子关系（SetParent）** = 包裹贴着客户的地址标签
+- **`CLASSIFIED` tag** = "这是包裹不是客户本人"的识别标志
+- **可见性过滤** = "这个包裹寄给谁"（所有人 vs 只给 owner）
+
+**所以 classified 本身不是游戏对象**——它是"**服务于主实体的网络载体**"。
+
+#### 第四步：两种典型的 Classified
+
+饥荒联机版里最常见的两种 classified：
+
+| 类型 | 作用 | 字段数 | 父实体 | 可见性 |
+|------|------|-------|--------|--------|
+| `player_classified` | 玩家专属 | 50+ | player 实体 | 所有人可见 |
+| `inventoryitem_classified` | 物品专属 | 20+ | 物品实体 | 所有人可见 |
+| `inventory_classified` | 背包内容 | 复杂 | player 实体 | **只给 owner 可见** |
+| `wx78_classified` | WX-78 特有数据 | 几个 | WX-78 实体 | 所有人可见 |
+
+**`inventory_classified` 是"只给 owner 看"的典型例子**——其他玩家不能看你背包里有什么，这是设计上的需求，classified 系统提供了原生支持。
+
+> **新手记忆**：**所有带 `_classified` 后缀的 Prefab，都是一个专门承载 net 变量的隐形实体，用来为某个主实体做网络同步**。读到 `SpawnPrefab("xxx_classified")` 不要困惑——就是在"**给主实体配一个快递包裹**"。
+
+---
+
+### 6.3.2 快速入门：一个 Classified 文件的骨架
+
+现在我们打开 `scripts/prefabs/inventoryitem_classified.lua`——这是一个 **224 行的完整 classified 样板**，官方写得很规整，非常适合作为学习范本。
+
+#### 第一步：工厂函数的最小骨架
+
+看第 142-162 行的开头：
+
+```142:162:scripts/prefabs/inventoryitem_classified.lua
+local function fn()
+    local inst = CreateEntity()
+
+    if TheWorld.ismastersim then
+        inst.entity:AddTransform() --So we can follow parent's sleep state
+    end
+    inst.entity:AddNetwork()
+    inst.entity:Hide()
+    inst:AddTag("CLASSIFIED")
+
+    inst.image = net_hash(inst.GUID, "inventoryitem.image", "imagedirty")
+    inst.atlas = net_hash(inst.GUID, "inventoryitem.atlas", "imagedirty")
+    inst.cangoincontainer = net_bool(inst.GUID, "inventoryitem.cangoincontainer")
+    inst.canonlygoinpocket = net_bool(inst.GUID, "inventoryitem.canonlygoinpocket")
+    inst.canonlygoinpocketorpocketcontainers = net_bool(inst.GUID, "inventoryitem.canonlygoinpocketorpocketcontainers")
+    inst.src_pos =
+    {
+        isvalid = net_bool(inst.GUID, "inventoryitem.src_pos.isvalid"),
+        x = net_float(inst.GUID, "inventoryitem.src_pos.x"),
+        z = net_float(inst.GUID, "inventoryitem.src_pos.z"),
+    }
+```
+
+**五个关键点**：
+
+**① `CreateEntity()`**：创建底层实体——classified 本质上还是一个实体，只是"看不见"。
+
+**② `AddTransform()` 只在服务端**：因为 classified 要"**跟着父实体一起休眠**"（`So we can follow parent's sleep state`）。Transform 组件让它有位置，从而能触发 sleep/wake 机制。
+
+**③ `AddNetwork()` 两端都要**：这是 classified 的核心——它是联网实体，必须有网络组件。
+
+**④ `Hide()` 隐身**：classified 不需要渲染，直接隐藏。这是一个引擎级优化——不占用渲染资源。
+
+**⑤ `AddTag("CLASSIFIED")` 标识**：打上 `"CLASSIFIED"` tag，告诉其他系统"**我是一个 classified，不是普通实体**"——在实体搜索、目标选择、UI 查找时会被特殊处理。
+
+#### 第二步：声明 net 变量
+
+紧接着的几十行都是在声明 net 变量：
+
+```lua
+inst.image = net_hash(inst.GUID, "inventoryitem.image", "imagedirty")
+inst.atlas = net_hash(inst.GUID, "inventoryitem.atlas", "imagedirty")
+inst.cangoincontainer = net_bool(inst.GUID, "inventoryitem.cangoincontainer")
+...
+inst.percentused = net_byte(inst.GUID, "inventoryitem.percentused", "percentuseddirty")
+inst.perish = net_smallbyte(inst.GUID, "inventoryitem.perish", "perishdirty")
+...
+```
+
+**每个 net 变量的三个参数**：
+
+1. **`inst.GUID`**：属于哪个实体
+2. **名字字符串**：引擎内部用来识别这个变量的唯一 ID
+3. **dirty 事件名**（可选）：当这个变量在客户端发生变化时，在实体上 push 一个对应的事件
+
+我们在 6.3.3 节详细讲各种 net 类型。
+
+#### 第三步：设置默认值
+
+看第 177-195 行：
+
+```177:195:scripts/prefabs/inventoryitem_classified.lua
+    inst.image:set(0)
+    inst.atlas:set(0)
+    inst.cangoincontainer:set(true)
+    inst.canonlygoinpocket:set(false)
+    inst.canonlygoinpocketorpocketcontainers:set(false)
+    inst.src_pos.isvalid:set(false)
+    inst.percentused:set(255)
+    inst.perish:set(63)
+    inst.recharge:set(255)
+    inst.rechargetime:set(-2)
+    inst.deploymode:set(DEPLOYMODE.NONE)
+    inst.deployspacing:set(DEPLOYSPACING.DEFAULT)
+    inst.deployrestrictedtag:set(0)
+    inst.usegridplacer:set(false)
+    inst.attackrange:set(-99)
+    inst.walkspeedmult:set(1)
+    inst.equiprestrictedtag:set(0)
+    inst.moisture:set(0)
+	inst.islockedinslot:set(false)
+```
+
+**每个 net 变量都显式 `set` 一次**——不是赋值，是**告诉网络层"这个变量有初值，要同步给客户端"**。
+
+**留意两个特殊的默认值**：
+
+- **`percentused:set(255)`**：255 是"**无值**"标记（百分比 0-100，254/255 留作特殊含义）
+- **`perish:set(63)`**：63 也是"**无腐烂**"标记
+
+这是 net 变量的常见技巧——**用取值范围外的数值表示"未设置"**，避免开额外 bool 字段。
+
+#### 第四步：Pristine 分界 + 注册服务端/客户端方法
+
+看第 197-221 行：
+
+```197:221:scripts/prefabs/inventoryitem_classified.lua
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        inst.DeserializePercentUsed = DeserializePercentUsed
+        inst.DeserializePerish = DeserializePerish
+        inst.DeserializeRecharge = DeserializeRecharge
+        inst.DeserializeRechargeTime = DeserializeRechargeTime
+        inst.OnEntityReplicated = OnEntityReplicated
+
+        --inst._rechargetask = nil
+
+        --Delay net listeners until after initial values are deserialized
+        inst:DoStaticTaskInTime(0, RegisterNetListeners)
+        return inst
+    end
+
+    inst.persists = false
+
+    inst.SerializePercentUsed = SerializePercentUsed
+    inst.SerializePerish = SerializePerish
+    inst.ForcePerishDirty = ForcePerishDirty
+    inst.SerializeRecharge = SerializeRecharge
+    inst.SerializeRechargeTime = SerializeRechargeTime
+
+    return inst
+end
+
+return Prefab("inventoryitem_classified", fn)
+```
+
+**熟悉的 Pristine 分界**（回顾 5.4 节）——但用法略有不同：
+
+- **客户端分支**：挂上 `DeserializeXxx`（反序列化）方法 + `OnEntityReplicated`（实体反序列化完成回调）+ 延迟注册 dirty 事件监听器
+- **服务端分支**：`persists = false`（classified **不进存档**——每次游戏启动重新创建）+ 挂上 `SerializeXxx`（序列化）方法
+
+**注意 `persists = false`**：5.2.5 节讲过"持久性"。classified 不应该被存档——它的数据来自主组件的 `OnLoad`，读档后主组件会重新 push 到 classified。
+
+#### 第五步：整体结构图
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  inventoryitem_classified.lua                           │
+├─────────────────────────────────────────────────────────┤
+│  SerializeXxx 函数们（服务端 → classified）               │
+│    local function SerializePercentUsed(inst, percent)   │
+│      ...                                                 │
+│                                                          │
+│  DeserializeXxx 函数们（classified dirty → 主实体）       │
+│    local function DeserializePercentUsed(inst)          │
+│      ...                                                 │
+│                                                          │
+│  OnEntityReplicated  ← 客户端初始化时找到父实体           │
+│                                                          │
+│  RegisterNetListeners  ← 注册 dirty 事件监听             │
+│                                                          │
+│  local function fn()                                    │
+│    ① CreateEntity + AddTransform + AddNetwork + Hide   │
+│    ② AddTag("CLASSIFIED")                              │
+│    ③ 声明 net 变量                                       │
+│    ④ 设置默认值                                          │
+│    ⑤ SetPristine                                         │
+│    ⑥ 客户端：挂 DeserializeXxx / 服务端：挂 SerializeXxx│
+│  end                                                    │
+│                                                          │
+│  return Prefab("inventoryitem_classified", fn)          │
+└─────────────────────────────────────────────────────────┘
+```
+
+**这就是一个 classified 文件的完整结构**。你自己写一个 classified 时，照这个骨架填就行。
+
+---
+
+### 6.3.3 快速入门：net 变量的基础类型
+
+Classified 的核心就是 net 变量。这一节快速过一遍常用类型。
+
+#### 所有 net 变量的共同特征
+
+```lua
+inst.xxx = net_<type>(inst.GUID, "标识符字符串", "脏事件名")
+```
+
+**三个参数**：
+
+1. **GUID**：属于哪个实体
+2. **标识符**：全实体唯一的字符串名，推荐格式 `"组件名.字段名"`
+3. **脏事件名**（可选）：当客户端收到新值时触发的事件名
+
+**所有 net 变量的统一 API**：
+
+- **`netvar:set(v)`**——服务端调用，设置值并标记为脏（触发同步）
+- **`netvar:set_local(v)`**——任何端都能调用，仅本地改值不触发同步（优化用）
+- **`netvar:value()`**——读取当前值
+
+#### 常用 net 类型速查表
+
+参考 `player_classified.lua` 第 1341-1370 行和 `inventoryitem_classified.lua` 的字段声明：
+
+| 类型 | 值域 | 占用 | 使用场景 |
+|------|-----|------|----------|
+| `net_bool` | `true/false` | 1 位 | 布尔开关（但更优先用 tag） |
+| `net_tinybyte` | 0-7（3 位）| 3 位 | 超小整数（枚举 < 8） |
+| `net_smallbyte` | 0-63（6 位）| 6 位 | 小整数（6 位足够） |
+| `net_byte` | 0-255 | 8 位 | 百分比 0-100、通用小整数 |
+| `net_shortint` | -32768 ~ 32767 | 16 位 | 中等带符号整数 |
+| `net_ushortint` | 0-65535 | 16 位 | 血量、饥饿、理智等 0-9999 范围值 |
+| `net_int` | -2^31 ~ 2^31-1 | 32 位 | 大整数 |
+| `net_uint` | 0 ~ 2^32-1 | 32 位 | 大无符号整数（GUID 引用） |
+| `net_float` | IEEE 754 float | 32 位 | 位置、时间戳 |
+| `net_hash` | 字符串哈希 | 32 位 | 字符串的哈希（比 net_string 省） |
+| `net_string` | 任意字符串 | 可变 | 实际字符串 |
+| `net_event` | 无数据 | 0 位（仅触发）| 纯事件信号 |
+| `net_entity` | GUID | 32 位 | 其他实体的引用 |
+
+#### 几个实战用法
+
+**① 血量（0-9999）**：用 `net_ushortint`
+
+```1341:1342:scripts/prefabs/player_classified.lua
+    inst.currenthealth = net_ushortint(inst.GUID, "health.currenthealth", "healthdirty")
+    inst.maxhealth = net_ushortint(inst.GUID, "health.maxhealth", "healthdirty")
+```
+
+**② 布尔开关**：优先用 tag，其次用 `net_bool`
+
+```1344:1345:scripts/prefabs/player_classified.lua
+    inst.istakingfiredamage = net_bool(inst.GUID, "health.takingfiredamage", "istakingfiredamagedirty")
+    inst.istakingfiredamagelow = net_bool(inst.GUID, "health.takingfiredamagelow", "istakingfiredamagelowdirty")
+```
+
+**③ 字符串身份标识**：用 `net_hash`
+
+```lua
+-- inventoryitem_classified.lua 第 152-153 行
+inst.image = net_hash(inst.GUID, "inventoryitem.image", "imagedirty")
+inst.atlas = net_hash(inst.GUID, "inventoryitem.atlas", "imagedirty")
+```
+
+**为什么用 `net_hash` 而不是 `net_string`？** 因为 image 和 atlas 的值其实是**固定集合里挑选**（就那几百种可能的贴图名字）——用哈希传 4 字节，客户端再反哈希查表，比直接传字符串省带宽。
+
+**④ 百分比**（0-100）：用 `net_byte`
+
+```163:165:scripts/prefabs/inventoryitem_classified.lua
+    inst.percentused = net_byte(inst.GUID, "inventoryitem.percentused", "percentuseddirty")
+    inst.perish = net_smallbyte(inst.GUID, "inventoryitem.perish", "perishdirty")
+    inst.recharge = net_byte(inst.GUID, "inventoryitem.recharge", "rechargedirty")
+```
+
+**⑤ 事件信号**：用 `net_event`
+
+```lua
+-- 纯粹触发事件，不携带数据（上次我们提到的"force dirty"场景）
+inst.ispulseup = net_event(inst.GUID, "ispulseupdirty")
+```
+
+#### 脏事件（dirty event）的作用
+
+回到第二个参数——**dirty 事件名**。看一个完整链路：
+
+```
+服务端：
+inst.classified.percentused:set(50)   ← set 会触发同步
+    ↓
+网络包发送
+    ↓
+客户端：
+inst.classified.percentused 收到 50
+    ↓
+触发事件 "percentuseddirty" 在 inst.classified 上
+    ↓
+RegisterNetListeners 里监听过这个事件 →
+    ↓
+DeserializePercentUsed(inst.classified) 被调用
+    ↓
+DeserializePercentUsed 在主实体上 push "percentusedchange" 事件
+    ↓
+主实体的监听器（如 UI、动画）响应
+```
+
+**这种两层事件的设计**——
+
+1. classified 收到 dirty 就触发 classified 上的事件
+2. classified 的处理函数（Deserialize）再把事件 push 到**主实体**上
+
+**目的**：**让 classified 和主实体之间解耦**。UI 代码监听主实体的"percentusedchange"事件就行，不用关心背后有 classified 存在。
+
+---
+
+### 6.3.4 进阶：`CLASSIFIED` tag 与网络可见性过滤
+
+#### 第一步：为什么需要 `CLASSIFIED` tag？
+
+如果 classified 和普通实体完全一样，就会引发几个问题：
+
+1. **玩家按 Tab 键打开实体调试界面，能看到一堆 classified 实体——干扰** UI 可读性
+2. **AI 搜索附近实体（`FindEntities`）时，会把 classified 也当成目标**——但它没有血、没有 combat，搜到没意义
+3. **鼠标点击会选中 classified**——破坏游戏体验
+
+**`CLASSIFIED` tag 就是给这些系统一个"**请忽略我**"的信号**。
+
+看 `consolecommands.lua` 第 1221-1224 行（用于调试选择实体的代码）：
+
+```1221:1224:scripts/consolecommands.lua
+			and ent.Network ~= nil
+			and not ent:HasTag("CLASSIFIED")
+			and not ent:HasTag("INLIMBO")
+			then
+```
+
+**筛选条件里显式排除 `CLASSIFIED` tag**——调试选择实体时跳过 classified。
+
+#### 第二步：打 tag 的标准姿势
+
+所有 classified 的工厂函数**开头都会打 `CLASSIFIED` tag**：
+
+```lua
+-- player_classified.lua 第 1336-1337 行
+inst.entity:Hide()
+inst:AddTag("CLASSIFIED")
+
+-- inventoryitem_classified.lua 第 149-150 行
+inst.entity:Hide()
+inst:AddTag("CLASSIFIED")
+```
+
+**顺序重要**：**先 `Hide` 再 `AddTag`**——虽然两者独立，但这个顺序是 Klei 的约定（符合"先解决视觉，再解决标识"的设计顺序）。
+
+#### 第三步：网络可见性过滤（只给 owner 看）
+
+除了 `CLASSIFIED` tag 之外，classified 还有一个更强大的机制——**网络可见性过滤**。
+
+想象一个场景：**玩家 A 的背包里有什么，应该只有玩家 A 的客户端知道**——其他玩家的客户端不需要、也不应该收到这些数据。
+
+**这是通过 `Network` 组件的 `SetClassifiedTarget` 方法实现的**。看一下 `inventory_classified.lua`（玩家背包的 classified）的创建：
+
+```lua
+-- scripts/prefabs/inventory_classified.lua 的工厂函数里（简化示意）
+inst.entity:AddNetwork()
+inst.Network:SetClassifiedTarget(owner_player_entity)
+```
+
+调用 `SetClassifiedTarget(player)` 后，**这个 classified 实体的网络数据只会发给指定的 player**，其他客户端根本收不到。
+
+**对比两种可见性**：
+
+| 可见性类型 | 做法 | 结果 |
+|-----------|------|------|
+| **所有人可见** | 普通 AddNetwork，不 SetClassifiedTarget | 所有客户端都能收到 net 变量更新 |
+| **只给 owner 可见** | `inst.Network:SetClassifiedTarget(owner)` | 只有 owner 客户端能收到，其他客户端字段永远是默认值 |
+
+#### 第四步：实际应用
+
+**例子 1：玩家血量**——所有人可见（`player_classified`）
+
+玩家的血量其他玩家也要看到（显示玩家列表的血条、判断目标血量低）——所以 `player_classified` **不**设 ClassifiedTarget，所有客户端都能看到。
+
+**例子 2：背包内容**——只给 owner 可见（`inventory_classified`）
+
+背包里具体有什么物品、什么槽位、每个堆叠多少——**只有玩家自己**的客户端需要知道。所以 `inventory_classified` 在创建时**设置 ClassifiedTarget 为 owner**，其他玩家收不到这些数据——既保护隐私（多人游戏里不能看对方背包）、又节省带宽。
+
+**例子 3：物品通用数据**——所有人可见（`inventoryitem_classified`）
+
+物品的耐久、腐烂度这些——其他玩家捡起来用时也要知道。所以 `inventoryitem_classified` 也是所有人可见。
+
+> **开发逻辑**：可见性设计是**隐私 + 带宽**的双重考量——看不到的数据根本不发送，既保护玩家、又省带宽。Klei 通过 classified + SetClassifiedTarget 把这种需求做成了语言原语，你写 Mod 时只要按这个模式组织数据就行。
+
+---
+
+### 6.3.5 进阶：父子关系——`SetParent` 让 classified 跟随 owner
+
+Classified 和主实体之间通过 **Entity 层的父子关系**建立绑定——这是最重要的一层组织关系。
+
+#### 第一步：父子关系是怎么建立的？
+
+看 `inventoryitem_replica.lua` 第 13-14 行：
+
+```13:14:scripts/components/inventoryitem_replica.lua
+        self.classified = SpawnPrefab("inventoryitem_classified")
+        self.classified.entity:SetParent(inst.entity)
+```
+
+**两行代码**：
+
+1. **SpawnPrefab** 创建 classified 实体
+2. **`SetParent(inst.entity)`** 把 classified 的父亲设为主实体
+
+**父子关系做了什么？**
+
+- **位置跟随**：子实体自动跟着父实体移动（这就是为什么 classified 要 `AddTransform`——才能被父实体的 Transform 带着跑）
+- **休眠同步**：父实体休眠时子实体也休眠——减少网络同步（6.2 节讲过 sleep 优化）
+- **销毁级联**：父实体销毁时子实体也自动销毁——省得手动清理
+- **场景跨越共同**：传送、进入洞穴等场景变换，父子一起走
+
+#### 第二步：客户端如何找到父实体？
+
+服务端创建 classified 时设置了 `SetParent`——这个关系会通过网络同步给客户端。客户端在 `OnEntityReplicated` 钩子里查询父实体。
+
+看 `inventoryitem_classified.lua` 第 7-15 行：
+
+```7:15:scripts/prefabs/inventoryitem_classified.lua
+local function OnEntityReplicated(inst)
+    inst._parent = inst.entity:GetParent()
+    if inst._parent == nil then
+        print("Unable to initialize classified data for inventory item")
+	elseif not inst._parent:TryAttachClassifiedToReplicaComponent(inst, "inventoryitem") then
+        inst._parent.inventoryitem_classified = inst
+        inst.OnRemoveEntity = OnRemoveEntity
+    end
+end
+```
+
+**执行流程**：
+
+1. **`inst.entity:GetParent()`**：获取父实体——**这个父实体是服务端通过 `SetParent` 设定的**，客户端通过网络同步拿到
+2. **`TryAttachClassifiedToReplicaComponent(inst, "inventoryitem")`**：尝试把 classified 挂给主实体的 `inst.replica.inventoryitem`——如果成功（主实体已经有对应 replica），就挂上
+3. **否则**：`inst._parent.inventoryitem_classified = inst`——直接挂到主实体的字段上，等主实体创建 replica 时通过 `inst.inventoryitem_classified` 拿到它
+
+**`TryAttachClassifiedToReplicaComponent`**（在 `entityreplica.lua` 第 88-95 行）：
+
+```88:95:scripts/entityreplica.lua
+function EntityScript:TryAttachClassifiedToReplicaComponent(classified, name)
+	local cmp = rawget(self.replica, "_")[name]
+	if cmp then
+		cmp:AttachClassified(classified)
+		return true
+	end
+	return false
+end
+```
+
+**注意时序问题**：在客户端，**classified 和 replica 的创建顺序是不确定的**——有可能 replica 先创建（找不到 classified，等着），也可能 classified 先创建（找不到 replica，存在主实体字段上等着）。这段代码处理两种时序：
+
+- **replica 先到 classified 后到**：classified 的 `OnEntityReplicated` 成功调用 `AttachClassified`
+- **classified 先到 replica 后到**：classified 存到 `inst.inventoryitem_classified`，replica 的构造函数里去读（回顾 6.2.2 节的 replica 构造代码）
+
+这是 Klei 对"分布式时序不确定性"的鲁棒处理。
+
+#### 第三步：销毁时的级联
+
+看 `inventoryitem_classified.lua` 第 1-5 行：
+
+```1:5:scripts/prefabs/inventoryitem_classified.lua
+local function OnRemoveEntity(inst)
+    if inst._parent ~= nil then
+        inst._parent.inventoryitem_classified = nil
+    end
+end
+```
+
+**classified 被销毁时**：清理 `inst._parent.inventoryitem_classified = nil`——把主实体上对这个 classified 的引用置空，避免悬挂引用（主实体如果继续活着，它不该持有一个已销毁的 classified）。
+
+#### 第四步：父子关系的两种用法
+
+**用法 1**：物品独立 classified（每个物品一个）
+
+```
+物品实体（刀）
+  ├── inventoryitem_classified（子）
+        ├── percentused
+        ├── perish
+        └── ...
+```
+
+**特点**：每个物品一个 classified——游戏里 1000 件物品就有 1000 个 classified。虽然多，但每个都很小，总成本可控。
+
+**用法 2**：玩家共享 classified（所有相关组件共用一个）
+
+```
+玩家实体（Wilson）
+  ├── player_classified（子）
+        ├── health.currenthealth
+        ├── health.maxhealth
+        ├── hunger.currenthunger
+        ├── hunger.maxhunger
+        ├── sanity.currentsanity
+        └── ...（50+ 字段）
+```
+
+**特点**：所有玩家相关组件都共用这一个 classified——节省网络实体数（不像物品那样每个组件一个）。
+
+> **开发逻辑**：**物品量多、但每个简单** → 一物一 classified。**玩家量少、但数据复杂** → 多组件共享 classified。这是针对两种不同数据规模的最优解。你写 Mod 时要根据自己的场景选型——比如"为每个怪物加一个专属 classified"vs"为所有怪物共用一个 boss_classified"——各有优劣。
+
+---
+
+### 6.3.6 进阶：Serialize / Deserialize 模式
+
+Classified 和主实体之间的数据流是**双向的**——服务端把主组件的状态变化"**序列化**"进 classified，客户端从 classified "**反序列化**"出状态并通知主实体。
+
+#### 第一步：Serialize（服务端 → classified）
+
+看 `inventoryitem_classified.lua` 第 23-25 行：
+
+```23:25:scripts/prefabs/inventoryitem_classified.lua
+local function SerializePercentUsed(inst, percent)
+    inst.percentused:set((percent == nil and 255) or (percent <= 0 and 0) or math.clamp(math.floor(percent * 100 + .5), 1, 100))
+end
+```
+
+**做的事**：接收一个 `percent`（0-1 浮点数），转换成 0-100 的字节值放到 net 变量。
+
+**几个技巧**：
+
+- **`nil → 255`**：percent 是 nil 表示"无意义"——用 255 这个特殊值标记
+- **`<=0 → 0`**：clamp 下限
+- **`math.floor(percent * 100 + .5)`**：乘 100 后四舍五入（`+ .5` 再 floor 是 Lua 传统的四舍五入写法）
+- **`math.clamp(x, 1, 100)`**：clamp 到 1-100（避免和 0/255 的特殊值冲突）
+
+**调用时机**：主组件的字段变化时——通常在 replica 的 SetXxx 里调用。看 `inventoryitem_replica.lua` 第 16 行：
+
+```lua
+inst:ListenForEvent("percentusedchange", function(inst, data) self.classified:SerializePercentUsed(data.percent) end)
+```
+
+**整个链路**：
+
+```
+服务端：主组件 finiteuses 的耐久变化
+  ↓
+finiteuses 组件 push "percentusedchange" 事件，data = {percent = 0.5}
+  ↓
+inventoryitem_replica 监听器触发 → self.classified:SerializePercentUsed(0.5)
+  ↓
+Serialize 函数里：inst.percentused:set(50)（把 0.5 转成 50）
+  ↓
+net 变量标记脏，下一帧同步到客户端
+```
+
+#### 第二步：Deserialize（classified dirty → 主实体）
+
+客户端收到 net 变量更新后的流程。看 `inventoryitem_classified.lua` 第 27-31 行：
+
+```27:31:scripts/prefabs/inventoryitem_classified.lua
+local function DeserializePercentUsed(inst)
+    if inst.percentused:value() ~= 255 and inst._parent ~= nil then
+        inst._parent:PushEvent("percentusedchange", { percent = inst.percentused:value() / 100 })
+    end
+end
+```
+
+**做的事**：读 net 变量（已经是最新值），转换回 0-1 浮点数，在**主实体上 push 事件**。
+
+**关键两句**：
+
+- **`inst.percentused:value() ~= 255`**：跳过"无意义"值（255 是 Serialize 里用的特殊标记，客户端不处理）
+- **`inst._parent:PushEvent(...)`**：把事件 push 到**主实体**上——这样主实体的 UI、动画系统能响应
+
+**调用时机**：通过 dirty 事件监听器触发。看 `RegisterNetListeners`（第 131-140 行）：
+
+```131:140:scripts/prefabs/inventoryitem_classified.lua
+local function RegisterNetListeners(inst)
+    inst:ListenForEvent("imagedirty", OnImageDirty)
+    inst:ListenForEvent("percentuseddirty", DeserializePercentUsed)
+    inst:ListenForEvent("perishdirty", DeserializePerish)
+    inst:ListenForEvent("rechargedirty", DeserializeRecharge)
+    inst:ListenForEvent("rechargetimedirty", DeserializeRechargeTime)
+	inst:ListenForEvent("inventoryitem_stacksizedirty", OnStackSizeDirty, inst._parent)
+    inst:ListenForEvent("iswetdirty", OnIsWetDirty, inst._parent)
+    inst:ListenForEvent("isacidsizzlingdirty", OnIsAcidSizzlingDirty, inst._parent)
+end
+```
+
+**`"percentuseddirty"`** 是 net 变量声明时的第三个参数——客户端收到 dirty 就会触发这个事件。
+
+#### 第三步：为什么要 Serialize/Deserialize？——压缩与解压
+
+本质上，Serialize/Deserialize 是**浮点数 ↔ 整数（字节）**的转换：
+
+```
+0.0 - 1.0 浮点数
+   ↓ Serialize：× 100 → 整数
+0 - 100 整数
+   ↓ 网络传输（8 bits）
+0 - 100 整数
+   ↓ Deserialize：÷ 100 → 浮点数
+0.0 - 1.0 浮点数
+```
+
+**为什么不直接传 float？** 因为 float 是 32 bits，byte 是 8 bits——对于 0-1 百分比，byte 精度完全足够（1%），**省 75% 带宽**。
+
+这就是 classified 设计里的"**精度交换**"模式——**用合适的整数类型代替浮点数**，牺牲一些精度换带宽。
+
+#### 第四步：`ForcePerishDirty` —— 强制触发同步
+
+`inventoryitem_classified.lua` 第 37-41 行有一个特殊函数：
+
+```37:41:scripts/prefabs/inventoryitem_classified.lua
+--V2C: used to force color refresh when spoilage changes around 50%/20%
+local function ForcePerishDirty(inst)
+    inst.perish:set_local(inst.perish:value())
+    inst.perish:set(inst.perish:value())
+end
+```
+
+**做的事**：**先 `set_local` 改成另一个值，再 `set` 改回原值**——强制网络标记脏，触发客户端的 dirty 事件。
+
+**为什么要这样？** 因为 net 变量的 `:set` 只在**值真正改变时**才标记脏——如果服务端反复 set 同一个值，客户端什么事件都不会触发。
+
+但**有些场景需要"无值变化的强制刷新"**——比如当腐烂度刚好跨越了 50%/20% 这种视觉阈值时，需要重新计算颜色（`V2C:` 注释说明了这点）。这时就用 `set_local + set` 这个"假动作"强制触发。
+
+> **新手记忆**：**Serialize 是"打包浮点数"，Deserialize 是"拆包还原浮点数"**。能用整数表达的就别用浮点数，这是饥荒联机版省带宽的核心思路。
+
+---
+
+### 6.3.7 老手进阶：`player_classified` 的整体架构
+
+`scripts/prefabs/player_classified.lua` 是官方最大的 classified 文件——**1669 行**，挂了 **50+ 个 net 变量**。理解它的组织哲学对写自定义 classified 是最大的营养。
+
+#### 第一步：文件组织
+
+打开文件看结构：
+
+```
+player_classified.lua
+├── 第 1-10 行：依赖、局部变量
+├── 第 11-20 行：辅助函数 SetValue / SetDirty / PushPausePredictionFrames
+├── 第 27-93 行：各组件事件回调（OnHealthDelta / OnHungerDelta 等）
+├── 第 94-1000 行：业务逻辑函数（各种 SerializeXxx / DeserializeXxx / OnXxxDirty）
+├── 第 1000-1300 行：RegisterNetListeners、AttachClassified 等辅助设施
+├── 第 1330-1669 行：主工厂函数 fn()
+│     ├── CreateEntity + AddTransform + AddNetwork + Hide
+│     ├── AddTag("CLASSIFIED")
+│     ├── 声明 50+ 个 net 变量（分组：Health / Hunger / Sanity / ...）
+│     ├── 设置默认值
+│     ├── SetPristine
+│     ├── 客户端/服务端分支
+│     └── return inst
+└── return Prefab("player_classified", fn)
+```
+
+**规律**：按"**业务逻辑 → 注册与辅助 → 实体工厂**"的顺序组织。业务逻辑永远在最上，主函数永远在最下。
+
+#### 第二步：字段分组
+
+看 `player_classified.lua` 第 1341-1370 行的字段声明节选：
+
+```1341:1370:scripts/prefabs/player_classified.lua
+    inst.currenthealth = net_ushortint(inst.GUID, "health.currenthealth", "healthdirty")
+    inst.maxhealth = net_ushortint(inst.GUID, "health.maxhealth", "healthdirty")
+    inst.healthpenalty = net_byte(inst.GUID, "health.penalty", "healthdirty")
+    inst.istakingfiredamage = net_bool(inst.GUID, "health.takingfiredamage", "istakingfiredamagedirty")
+    inst.istakingfiredamagelow = net_bool(inst.GUID, "health.takingfiredamagelow", "istakingfiredamagelowdirty")
+    inst.issleephealing = net_bool(inst.GUID, "health.healthsleep")
+    inst.ishealthpulseup = net_bool(inst.GUID, "health.dodeltaovertime(up)", "healthdirty")
+    inst.ishealthpulsedown = net_bool(inst.GUID, "health.dodeltaovertime(down)", "healthdirty")
+	inst.lunarburnflags = net_tinybyte(inst.GUID, "health.lunarburnflags", "lunarburnflagsdirty")
+```
+
+**命名约定**：
+
+- **字段名就是字面意思**：`currenthealth`、`maxhealth`——和 `inst.components.health` 里的字段同名
+- **标识字符串前缀**：**`health.xxx`**——表明这是 health 相关的字段
+- **dirty 事件名复用**：多个字段共享同一个 dirty 事件名（如 `"healthdirty"`）——节省监听器数量
+
+**为什么多个字段共享 dirty 事件？** 因为：
+
+- **UI 刷新一般是整体的**：血条显示会同时用 currenthealth 和 maxhealth——一个触发就重绘整个血条
+- **节省回调数量**：3 个字段共用 1 个监听器，比 3 个字段 3 个监听器要轻
+
+#### 第三步：`player_classified` 的可见性——"所有人可见"
+
+注意 `player_classified.lua` 里**没有调用 `SetClassifiedTarget`**——所以它是**所有客户端都能看到的**。
+
+**原因**：玩家的 HUD 信息（血量、饥饿、理智等）不只自己看——其他玩家也要看：
+
+- 查看玩家列表
+- 判断队友状态
+- 做"帮队友续命"的判断
+
+**对比**：`inventory_classified.lua` 是 **只给 owner 看的**——所以要 SetClassifiedTarget。
+
+#### 第四步：`player_classified` 的生命周期
+
+**创建时机**：玩家实体初始化时（在 `player_common.lua` 里），SpawnPrefab 一个 `player_classified` 并设为 player 的子。
+
+**销毁时机**：玩家实体销毁时（退出游戏、换角色）自动级联销毁——因为是子实体。
+
+**持久化**：**`persists = false`**——不进存档。下次游戏启动时重新创建，数据由主组件的 OnLoad 重新填进去。
+
+#### 第五步：如何追踪一个字段的完整链路？
+
+以"玩家 A 被打了一拳，血量从 100 变成 50，玩家 B 的客户端是怎么看到的"为例——这是理解整套机制的黄金路径：
+
+```
+服务端（玩家 A 所在服务端）：
+1. combat 组件调用 health.DoDelta(-50)
+2. health.lua 的 SetVal 设置 self.currenthealth = 50
+3. Class 的 onset 触发 oncurrenthealth(self, 50)
+4. oncurrenthealth（health.lua 第 18 行）调用 self.inst.replica.health:SetCurrent(50)
+5. health_replica.SetCurrent 调用 self.classified:SetValue("currenthealth", 50)
+6. player_classified 的 SetValue（第 11-14 行）调用 inst.currenthealth:set(50)
+7. net 变量标记脏
+
+网络层：
+8. 下一个 tick 发出更新包
+
+玩家 B 的客户端：
+9. 收到 net 变量更新，inst.currenthealth 值变为 50
+10. 触发 "healthdirty" 事件
+11. player_classified 的 RegisterNetListeners 里监听的处理函数触发
+12. 处理函数在 player 实体上 PushEvent（比如 "healthchange"）
+13. HUD 监听器响应，重绘血条
+```
+
+**13 步链路，每一步都是独立可替换的模块**——这就是组件化设计的威力。你可以在任何一步插入自己的代码（加一个 buff 监听、改 UI 显示、拦截 SetValue 等）。
+
+---
+
+### 6.3.8 老手进阶：自定义 classified 的六个陷阱
+
+假设你写了一个"**灵能**"组件 `myability`（6.2.8 节示范过 replica），要配套一个 `myability_classified`——这里是你很容易栽的六个坑。
+
+#### 陷阱 1：忘记在 Prefab 里注册 classified
+
+```lua
+-- ❌ 错：只写了 _classified.lua 文件，但没注册到 PrefabFiles
+PrefabFiles = {
+    "myability_mod",
+    -- "myability_classified",   ← 忘了加
+}
+```
+
+**症状**：`SpawnPrefab("myability_classified")` 报错 `Can't find prefab`。
+
+**解决**：**所有 classified 的 lua 文件都必须在 modmain 的 `PrefabFiles` 里登记**。
+
+---
+
+#### 陷阱 2：SetParent 忘了或写反
+
+```lua
+-- ❌ 错：没 SetParent，classified 成了"孤儿"
+local classified = SpawnPrefab("myability_classified")
+-- 漏了 classified.entity:SetParent(inst.entity)
+
+-- ❌ 错：写反了
+inst.entity:SetParent(classified.entity)   -- 主实体变成 classified 的儿子？！
+```
+
+**症状**：
+- 没 SetParent：classified 不跟随主实体休眠/移动/销毁——内存泄漏
+- 写反：主实体会被当作 classified 的子，各种场景切换会崩
+
+**解决**：**始终是 `classified.entity:SetParent(mainentity.entity)`**——classified 是**子**，主实体是**父**。
+
+---
+
+#### 陷阱 3：客户端代码访问 classified 但没判空
+
+```lua
+-- ❌ 错：时序不可控
+function MyAbility:GetMana()
+    return self.classified.currentmana:value()   -- 崩：self.classified 可能 nil
+end
+
+-- ✅ 对：防御式
+function MyAbility:GetMana()
+    if self.classified ~= nil then
+        return self.classified.currentmana:value()
+    else
+        return 0  -- 默认值
+    end
+end
+```
+
+**原因**：6.3.5 节讲过，classified 在客户端的 attach 是异步的——有窗口期 `self.classified == nil`。客户端代码必须**所有地方都防御式判空**。
+
+---
+
+#### 陷阱 4：net 变量名全局冲突
+
+```lua
+-- myability_classified.lua
+inst.currentmana = net_ushortint(inst.GUID, "health.currenthealth", "dirtyhealth")  -- ❌ 用了 health 的名字！
+```
+
+**net 变量的标识符是在 GUID 维度唯一的**——但如果你复制别人代码时没改名字，有概率撞名导致引擎错误覆盖。
+
+**解决**：**名字永远带上 Mod 前缀**：
+
+```lua
+inst.currentmana = net_ushortint(inst.GUID, "mymod.myability.currentmana", "currentmanadirty")
+```
+
+---
+
+#### 陷阱 5：SerializeXxx 里用了浮点数
+
+```lua
+-- ❌ 错：精度浪费
+local function SerializeMana(inst, mana)
+    inst.currentmana:set(mana)   -- mana 是 0-100 浮点数，但 net 是 ushortint
+end
+
+-- ✅ 对：四舍五入
+local function SerializeMana(inst, mana)
+    inst.currentmana:set(math.floor(mana + .5))
+end
+```
+
+**原因**：net_ushortint 的 `:set` 如果收到非整数参数，有些引擎实现会 `math.floor`（丢弃小数）、有些会 `math.ceil`、有些直接报错——不可靠。**显式 `math.floor(x + .5)` 做四舍五入**是最稳的。
+
+---
+
+#### 陷阱 6：Deserialize 在客户端改服务端字段
+
+```lua
+-- ❌ 错：客户端不能写服务端组件
+local function DeserializeMana(inst)
+    if inst._parent and inst._parent.components.myability then
+        inst._parent.components.myability.currentmana = inst.currentmana:value()   -- 客户端这里 components.myability == nil
+    end
+end
+
+-- ✅ 对：通过事件通知，让主组件或 replica 处理
+local function DeserializeMana(inst)
+    if inst._parent ~= nil then
+        inst._parent:PushEvent("manachange", { mana = inst.currentmana:value() })
+    end
+end
+```
+
+**原因**：客户端根本没有 `components.myability`（客户端 components 几乎空）——直接改会崩。**客户端和 classified 通信的唯一合法方式是 `PushEvent`**，让监听事件的代码（通常是 UI）处理。
+
+#### 第七步：自定义 classified 的最小骨架
+
+结合所有经验，一个 **Mod 自定义 classified 的最小可用模板**：
+
+```lua
+-- scripts/prefabs/myability_classified.lua
+
+local function SerializeMana(inst, mana)
+    inst.currentmana:set(math.floor(mana + .5))
+end
+
+local function DeserializeMana(inst)
+    if inst._parent ~= nil then
+        inst._parent:PushEvent("manachange", { mana = inst.currentmana:value() })
+    end
+end
+
+local function RegisterNetListeners(inst)
+    inst:ListenForEvent("currentmanadirty", DeserializeMana)
+end
+
+local function OnRemoveEntity(inst)
+    if inst._parent ~= nil then
+        inst._parent.myability_classified = nil
+    end
+end
+
+local function OnEntityReplicated(inst)
+    inst._parent = inst.entity:GetParent()
+    if inst._parent == nil then
+        print("Unable to initialize myability classified")
+    elseif not inst._parent:TryAttachClassifiedToReplicaComponent(inst, "myability") then
+        inst._parent.myability_classified = inst
+        inst.OnRemoveEntity = OnRemoveEntity
+    end
+end
+
+local function fn()
+    local inst = CreateEntity()
+
+    if TheWorld.ismastersim then
+        inst.entity:AddTransform()
+    end
+    inst.entity:AddNetwork()
+    inst.entity:Hide()
+    inst:AddTag("CLASSIFIED")
+
+    inst.currentmana = net_ushortint(inst.GUID, "mymod.myability.currentmana", "currentmanadirty")
+    inst.maxmana = net_ushortint(inst.GUID, "mymod.myability.maxmana", "maxmanadirty")
+
+    inst.currentmana:set(100)
+    inst.maxmana:set(100)
+
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        inst.OnEntityReplicated = OnEntityReplicated
+        inst:DoStaticTaskInTime(0, RegisterNetListeners)
+        return inst
+    end
+
+    inst.persists = false
+    inst.SerializeMana = SerializeMana
+
+    return inst
+end
+
+return Prefab("myability_classified", fn)
+```
+
+**可以直接复制使用**——把"myability" 改成你的组件名，把字段改成你的字段。
+
+---
+
+### 6.3.9 小结
+
+- **Classified 是"一个专门承载 net 变量的隐形联网实体"**——它存在的意义是为主实体的某类数据提供**独立的网络载体**，解决"字段混杂、可见性难控、生命周期耦合"三大问题。
+- **Classified 实体的标志性特征**：`AddNetwork + Hide + AddTag("CLASSIFIED") + SetParent` 四件套，外加 `persists = false`（不入存档）。
+- **`CLASSIFIED` tag 是"请忽略我"信号**——`FindEntities`、调试 UI、实体选择等系统都会跳过 classified。
+- **可见性过滤**：默认所有人可见；`inst.Network:SetClassifiedTarget(owner)` 让 classified **只给指定玩家可见**——用于背包这类隐私数据。
+- **net 变量类型速查**：`net_bool`（1 bit）、`net_tinybyte`（3 bits）、`net_smallbyte`（6 bits）、`net_byte`（8 bits）、`net_ushortint`（16 bits）、`net_float`（32 bits）、`net_hash`（字符串哈希）、`net_string`（真字符串）、`net_event`（纯事件）。**能小就小**。
+- **脏事件（dirty event）机制**：net 变量声明时的第三个参数是事件名——客户端收到更新时自动触发这个事件，供 `RegisterNetListeners` 监听。多字段共享同一事件是常见优化。
+- **父子关系的三个好处**：位置跟随、休眠同步、销毁级联——这是用 `classified.entity:SetParent(mainentity.entity)` 一行代码换来的。
+- **客户端挂载时序不确定**：`OnEntityReplicated` 通过 `TryAttachClassifiedToReplicaComponent` 处理"replica 先到 vs classified 先到"两种情况——是 Klei 对分布式时序的鲁棒处理。
+- **Serialize/Deserialize 模式**：服务端 Serialize（浮点 → 整数 → net 变量），客户端 Deserialize（net 变量 → 整数 → 浮点 → PushEvent 到主实体）。**用精度换带宽**是核心设计。
+- **`player_classified` 的规模**：1669 行、50+ 字段、所有人可见——但仍保持清晰的"按组件分组、命名统一、多字段共享 dirty 事件"的组织方式。
+- **自定义 classified 六陷阱**：忘了登记到 PrefabFiles、SetParent 写反/遗漏、客户端不判空崩溃、net 变量名字撞名、Serialize 用浮点、Deserialize 客户端写服务端字段——每个都是实际写时会栽的跟头。
+
+> **下一节预告**：6.4 节我们讲 **Timer 组件**——"如何优雅地管理组件级的多个计时任务"。它和 `inst:DoPeriodicTask` 的手动计时有什么区别？多个 Mod 往同一个组件加计时任务时会不会互相干扰？答案在下一节。
 
 ## 6.4 Timer 组件——组件级计时器的正确使用
 
