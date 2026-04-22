@@ -3467,4 +3467,351 @@ dst_compatible = true              -- 是否兼容联机版
 
 ## 5.7 实战：创建一个全新的自定义物品
 
-（待编写）
+### 本节导读
+
+前面六节我们建立了 Prefab 系统的完整知识体系——从「图纸是什么」「工厂函数五段式」「Pristine 分界线」到「Tag 身份识别」「资源加载流程」。这一节是**整章的实战总结**：我们从零开始做一把叫「**灵能短剑**」（`psionic_shortsword`）的武器 Mod，把前六节所有的知识点串起来。
+
+> **新手**读完 5.7.1-5.7.3 就能做出一把"看得见、捡得起、能堆叠"的物品，进游戏调个 `c_give("psionic_shortsword")` 就有成就感；**进阶读者**继续看 5.7.4-5.7.6，会给它加上**武器伤害、有限耐久、物品栏图标、合成配方**——它就是一把真正可以玩的武器了；**老手**可以跳到 5.7.7-5.7.8，了解如何用 `modinfo.configuration_options` 让玩家自己调伤害，以及用 `AddPrefabPostInit` **不创建新 Prefab 也能魔改原版长矛**。最后 5.7.9 列出所有我在写这个教程时亲手踩过的坑，供你速查。
+
+**本节选定的物品设计**：
+
+| 属性 | 数值 | 说明 |
+|------|------|------|
+| 名字 | 灵能短剑 | 英文 `psionic_shortsword` |
+| 基础伤害 | 38 | 比长矛（34）略高 |
+| 耐久次数 | 150 | 和长矛相同 |
+| 特殊效果 | 命中时消耗施法者 1 点理智 | 展示多组件配合 |
+| 合成材料 | 3 金块 + 1 噩梦燃料 + 2 木头 | 在炼金引擎处合成 |
+
+我们用**灵能短剑**做例子，因为它涵盖的知识点正好**完整覆盖前六节**：
+
+- `SetBank / SetBuild`（5.1、5.2）——如何复用长矛的动画让它有可见外观
+- 工厂函数五段式（5.2.2）——一步步搭骨架
+- `SetPristine` 分界（5.4）——哪些代码在客户端执行
+- tag 提前声明（5.5.4）——`"weapon"`、`"sharp"` 如何做性能优化
+- `Assets` 和 `PrefabFiles`（5.6）——Mod 资源声明的正确姿势
+
+---
+
+### 5.7.1 快速入门：Mod 目录骨架与 `modinfo.lua`
+
+打开你本地的 Don't Starve Together 的 `mods/` 目录（通常在 Steam 安装目录下），新建一个文件夹 `psionic_shortsword_mod/`。这个文件夹就是我们整个 Mod 的"工作区"。
+
+#### 第一步：最小目录结构
+
+对一个**物品类 Mod**来说，最小的目录结构是：
+
+```
+psionic_shortsword_mod/
+├── modinfo.lua          ← Mod 的元信息（名字、作者、版本、兼容性）
+├── modmain.lua          ← Mod 的入口文件（加载 Prefab、注册资源）
+├── modicon.tex          ← Mod 在游戏列表里的 128x128 图标
+├── modicon.xml          ← 图标的图集描述
+├── scripts/
+│   └── prefabs/
+│       └── psionic_shortsword.lua   ← 我们的物品定义
+├── anim/                ← 动画资源（.zip）
+└── images/
+    └── inventoryimages/
+        ├── psionic_shortsword.tex   ← 64x64 物品栏图标
+        └── psionic_shortsword.xml   ← 对应的图集
+```
+
+**每个文件的职责**：
+
+| 文件/目录 | 职责 | 什么时候必须 |
+|-----------|------|--------------|
+| `modinfo.lua` | 描述 Mod 本身（不含游戏逻辑） | **必须**——游戏靠它识别 Mod |
+| `modmain.lua` | Mod 的引导脚本——注册资源、加载 Prefab、设置 STRINGS | **必须**——游戏启动时执行它 |
+| `modicon.tex/xml` | Mod 列表里的小图标 | **必须**（否则 Mod 列表里显示红框） |
+| `scripts/prefabs/*.lua` | 具体的 Prefab 定义 | 想添加新物品就**必须** |
+| `anim/*.zip` | 动画资源 | 有自定义动画时**必须** |
+| `images/inventoryimages/*` | 物品栏 64x64 图标 | 有新物品时**必须**（否则图标是紫底红叹号） |
+
+> **开发逻辑**：Klei 强制要求这几个文件，是因为游戏在"扫描 Mod 列表"阶段就要读 `modinfo.lua`，此时根本没执行 `modmain.lua`——两个文件解耦是为了**让玩家在启用 Mod 之前就能看到它的信息**（名字、作者、配置选项）。
+
+#### 第二步：写 `modinfo.lua`
+
+对照 `mods/联机版mod/renwu/modinfo.lua` 的风格，我们的版本如下：
+
+```lua
+name = "灵能短剑"
+description = "来自《饥荒联机版 Mod 开发白皮书》第 5 章实战教程的示例物品。"
+author = "你的名字"
+version = "1.0"
+
+forumthread = ""
+api_version = 10               -- 联机版 API 版本，填 10 即可
+dst_compatible = true          -- 兼容联机版（DST）
+dont_starve_compatible = false -- 不兼容单机版
+
+icon_atlas = "modicon.xml"
+icon = "modicon.tex"
+
+-- 联机关键开关
+all_clients_require_mod = true  -- 客机必须装这个 Mod 才能连进来
+client_only_mod = false         -- 不是纯客户端 Mod（它改了游戏逻辑）
+server_only_mod = false         -- 也不是纯服务端 Mod
+
+-- 先留空，5.7.7 节再加配置项
+configuration_options = {}
+```
+
+**关键字段解释**：
+
+| 字段 | 我们的值 | 说明 |
+|------|---------|------|
+| `api_version` | `10` | 联机版 API，固定 `10`（**不要**填成 `6` 那是单机版） |
+| `dst_compatible` | `true` | 联机版兼容 |
+| `dont_starve_compatible` | `false` | 单机版不兼容（联机和单机数据结构有差异） |
+| `all_clients_require_mod` | `true` | 因为我们**加了新 Prefab**——客户端本地必须有资源 |
+| `client_only_mod` | `false` | 我们改游戏逻辑（加物品），不是纯 UI Mod |
+
+> **为什么 `all_clients_require_mod = true`？** 回顾 5.6.8 节的坑 6：主机启用这个 Mod 时，Lua 脚本会自动同步给客户端，但客户端本地**必须自己有资源**（`.zip`、`.tex`、`.xml`），否则他们看到的"灵能短剑"会是紫底红叹号。
+
+#### 第三步：写一个最小的 `modmain.lua`（暂时留空）
+
+```lua
+-- modmain.lua 最小版
+-- 让 env（Mod 沙箱环境）能直接访问全局变量
+GLOBAL.setmetatable(env, {
+    __index = function(t, k)
+        return GLOBAL.rawget(GLOBAL, k)
+    end
+})
+
+-- 先声明一个空的 PrefabFiles，5.7.3 节我们填它
+PrefabFiles = {}
+Assets = {}
+```
+
+**那段 `setmetatable(env, ...)` 做什么？** Mod 的脚本是在一个**沙箱环境 `env`** 里跑的——直接写 `TheWorld` 访问不到，要写 `GLOBAL.TheWorld`。这段代码做了一个"**穿透**"：在沙箱里找不到的名字，自动去 `GLOBAL` 里找——相当于以后你写 `TheWorld.ismastersim` 就能直接生效，不用每次都写 `GLOBAL.TheWorld.ismastersim`。
+
+这是 Mod 圈子的惯用法，几乎每个 Mod 的 `modmain.lua` 开头都有这段（见 `renwu/modmain.lua` 第 2-6 行）。
+
+> **新手记忆**：三个文件画个心智图——`modinfo.lua` 是 Mod 的"身份证"，`modmain.lua` 是 Mod 的"主函数"，`scripts/prefabs/*.lua` 是 Mod 里具体的"图纸"。我们到这里身份证写好了，主函数留了个空壳，接下来该画图纸了。
+
+---
+
+### 5.7.2 快速入门：最小可运行的 Prefab —— `psionic_shortsword.lua`
+
+现在进入最重要的一步：写 Prefab 文件。我们**暂时不考虑美术资源**——先让它借用长矛的动画跑起来，看到"物品确实在世界里"，再一步步加功能。
+
+#### 第一步：完整骨架（五段式回顾）
+
+创建 `scripts/prefabs/psionic_shortsword.lua`：
+
+```lua
+-- psionic_shortsword.lua —— 第一版，最小可运行
+local assets =
+{
+    -- 暂时借用长矛的动画，所以这里不声明自己的 anim
+    -- 等 5.7.5 我们加自定义图标时再补
+}
+
+local function fn()
+    -- ① 创建实体 + 引擎组件
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()
+
+    -- ② 物理 + 视觉（借用长矛的动画）
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("spear")
+    inst.AnimState:SetBuild("swap_spear")
+    inst.AnimState:PlayAnimation("idle")
+
+    -- ③ 客户端也要识别的标签
+    inst:AddTag("sharp")
+    inst:AddTag("pointy")
+    inst:AddTag("weapon")   -- 从 weapon 组件提前加到 pristine，优化性能
+
+    MakeInventoryFloatable(inst, "med", 0.05, 0.75)
+
+    -- ④ SetPristine 分界
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    -- ⑤ 服务端组件
+    inst:AddComponent("inspectable")
+    inst:AddComponent("inventoryitem")
+
+    MakeHauntableLaunch(inst)
+
+    return inst
+end
+
+return Prefab("psionic_shortsword", fn, assets)
+```
+
+这 30 行代码已经具备一个可生成、可拾起、可堆叠、被鬼可附身的完整物品了——**它和 `log.lua`、`flint.lua` 的结构几乎一模一样**（回顾 5.1.2 和 5.2.2 节）。我们重点关注两处选型：
+
+#### 第二步：为什么 `SetBank("spear") / SetBuild("swap_spear")`？
+
+这是本节最关键的**偷懒技巧**——**让新物品复用原版的动画资源**。
+
+看一下回忆 5.2.2 节里对 `AnimState` 两个函数的解释：
+
+- `SetBank("spear")` —— 告诉引擎用 `spear` 这个**动画骨架**（包含所有动画片段的骨骼定义）
+- `SetBuild("swap_spear")` —— 告诉引擎用 `swap_spear` 这个**外观皮肤**（具体贴图）
+
+这两个名字来自原版 `scripts/prefabs/spear.lua` 第 37-38 行：
+
+```lua
+inst.AnimState:SetBank("spear")
+inst.AnimState:SetBuild("swap_spear")
+```
+
+**为什么能复用？** 因为联机版的动画系统里，**只要 bank 和 build 的名字在游戏里已经注册过**（长矛已经加载了 `anim/spear.zip` 和 `anim/swap_spear.zip`），任何 Prefab 都可以直接 `SetBank/SetBuild` 到这些资源上。**我们不需要在 `assets` 里重新声明**——因为引擎已经在加载长矛时加载过这些 zip 了。
+
+> **开发逻辑**：原版的 `anim/spear.zip` 在游戏启动时就已加载（因为原版长矛是玩家常合成的物品），我们的新物品直接复用它等于"白嫖"。**坏处**：玩家看到的"灵能短剑"长得和普通长矛一模一样；**好处**：你可以先不用学动画制作，专注于代码逻辑。后面 5.7.5 节会讲怎么换自定义图标。
+
+#### 第三步：为什么提前加 `"weapon"` 标签？
+
+对比 `spear.lua` 第 44-45 行的这条注释：
+
+```lua
+--weapon (from weapon component) added to pristine state for optimization
+inst:AddTag("weapon")
+```
+
+**正常情况**下，你在服务端 `inst:AddComponent("weapon")` 时，组件会**自动**给实体加一个 `"weapon"` 标签——但这个标签是在 replica 同步后客户端才能看到，有几帧延迟。
+
+Klei 的做法是**手动在 pristine 阶段提前加这个标签**，让客户端一拿到实体就能通过 `inst:HasTag("weapon")` 识别它是武器——这样 UI 渲染、动作判断、动画播放都不用等组件同步。这是 5.5.4 节讲的"用 tag 避免组件同步"的典型案例。
+
+> **新手记忆**：**给武器类 Prefab 提前加 `"weapon"` 标签，给光源类提前加 `"lighter"` 标签，给投掷物提前加 `"projectile"` 标签**——这是 Klei 推荐的标准写法，源码里到处都是这种注释。
+
+#### 第四步：验证"能跑"
+
+此时如果我们把 Mod 完整装好（再等 5.7.3 节讲注册），游戏启动控制台输入：
+
+```
+c_spawn("psionic_shortsword")
+```
+
+一个**看起来和长矛一模一样的物品**会出现在你脚下。你可以：
+
+- **走过去** → 提示「拾起」
+- **E 键捡起** → 它进入你的背包
+- **右上角背包槽**显示一把长矛图标（因为我们借用了长矛的 UI）
+
+这时虽然它"看起来像长矛"，但它在**代码层面已经是一个独立的 Prefab**——`c_find("psionic_shortsword")` 能找到它、`inst.prefab == "psionic_shortsword"` 会返回 `true`。
+
+**但它还不能当武器使**——右键砸蜘蛛没有伤害，因为我们还没加 `weapon` 组件。这就是下一节（5.7.4）的事了。
+
+---
+
+### 5.7.3 快速入门：在 `modmain.lua` 里"登记"你的 Prefab
+
+光写了 `psionic_shortsword.lua` 游戏是**认不出它**的——必须在 `modmain.lua` 里登记才能让引擎加载。回顾 5.6.7 节我们讲过的 `PrefabFiles` 和 `Assets` 机制，这节把它落到实处。
+
+#### 第一步：在 `PrefabFiles` 里加文件名
+
+打开 `modmain.lua`，把 `PrefabFiles` 改成：
+
+```lua
+PrefabFiles = {
+    "psionic_shortsword",   -- 对应 scripts/prefabs/psionic_shortsword.lua
+}
+```
+
+**注意三件事**：
+
+1. **不带 `.lua` 后缀**——引擎会自动补
+2. **不带 `prefabs/` 前缀**——引擎会自动加（回顾 5.6.7 节里 `"prefabs/"..prefab_path`）
+3. **文件名全小写**——Linux 专服大小写敏感（5.6.8 节坑 1）
+
+这一行会让 `ModWrangler:RegisterPrefabs` 在游戏启动时做这些事（回顾 5.6.7 节的源码）：
+
+```
+① LoadPrefabFile("prefabs/psionic_shortsword", nil, MODS_ROOT.."psionic_shortsword_mod/")
+② 执行 psionic_shortsword.lua → 拿到 return 的 Prefab 对象
+③ 注册到 Prefabs["psionic_shortsword"] = prefab
+④ 这把"灵能短剑"就能被 SpawnPrefab 找到了
+```
+
+#### 第二步：`Assets = {}` 暂时留空
+
+因为这一版我们**完全复用原版的动画资源**，没有自己的 `.zip`、`.tex`、`.xml`——所以 `Assets` 可以留空：
+
+```lua
+Assets = {}
+```
+
+等 5.7.5 节加物品栏图标时，这里会填几行：
+
+```lua
+-- 预告：5.7.5 节我们会这样补
+Assets = {
+    Asset("ATLAS", "images/inventoryimages/psionic_shortsword.xml"),
+    Asset("IMAGE", "images/inventoryimages/psionic_shortsword.tex"),
+    Asset("ATLAS_BUILD", "images/inventoryimages/psionic_shortsword.xml", 256),
+}
+```
+
+#### 第三步：完整的第一版 `modmain.lua`
+
+```lua
+-- modmain.lua —— 第一版，最小可运行
+GLOBAL.setmetatable(env, {
+    __index = function(t, k)
+        return GLOBAL.rawget(GLOBAL, k)
+    end
+})
+
+PrefabFiles = {
+    "psionic_shortsword",
+}
+
+Assets = {}
+```
+
+**6 行代码，加上 30 行 Prefab**——一个新物品 Mod 就成型了。这个 Mod 装进游戏（放到 `mods/psionic_shortsword_mod/`）+ 主菜单启用，进存档后控制台输入 `c_spawn("psionic_shortsword")`，你就能得到世界上第一把属于你的"灵能短剑"（虽然它还不能打架）。
+
+#### 第四步：理解引擎背后发生了什么
+
+把 5.6 节学到的流程再走一遍——**你启用这个 Mod 后，游戏启动做了哪些事**：
+
+```
+游戏启动
+  │
+  ├── 扫描 mods/psionic_shortsword_mod/modinfo.lua
+  │     ├── 读到 name = "灵能短剑" 显示在 Mod 列表
+  │     └── all_clients_require_mod = true 记录为"硬依赖"
+  │
+  ├── 玩家启用 Mod，加载存档
+  │
+  ├── ModManager:LoadMods
+  │     ├── 执行 modmain.lua（在沙箱 env 里）
+  │     │     ├── setmetatable(env, ...)  让 env 能穿透访问全局
+  │     │     ├── PrefabFiles = {"psionic_shortsword"}
+  │     │     └── Assets = {}
+  │     │
+  │     └── 此时 mod.PrefabFiles 和 mod.Assets 已被 Wrangler 记录
+  │
+  ├── ModWrangler:RegisterPrefabs
+  │     ├── 对每个 PrefabFiles 名字调用 LoadPrefabFile
+  │     │     └── 执行 scripts/prefabs/psionic_shortsword.lua
+  │     │           ├── 返回 Prefab("psionic_shortsword", fn, {})
+  │     │           └── 注册到 Prefabs["psionic_shortsword"] = prefab
+  │     │
+  │     └── 创建虚拟 Prefab "MOD_psionic_shortsword_mod"
+  │           └── TheSim:LoadPrefabs 触发所有资源加载（本例因 Assets 为空，空转）
+  │
+  └── 游戏进行中
+        └── c_spawn("psionic_shortsword") 可以成功执行
+              └── 回顾 5.1.5 节的 SpawnPrefabFromSim 全流程
+```
+
+**你写的 6 行 modmain + 30 行 Prefab**，触发了上面一整条引擎内部的机制——这就是 Mod 系统的魅力：**引擎把你的文件当作一等公民**，和原版 Prefab 一视同仁。
+
+> **新手记忆到这里**：写 Mod 的**最小闭环**是四步——建目录、写 modinfo、写 Prefab、在 modmain 的 PrefabFiles 登记。**缺一不可**。接下来我们进入进阶部分，给这把"看得见的假长矛"加上真正的战斗属性。
+
+---
+
