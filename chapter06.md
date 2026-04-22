@@ -3022,7 +3022,987 @@ return Prefab("myability_classified", fn)
 
 ## 6.4 Timer 组件——组件级计时器的正确使用
 
-（待编写）
+### 本节导读
+
+前面两节（6.2 Replica / 6.3 Classified）我们讲了**联机同步的底层机制**——那是相对复杂的话题。本节换一个简单但极实用的主题：**Timer 组件**。
+
+几乎每一个带"**定时行为**"的 Prefab 都会用到 Timer——比如魏斯（Walter）的 Woby 攻击冷却、WX-78 的充电再生节奏、Tillweed Salve 的 buff 持续时间、Winona 电池的过载计时——都靠它。但 Timer 也是**最常被误用**的组件之一：很多 Mod 用 `DoPeriodicTask` 硬写计时，结果存档读档后 buff 消失、控制台 `c_reset` 后定时器还在鬼祟运行、多个 Mod 的定时器互相覆盖——这些问题 99% 都是"**没用 Timer 组件**"造成的。
+
+> **新手**从 6.4.1-6.4.3 入手，学会 `StartTimer / StopTimer / TimerExists / timerdone 事件`——只要会这五个就能做大多数"倒计时 buff / 冷却时间"功能；**进阶读者**从 6.4.4-6.4.6 深入 Pause/Resume/LongUpdate 高级操作、OnSave/OnLoad 自动存档机制、以及 Timer 和原生 `DoTaskInTime` 的区别；**老手**跳到 6.4.7-6.4.8 学习真实 Prefab（Walter、WX-78、Winona 电池、Wortox）的 Timer 使用模式，以及新手/进阶都容易踩的五个陷阱。
+
+**前置**：本节假设你已经读过 6.1 节（组件生命周期）和 5.2.4 节（实体 OnSave/OnLoad），对组件的存档机制有基本了解。
+
+---
+
+### 6.4.1 快速入门：为什么需要 Timer 组件？
+
+#### 场景 1：一个 buff 要持续 60 秒，然后自动移除
+
+**不用 Timer 组件的写法（原始）**：
+
+```lua
+-- buff 附加上来时
+inst:DoTaskInTime(60, function()
+    inst:RemoveDebuff("speed_buff")
+end)
+```
+
+**这有什么问题？**
+
+1. **无法查询"还剩多久"**：UI 想在屏幕上显示"30 秒后结束"——拿不到剩余时间
+2. **无法暂停**：游戏菜单暂停、玩家被冻结——task 还在倒计时
+3. **无法存档**：玩家退出游戏再进来，这个 task 消失了，buff 永远不会结束（变成永久 buff）
+4. **无法手动中止**：玩家喝了"净化药水"想立刻消除所有 buff——找不到这个 task 怎么取消
+
+**用 Timer 组件的写法**：
+
+```lua
+-- buff 附加时
+inst.components.timer:StartTimer("speed_buff_duration", 60)
+
+-- 监听 timerdone
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "speed_buff_duration" then
+        inst:RemoveDebuff("speed_buff")
+    end
+end)
+```
+
+**立即获得四大好处**：
+
+1. **查询剩余时间**：`inst.components.timer:GetTimeLeft("speed_buff_duration")`
+2. **暂停/恢复**：`PauseTimer / ResumeTimer`
+3. **自动存档**：存档时 Timer 组件的 OnSave 会把"剩余 32.5 秒"写进存档，读档恢复
+4. **手动中止**：`StopTimer("speed_buff_duration")` 一行搞定
+
+#### 场景 2：一个怪物每隔 5 秒重新选择目标
+
+**不用 Timer 的写法**：
+
+```lua
+inst.retargettask = inst:DoPeriodicTask(5, function()
+    inst.components.combat:TryRetarget()
+end)
+```
+
+这在普通怪物身上**确实更简单、更合适**——我们**并不想**让这个任务能暂停/恢复/存档——它是纯粹的运行时行为，跟随实体生死即可。
+
+**所以 Timer 不是"万能替代"**——它是**对"需要存档/可查询/可暂停"的倒计时类场景**的最佳方案。
+
+#### 第三步：两种任务的选型
+
+| 场景 | 推荐 |
+|------|------|
+| buff / debuff 持续时间 | **Timer** |
+| 冷却时间（技能、武器） | **Timer**（可以查 UI 进度） |
+| 物品耐久归零倒计时 | **Timer** |
+| 延迟执行某动作（触发后 3 秒生效） | **Timer** 或 `DoTaskInTime`（看是否需要存档） |
+| 心跳任务（每帧/每秒检查某条件） | `DoPeriodicTask` |
+| 实体临时高亮（0.5 秒后消失） | `DoTaskInTime`（不需要存档） |
+| 预判攻击（用 `DoTaskInTime` 立即触发） | `DoTaskInTime` |
+
+**核心判别标准**：
+
+- **需要 UI 显示进度 / 可查询剩余时间** → Timer
+- **需要存档恢复** → Timer
+- **可能需要暂停** → Timer
+- **纯粹的瞬态任务（随实体销毁就没了）** → 原生 task
+
+> **新手记忆**：**所有"玩家眼里感知到的倒计时"都用 Timer**。玩家看不到的内部状态更新用原生 task。
+
+---
+
+### 6.4.2 快速入门：Timer 的基本 API
+
+打开 `scripts/components/timer.lua`——它只有 **159 行**，是饥荒最精简的组件之一。我们一起过 Timer 的核心 API。
+
+#### Timer 组件的状态存储
+
+看第 1-4 行：
+
+```1:4:scripts/components/timer.lua
+local Timer = Class(function(self, inst)
+    self.inst = inst
+    self.timers = {}
+end)
+```
+
+**只有一个字段 `self.timers`**——这是一张表，以**计时器名称**为键，存储所有活跃的计时器。每个计时器的数据结构是：
+
+```lua
+self.timers["speed_buff"] = {
+    timer = <scheduler_task>,    -- 底层的 DoTaskInTime 任务引用
+    timeleft = 30.5,              -- 剩余时间（用于暂停恢复）
+    end_time = 12345.5,           -- 绝对结束时间戳
+    initial_time = 60,            -- 最初设置的总时长
+    paused = false,               -- 是否暂停中
+}
+```
+
+**注意 `self.timers` 是以字符串名字为 key**——这就是 Timer 组件的"**命名复用**"机制：同一个组件上可以有多个计时器，只要名字不同。
+
+#### API 1：`StartTimer` —— 启动一个计时器
+
+看第 36-54 行：
+
+```36:54:scripts/components/timer.lua
+function Timer:StartTimer(name, time, paused, initialtime_override)
+    if self:TimerExists(name) then
+        print("A timer with the name ", name, " already exists on ", self.inst, "!")
+        return
+    end
+
+    self.timers[name] =
+    {
+        timer = self.inst:DoTaskInTime(time, OnTimerDone, self, name),
+        timeleft = time,
+        end_time = GetTime() + time,
+        initial_time = initialtime_override or time,
+        paused = false,
+    }
+
+    if paused then
+        self:PauseTimer(name)
+    end
+end
+```
+
+**签名**：`StartTimer(name, time, paused, initialtime_override)`
+
+| 参数 | 类型 | 含义 |
+|------|------|------|
+| `name` | string | 计时器的唯一名称（组件范围内） |
+| `time` | number | 剩余时长（秒） |
+| `paused` | bool（可选）| 是否立即进入暂停状态 |
+| `initialtime_override` | number（可选）| 覆盖 initial_time（总时长，用于 GetTimeElapsed 计算） |
+
+**注意第一行的防御**：`if self:TimerExists(name)`——**如果同名计时器已存在，直接返回 + 打印警告**。你**不能简单地"重启"一个计时器**——要先 `StopTimer` 再 `StartTimer`。
+
+**使用示例**（来自 `scripts/prefabs/tillweedsalve.lua` 第 83-84 行）：
+
+```83:84:scripts/prefabs/tillweedsalve.lua
+    inst.components.timer:StopTimer("regenover")
+    inst.components.timer:StartTimer("regenover", BUFF_DURATION)
+```
+
+**这就是"刷新 buff 持续时间"的标准写法**——先停止再启动。
+
+#### API 2：`StopTimer` —— 取消一个计时器
+
+看第 56-66 行：
+
+```56:66:scripts/components/timer.lua
+function Timer:StopTimer(name)
+    if not self:TimerExists(name) then
+        return
+    end
+
+    if self.timers[name].timer ~= nil then
+        self.timers[name].timer:Cancel()
+        self.timers[name].timer = nil
+    end
+    self.timers[name] = nil
+end
+```
+
+**做的事**：
+1. 检查计时器存不存在（不存在就静默返回——不报错）
+2. 取消底层的 scheduler task
+3. 从 `self.timers` 表里删除这个计时器
+
+**注意**：**`StopTimer` 不会触发 `timerdone` 事件**——它是"手动中止"，而不是"正常结束"。
+
+#### API 3：`TimerExists` —— 检查存在
+
+看第 27-29 行：
+
+```27:29:scripts/components/timer.lua
+function Timer:TimerExists(name)
+    return self.timers[name] ~= nil
+end
+```
+
+**一行——但极常用**。几乎每个使用 Timer 的代码都有 `TimerExists` 判断：
+
+- **启动前检查**：`if not inst.components.timer:TimerExists("xxx") then StartTimer(...) end`——避免重复启动
+- **触发前检查**：冷却时间还没结束就不让技能释放——`if not inst.components.timer:TimerExists("cooldown") then DoSkill() end`
+
+#### API 4：`GetTimeLeft / GetTimeElapsed` —— 查询时间
+
+```95:102:scripts/components/timer.lua
+function Timer:GetTimeLeft(name)
+    if not self:TimerExists(name) then
+        return
+    elseif not self:IsPaused(name) then
+        self.timers[name].timeleft = self.timers[name].end_time - GetTime()
+    end
+    return self.timers[name].timeleft
+end
+```
+
+**`GetTimeLeft`** 返回剩余秒数——**注意它会懒更新**：只有没暂停的情况下才根据 `end_time - GetTime()` 重新计算 `timeleft`。如果暂停，直接返回之前保存的值（凝固的剩余时间）。
+
+```116:120:scripts/components/timer.lua
+function Timer:GetTimeElapsed(name)
+    return self:TimerExists(name)
+        and (self.timers[name].initial_time or 0) - self:GetTimeLeft(name)
+        or nil
+end
+```
+
+**`GetTimeElapsed`** 返回已过去的秒数——用 `initial_time - GetTimeLeft` 算出来。
+
+**使用场景**：UI 要画一个进度条：
+
+```lua
+local percent = inst.components.timer:GetTimeElapsed("cooldown") / <总冷却时间>
+-- 画进度条 percent 从 0 到 1
+```
+
+---
+
+### 6.4.3 快速入门：`timerdone` 事件与 OnTimerDone 回调
+
+Timer 组件**不直接接受回调函数**——它通过**事件**机制通知你。
+
+#### 核心机制：`OnTimerDone` 内部回调
+
+看第 31-34 行：
+
+```31:34:scripts/components/timer.lua
+local function OnTimerDone(inst, self, name)
+    self:StopTimer(name)
+    inst:PushEvent("timerdone", { name = name })
+end
+```
+
+**两件事**：
+1. **清理自己**：调用 `StopTimer` 从 `self.timers` 里移除
+2. **触发 `timerdone` 事件**：data 是 `{ name = "xxx" }`
+
+#### 典型的监听模式
+
+**Pattern 1：统一分发 OnTimerDone 回调**
+
+看 `scripts/prefabs/walter.lua` 第 625-629 行：
+
+```625:629:scripts/prefabs/walter.lua
+local function OnTimerDone(inst, data)
+	if data and data.name == "wobybuck" then
+		inst._wobybuck_damage = 0
+	end
+end
+```
+
+然后在工厂函数里：
+
+```lua
+inst:ListenForEvent("timerdone", OnTimerDone)
+```
+
+**这是最常见的模式**——**一个 `OnTimerDone` 函数 + 内部 `if data.name == "xxx" then`** 分发。组件上有几个不同名字的计时器，就有几个分支。
+
+看 `scripts/prefabs/winona_battery_high.lua` 第 763-773 行的多分支：
+
+```763:773:scripts/prefabs/winona_battery_high.lua
+local function OnTimerDone(inst, data)
+	if data then
+		if data.name == "shardloaddelay" then
+			inst.components.timer:ResumeTimer("shardload")
+			StartUpdatingShardLoad(inst)
+		elseif data.name == "shardload" then
+			StopUpdatingShardLoad(inst)
+			OnUpdateShardLoad(inst)
+		elseif data.name == "overloaded" then
+			SetOverloaded(inst, false)
+			inst.components.timer:StartTimer("shardload", CalcOverloadThreshold(inst))
+```
+
+**三个分支对应三个不同的计时器**——这正是 Timer 组件的优势：**一个监听器管多个计时器**。
+
+#### Pattern 2：在 Prefab 定义时用 `OnTimerDoneFn` 字段
+
+看 `scripts/prefabs/weed_defs.lua` 第 143-148 行：
+
+```143:148:scripts/prefabs/weed_defs.lua
+WEED_DEFS.weed_tillweed.OnTimerDoneFn = function(inst, data)
+	if data.name == "make_debris" then
+		local x, y, z = inst.Transform:GetWorldPosition()
+		local tilling_dist = inst.weed_def.spread.ground_dist
+		local debris = TheSim:FindEntities(x, y, z, tilling_dist, DEBRIS_OBJECTS_ONEOF_TAGS)
+		if #debris < TUNING.WEED_TILLWEED_MAX_DEBRIS then
+```
+
+有些"**带 OnXxxFn 字段**"的 Prefab 定义方式是另一种抽象——把回调存在字段里供通用处理器调用。你可以把它看作 `OnTimerDone` 的变种。
+
+#### 完整的 buff 示例
+
+把前面学到的串起来，写一个完整的"速度 buff"——持续 60 秒：
+
+```lua
+-- 在 Prefab 的工厂函数末尾
+inst:AddComponent("timer")
+
+local function OnTimerDone(inst, data)
+    if data.name == "speed_buff" then
+        inst.components.locomotor:RemoveExternalSpeedMultiplier(inst, "speed_buff_src")
+        inst:PushEvent("buff_expired", { type = "speed_buff" })
+    end
+end
+
+inst:ListenForEvent("timerdone", OnTimerDone)
+
+-- 外部代码调用（比如喝了加速药水）
+local function ApplySpeedBuff(inst)
+    inst.components.locomotor:SetExternalSpeedMultiplier(inst, "speed_buff_src", 1.5)
+
+    if inst.components.timer:TimerExists("speed_buff") then
+        inst.components.timer:StopTimer("speed_buff")
+    end
+    inst.components.timer:StartTimer("speed_buff", 60)
+end
+```
+
+**这 12 行代码完整实现了一个"60 秒速度 buff、可叠加刷新、存档恢复"的机制**——如果不用 Timer 组件，你要自己处理存档、查询、暂停等所有细节，代码量至少 3 倍。
+
+---
+
+### 6.4.4 进阶：Pause / Resume / LongUpdate / SetTimeLeft
+
+除了 Start / Stop / GetTimeLeft，Timer 还有几个"**进阶 API**"——它们在特殊场景下非常关键。
+
+#### API：`PauseTimer / ResumeTimer`
+
+看第 72-93 行：
+
+```72:93:scripts/components/timer.lua
+function Timer:PauseTimer(name)
+    if not self:TimerExists(name) or self:IsPaused(name) then
+        return
+    end
+
+    self:GetTimeLeft(name)
+
+    self.timers[name].paused = true
+    self.timers[name].timer:Cancel()
+    self.timers[name].timer = nil
+end
+
+function Timer:ResumeTimer(name)
+    if not self:IsPaused(name) then
+        return
+    end
+
+    self.timers[name].paused = false
+    self.timers[name].timer = self.inst:DoTaskInTime(self.timers[name].timeleft, OnTimerDone, self, name)
+    self.timers[name].end_time = GetTime() + self.timers[name].timeleft
+	return true
+end
+```
+
+**Pause 的技巧**：
+
+- `self:GetTimeLeft(name)` 一行——这是**把当前剩余时间"**锁定**"进 `timeleft` 字段**（回顾 `GetTimeLeft` 的实现，它会先更新 `timeleft = end_time - GetTime()`）
+- 然后 `Cancel` 底层 task
+- 设置 `paused = true`
+
+**Resume 则是反过来**：根据当前的 `timeleft` 新建一个 task，重置 `end_time`。
+
+**典型使用场景**——`scripts/prefabs/skilltree_wortox.lua` 第 39-44 行：
+
+```39:44:scripts/prefabs/skilltree_wortox.lua
+local function OnDeath(inst, data)
+    if inst.components.timer:TimerExists("wortox_panflute_playing") then
+        inst.components.timer:PauseTimer("wortox_panflute_playing")
+    end
+end
+```
+
+**Wortox 死亡时**暂停"**万花筒笛子**"的计时器——这样他复活后可以 `ResumeTimer` 继续倒计时，而不是从头开始或直接消失。
+
+这就是 Timer 相比于原生 `DoTaskInTime` 的最大优势——**"**死亡不会丢失状态**"**。
+
+#### API：`LongUpdate` —— 离散时间补偿
+
+看第 144-148 行：
+
+```144:148:scripts/components/timer.lua
+function Timer:LongUpdate(dt)
+    for k, v in pairs(self.timers) do
+        self:SetTimeLeft(k, self:GetTimeLeft(k) - dt)
+    end
+end
+```
+
+**`LongUpdate(dt)`**——把所有计时器快进 `dt` 秒。
+
+**什么时候被调用？** 主要是**离散时间补偿**场景：
+
+- **玩家睡觉**：`sleep_buff.lua` 调用所有组件的 `LongUpdate(8 * 60)` 让时间"快进 8 分钟"
+- **场景过渡**：从地面到洞穴、从主世界到远古洞穴——可能需要快进时间
+- **世界重置**：`TheWorld:LongUpdate(3600)` 把世界快进 1 小时
+
+**使用这个 API 的是引擎 / 世界系统**——你通常不直接调用 `LongUpdate`。但你要知道**如果你的 Timer 在睡觉快进时需要也跟着快进，Timer 组件已经自动处理了**。
+
+#### API：`SetTimeLeft` —— 手动改剩余时间
+
+看第 104-114 行：
+
+```104:114:scripts/components/timer.lua
+function Timer:SetTimeLeft(name, time)
+    if not self:TimerExists(name) then
+        return
+    elseif self:IsPaused(name) then
+        self.timers[name].timeleft = math.max(0, time)
+    else
+        self:PauseTimer(name)
+        self.timers[name].timeleft = math.max(0, time)
+        self:ResumeTimer(name)
+    end
+end
+```
+
+**两种情况**：
+
+- **暂停中**：直接改 `timeleft`
+- **运行中**：先 Pause（锁定当前时间）→ 改 `timeleft` → Resume（新时间重新开始倒计时）
+
+**`math.max(0, time)`** 保护——防止你传负数把计时器搞崩。
+
+**使用场景**：**玩家喝了"时间加速药剂"** → `SetTimeLeft("some_timer", current - 30)` 减 30 秒——立即触发剩余时间变化。
+
+#### API：`TransferComponent` —— 跨实体转移
+
+看第 150-157 行：
+
+```150:157:scripts/components/timer.lua
+function Timer:TransferComponent(newinst)
+    local newcomponent = newinst.components.timer
+
+    for k, v in pairs(self.timers) do
+        newcomponent:StartTimer(k, self:GetTimeLeft(k), v.paused, v.initial_time)
+    end
+
+end
+```
+
+**`TransferComponent`** 是一个 Klei 约定俗成的组件接口——在"**实体形态切换**"时把旧实体的状态搬到新实体。比如 Woodie 变身 Beaver 时会用到，把 `speed_buff` 的剩余时间原封不动搬到新形态上。
+
+---
+
+### 6.4.5 进阶：Timer 的 OnSave / OnLoad —— 自动存档恢复
+
+这是 Timer 相比于原生 task **最大的价值**——**自动存档和恢复**。
+
+看第 122-142 行：
+
+```122:142:scripts/components/timer.lua
+function Timer:OnSave()
+    local data = {}
+    for k, v in pairs(self.timers) do
+        data[k] =
+        {
+            timeleft = self:GetTimeLeft(k),
+            paused = v.paused,
+            initial_time = v.initial_time,
+        }
+    end
+    return next(data) ~= nil and { timers = data } or nil
+end
+
+function Timer:OnLoad(data)
+    if data.timers ~= nil then
+        for k, v in pairs(data.timers) do
+            self:StopTimer(k)
+            self:StartTimer(k, v.timeleft, v.paused, v.initial_time)
+        end
+    end
+end
+```
+
+#### OnSave 的三个技巧
+
+**技巧 1：`GetTimeLeft` 保证时间准确**
+
+```lua
+timeleft = self:GetTimeLeft(k),
+```
+
+不是存 `v.timeleft`（那可能是很久以前的值），而是**用 `GetTimeLeft(k)` 重新计算**——保证存档写入的时候是最新的剩余秒数。
+
+**技巧 2：`next(data) ~= nil and { timers = data } or nil`**
+
+**只有 data 非空才返回**——没有活跃计时器就返回 nil，不写进存档。回顾 6.1.4 节的 OnSave 铁律——**"只存必要的"**。
+
+**技巧 3：只存状态、不存 task 引用**
+
+`v.timer`（scheduler task）**不存**——存了也没用（task 是运行时对象）。读档时由 `OnLoad` 里的 `StartTimer` 重新创建 task。
+
+#### OnLoad 的关键写法
+
+```lua
+self:StopTimer(k)   -- 先清理可能的残留
+self:StartTimer(k, v.timeleft, v.paused, v.initial_time)
+```
+
+**`StopTimer(k)` 的防御**：读档时实体可能刚刚经过一遍工厂函数（也可能已经启动了默认计时器），先 StopTimer 确保干净状态再 StartTimer——**幂等安全**。
+
+#### 完整的存档生命周期
+
+**场景**：玩家拿着一个"3 分钟后自毁"的道具——存档-退出-重进看一下：
+
+```
+玩家拿起道具
+  ↓
+StartTimer("self_destruct", 180)
+  ↓
+玩家玩了 90 秒（剩余 90 秒）
+  ↓
+玩家保存存档
+  ├── 实体的 GetPersistData 遍历所有组件
+  ├── timer:OnSave() 被调用
+  └── 返回 { timers = { self_destruct = { timeleft = 90, paused = false, initial_time = 180 } } }
+     ↓
+  写入存档文件
+
+玩家退出游戏、重启游戏、加载存档
+  ↓
+实体被重建（SpawnPrefabFromSim）
+  ├── timer 组件被 AddComponent（工厂函数里）
+  │     └── self.timers = {}（空）
+  │
+  └── SetPersistData 被调用
+        └── timer:OnLoad(data) 被调用
+              ├── StopTimer("self_destruct")（防御清理，没有也没事）
+              └── StartTimer("self_destruct", 90, false, 180)
+                    ├── timeleft = 90 ← 从存档恢复的
+                    ├── initial_time = 180 ← 从存档恢复的
+                    └── 新建 scheduler task
+  ↓
+玩家继续游戏，90 秒后自毁
+```
+
+**整条链路**——你一行存档/读档代码都没写，全靠 Timer 组件的 OnSave/OnLoad 帮你搞定。
+
+> **开发逻辑**：**Timer 组件的 OnSave/OnLoad 是"**能力即免费**"的典型体现**——只要你用 Timer 而不是原生 task，就**自动获得**存档恢复能力，哪怕你根本不懂它怎么实现的。**这就是组件系统的美**——用现成的组件而不是自己造轮子。
+
+---
+
+### 6.4.6 进阶：Timer 与原生任务 API 的对比
+
+上面一直说 Timer 比 `DoTaskInTime` 好——但更准确的说法是**两者适用场景不同**。这节做一个对比。
+
+#### 原生任务：`DoTaskInTime` 和 `DoPeriodicTask`
+
+看 `entityscript.lua` 第 1512-1530 行：
+
+```1512:1530:scripts/entityscript.lua
+function EntityScript:DoPeriodicTask(time, fn, initialdelay, ...)
+    --print ("DO PERIODIC", time, self)
+    local periodic = scheduler:ExecutePeriodic(time, fn, nil, initialdelay, self.GUID, self, ...)
+
+    self.pendingtasks = self.pendingtasks or {}
+    self.pendingtasks[periodic] = true
+    periodic.onfinish = task_finish --function() if self.pendingtasks then self.pendingtasks[per] = nil end end
+    return periodic
+end
+
+function EntityScript:DoTaskInTime(time, fn, ...)
+    --print ("DO TASK IN TIME", time, self)
+    local periodic = scheduler:ExecuteInTime(time, fn, self.GUID, self, ...)
+
+    self.pendingtasks = self.pendingtasks or {}
+    self.pendingtasks[periodic] = true
+    periodic.onfinish = task_finish -- function() if self and self.pendingtasks then self.pendingtasks[per] = nil end end
+    return periodic
+end
+```
+
+**两个 API**：
+
+- **`DoTaskInTime(time, fn, ...)`**：`time` 秒后**执行一次** `fn`
+- **`DoPeriodicTask(time, fn, initialdelay, ...)`**：每隔 `time` 秒**周期执行** `fn`
+
+**共同点**：
+
+- 都挂在 `self.pendingtasks` 上——实体销毁时自动取消（避免"僵尸任务"）
+- 都返回一个 `periodic` 对象，可以 `:Cancel()` 手动取消
+
+#### 特性对比表
+
+| 特性 | Timer 组件 | `DoTaskInTime` | `DoPeriodicTask` |
+|------|-----------|----------------|-------------------|
+| 一次性 or 周期性 | 一次性 | 一次性 | 周期性 |
+| 有名字可查询 | ✅ 有（字符串 name） | ❌ 返回 task 对象 | ❌ 返回 task 对象 |
+| 查询剩余时间 | ✅ `GetTimeLeft(name)` | ❌ 没有 API | ❌ 没有 API |
+| 暂停/恢复 | ✅ `Pause/Resume` | ❌ 只能取消 | ❌ 只能取消 |
+| 自动存档恢复 | ✅ Timer:OnSave/OnLoad | ❌ 需要自己做 | ❌ 需要自己做 |
+| 自动 LongUpdate 支持 | ✅ 内置 | ❌ 无 | ❌ 无 |
+| 触发回调 | 间接（通过 `timerdone` 事件） | 直接（闭包） | 直接（闭包） |
+| 实体销毁时自动清理 | ✅ 通过 OnRemoveFromEntity | ✅ 通过 pendingtasks | ✅ 通过 pendingtasks |
+| 开销 | 中等（Class + 事件） | 低（只是 scheduler） | 低（只是 scheduler） |
+
+#### 什么时候用什么？
+
+**用 Timer 组件**：
+
+- **玩家可见的倒计时 / buff 持续时间**——永远用 Timer
+- **技能冷却时间**——永远用 Timer
+- **物品的"xx 秒后生效/失效"**——永远用 Timer
+
+**用 `DoTaskInTime`**：
+
+- **纯内部机制，不需要存档**（如"5 帧后播放下一个动画"）
+- **仅一次性、不需要暂停**（如"拾起物品时的短暂高亮特效"）
+- **回调逻辑非常简单、只有一处用**——写个 Timer 反而啰嗦
+
+**用 `DoPeriodicTask`**：
+
+- **周期性检查**（如"每秒检查一次是否在水里"）
+- **心跳更新**（如 StateGraph 的 tick）
+- **AI 周期性 retarget**
+
+#### 对比示例
+
+**场景**：玩家每受伤一次就显示一个红色受伤特效，1 秒后消失。
+
+**用 Timer（过度工程）**：
+
+```lua
+inst:ListenForEvent("attacked", function(inst)
+    if inst.components.timer:TimerExists("damage_flash") then
+        inst.components.timer:StopTimer("damage_flash")
+    end
+    inst.components.timer:StartTimer("damage_flash", 1)
+    inst:AddTag("damage_flashing")
+end)
+
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "damage_flash" then
+        inst:RemoveTag("damage_flashing")
+    end
+end)
+```
+
+**用 `DoTaskInTime`（合适）**：
+
+```lua
+inst:ListenForEvent("attacked", function(inst)
+    if inst._damage_flash_task then
+        inst._damage_flash_task:Cancel()
+    end
+    inst:AddTag("damage_flashing")
+    inst._damage_flash_task = inst:DoTaskInTime(1, function()
+        inst:RemoveTag("damage_flashing")
+        inst._damage_flash_task = nil
+    end)
+end)
+```
+
+**受伤特效不需要"**玩家查询"、存档恢复、暂停"**——纯瞬态行为**，用 DoTaskInTime 更简洁。
+
+> **开发逻辑**：**Timer 不是"万能方案"**——它有固定成本（组件本身、事件系统）。对于瞬态、不可查询、不存档的任务，**原生 task 更轻量更合适**。写 Mod 时先问自己"**玩家能不能感知这个倒计时？需不需要它存档？**"——能，用 Timer；不能，用 DoTaskInTime。
+
+---
+
+### 6.4.7 老手进阶：Timer 的实战设计模式
+
+这一节我们看真实 Prefab 中 Timer 的**典型使用模式**——这些模式是饥荒联机版的"**标准答案**"，值得直接套用。
+
+#### 模式 1：多计时器统一分发（WX-78 模式）
+
+`scripts/prefabs/wx78.lua` 在玩家身上维护了**至少 5 个**不同的计时器：
+
+```lua
+-- wx78.lua 片段
+inst.components.timer:StartTimer(CHARGEREGEN_TIMERNAME, inst:GetChargeRegenTime())  -- 充电再生
+inst.components.timer:StartTimer(MOISTURETRACK_TIMERNAME, TUNING.WX78_MOISTUREUPDATERATE*FRAMES)  -- 湿度追踪
+inst.components.timer:StartTimer(HUNGERDRAIN_TIMERNAME, TUNING.WX78_HUNGRYCHARGEDRAIN_TICKTIME)  -- 饥饿时的能量流失
+```
+
+对应的 `OnTimerFinished` 函数里**统一分发**：
+
+```lua
+local function OnTimerFinished(inst, data)
+    if data.name == CHARGEREGEN_TIMERNAME then
+        DoChargeRegen(inst)
+    elseif data.name == MOISTURETRACK_TIMERNAME then
+        DoMoistureTrack(inst)
+    elseif data.name == HUNGERDRAIN_TIMERNAME then
+        DoHungerDrain(inst)
+    -- ...
+    end
+end
+
+inst:ListenForEvent("timerdone", OnTimerFinished)
+```
+
+**模式特征**：
+
+- **使用 `local` 常量**（`CHARGEREGEN_TIMERNAME = "chargeregen_timer"`）——避免字符串手写拼错
+- **一个 `OnTimerFinished` 函数 + 多个 elseif 分支**——集中管理
+- **触发后很可能再次 StartTimer**——形成"**循环心跳**"（比如 chargeregen 每次触发后自动续命）
+
+#### 模式 2：互斥计时器（Winona 电池模式）
+
+`scripts/prefabs/winona_battery_high.lua` 第 763-779 行：
+
+```lua
+local function OnTimerDone(inst, data)
+    if data then
+        if data.name == "shardloaddelay" then
+            inst.components.timer:ResumeTimer("shardload")
+            StartUpdatingShardLoad(inst)
+        elseif data.name == "shardload" then
+            StopUpdatingShardLoad(inst)
+            OnUpdateShardLoad(inst)
+        elseif data.name == "overloaded" then
+            SetOverloaded(inst, false)
+            inst.components.timer:StartTimer("shardload", CalcOverloadThreshold(inst))
+        end
+    end
+end
+```
+
+**模式特征**：
+
+- **计时器之间相互联动**：`shardloaddelay` 结束 → Resume `shardload`
+- **状态机式**：一个状态结束必然触发下一个状态——像多米诺骨牌
+- **充分利用 `PauseTimer` + `ResumeTimer`**：让复杂的电池状态机不需要额外字段
+
+这种模式适合"**多阶段倒计时机制**"——如电池充电→过载→冷却→重新充电的循环。
+
+#### 模式 3：刷新式 buff（Tillweed Salve 模式）
+
+`scripts/prefabs/tillweedsalve.lua` 第 76-84 行：
+
+```76:84:scripts/prefabs/tillweedsalve.lua
+local function OnTimerDone(inst, data)
+    if data.name == "regenover" then
+        inst.components.debuff:Stop()
+    end
+end
+
+local function OnExtended(inst, target)
+    inst.components.timer:StopTimer("regenover")
+    inst.components.timer:StartTimer("regenover", BUFF_DURATION)
+```
+
+**模式特征**：
+
+- **先 `StopTimer` 再 `StartTimer`**——经典"**刷新 buff 持续时间**"
+- **命名清晰**：`"regenover"` = "再生结束"，语义直接
+- **触发 `timerdone` 时调 `debuff:Stop()`**——让 debuff 组件自己处理剩余清理
+
+这是**任何"可叠加刷新的 buff"的标准写法**——药水类、食物 buff、魔法 buff 都用这套。
+
+#### 模式 4：短期冷却（WX 扫描仪模式）
+
+`scripts/prefabs/wx78_scanner.lua` 第 242-244 行：
+
+```lua
+owner.components.talker:Say(GetString(owner,"ANNOUNCE_WX_SCANNER_NEW_FOUND"))
+owner.components.timer:StartTimer("ANNOUNCE_WX_SCANNER_NEW_FOUND", 15)
+```
+
+配合**触发前检查**：
+
+```lua
+if not owner.components.timer:TimerExists("ANNOUNCE_WX_SCANNER_NEW_FOUND") then
+    -- 说话 + 开冷却
+end
+```
+
+**模式特征**：
+
+- **冷却时间用 Timer**——15 秒内不重复触发
+- **计时器名字就是事件名**——命名达到最高自洽（一看就知道这是"这个事件的冷却"）
+- **只开启、不需要 timerdone 回调**——只是个"空转锁"
+
+这对应"**防刷屏**"、"**技能 CD**"等场景——你要的不是计时器到期后做什么，而是"**在这段时间内不让某事件触发**"。
+
+#### 模式 5：子实体跟随父实体计时（lunarthrall）
+
+`scripts/prefabs/lunarthrall_plant_gestalt.lua` 第 8-10 行：
+
+```8:10:scripts/prefabs/lunarthrall_plant_gestalt.lua
+local function Spawn(inst)
+    inst.components.timer:StartTimer("justspawned",15)
+    inst.Transform:SetRotation(math.random()*360)
+```
+
+**模式特征**：
+
+- **初始化时立刻启动计时器**——表示"刚生成状态持续 15 秒"
+- **配合 `TimerExists("justspawned")` 判断**——"我还在刚生成状态吗？"
+- **不一定需要 timerdone 回调**——计时器只作为"**状态标记**"
+
+这是**"状态持续时间"的最轻量实现**——甚至不用布尔字段，直接靠 Timer 的 `TimerExists` 来判断。
+
+#### 六种核心命名习惯
+
+从源码里总结出的命名风格：
+
+| 模式 | 命名约定 | 示例 |
+|------|----------|------|
+| buff/debuff 持续时间 | `<buff名>` or `<buff名>_duration` | `"speed_buff"`, `"regenover"` |
+| 技能冷却 | `<skill名>_cd` or `<skill名>` | `"skill_cooldown"`, `"panflute_playing"` |
+| 状态持续 | `<状态名>` | `"justspawned"`, `"overloaded"` |
+| 事件防抖 | `<事件名>` | `"ANNOUNCE_WX_SCANNER_NEW_FOUND"` |
+| 心跳节奏 | `<系统名>_ticktime` | `"heatsteam_ticktime"`, `"moisturetrack_timer"` |
+| 延迟触发 | `<动作名>_delay` | `"shardloaddelay"` |
+
+**你自己写 Mod 时**——建议**定义 `local` 常量**，避免手写字符串出错：
+
+```lua
+local SPEED_BUFF_TIMERNAME = "mymod_speed_buff"
+local COOLDOWN_TIMERNAME = "mymod_skill_cooldown"
+
+inst.components.timer:StartTimer(SPEED_BUFF_TIMERNAME, 60)
+```
+
+---
+
+### 6.4.8 老手进阶：Timer 使用的五个陷阱
+
+#### 陷阱 1：同名计时器重复启动
+
+```lua
+-- ❌ 错：StartTimer 第二次静默失败，警告到控制台但代码继续运行
+inst.components.timer:StartTimer("buff", 60)
+inst.components.timer:StartTimer("buff", 30)   -- 警告：计时器已存在！
+```
+
+**症状**：控制台打印警告，**第二次 StartTimer 什么都不做**——计时器还是 60 秒，而不是你期望的"刷新成 30 秒"。
+
+**解决**：**先 Stop 再 Start**：
+
+```lua
+-- ✅ 对
+if inst.components.timer:TimerExists("buff") then
+    inst.components.timer:StopTimer("buff")
+end
+inst.components.timer:StartTimer("buff", 30)
+```
+
+---
+
+#### 陷阱 2：在 timerdone 回调里再次 StartTimer 导致栈溢出
+
+```lua
+-- ❌ 错：看起来没问题
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "tick" then
+        inst.components.timer:StartTimer("tick", 0)   -- 0 秒立即触发 → 无限递归
+    end
+end)
+```
+
+**症状**：爆栈 / 无限循环 / 游戏卡死。
+
+**原因**：**`StartTimer(name, 0)` 会立即触发 `OnTimerDone` → 再 StartTimer → 再立即触发 → 死循环**。
+
+**解决**：**心跳类任务用 DoPeriodicTask，不用 Timer**。Timer 不适合高频重复任务。
+
+---
+
+#### 陷阱 3：名字冲突（多个 Mod 用同一个名字）
+
+```lua
+-- ModA 里
+inst.components.timer:StartTimer("cooldown", 30)
+
+-- ModB 里
+inst.components.timer:StartTimer("cooldown", 60)   -- 静默失败
+```
+
+**症状**：两个 Mod 互相干扰，有时一个工作有时另一个工作。
+
+**解决**：**计时器名字永远加 Mod 前缀**：
+
+```lua
+-- ModA
+inst.components.timer:StartTimer("mymod_cooldown", 30)
+```
+
+这和 6.3.8 陷阱 4（net 变量名冲突）是同一个道理——**命名空间隔离是 Mod 兼容性的基础**。
+
+---
+
+#### 陷阱 4：`OnTimerDone` 没判断 `data.name`
+
+```lua
+-- ❌ 错：任何计时器结束都会执行这段
+inst:ListenForEvent("timerdone", function(inst, data)
+    inst.components.debuff:Stop()    -- 任何 timer 结束都停 debuff
+end)
+
+-- ✅ 对：严格判断
+inst:ListenForEvent("timerdone", function(inst, data)
+    if data.name == "debuff_duration" then
+        inst.components.debuff:Stop()
+    end
+end)
+```
+
+**原因**：Timer 组件上**可能有多个不同计时器**，所有 `timerdone` 都通过同一个事件通知——你必须**严格判断 `data.name`**。
+
+---
+
+#### 陷阱 5：存档恢复后 `initial_time` 丢失
+
+假设你要画 UI 进度条：`percent = TimeElapsed / initial_time`。一个玩家进游戏 → 拿起道具 → 存档 → 重启 → 继续玩——UI 进度条**可能显示错误**。
+
+**原因**：`OnSave` 里存了 `initial_time`，`OnLoad` 里用 `StartTimer(k, v.timeleft, v.paused, v.initial_time)` 恢复——**第四个参数 `initialtime_override`**。
+
+**看 `StartTimer` 的签名**（第 36 行）：
+
+```lua
+function Timer:StartTimer(name, time, paused, initialtime_override)
+```
+
+**第二个参数 `time` 是"剩余时间"**，第四个参数 `initial_time_override` 是"总时长"——两个是**独立的**。
+
+**如果你自己调 `StartTimer("buff", 60)`**（没传第四参数），`initial_time` 会自动设为 60（和 time 相同）。但读档时 `OnLoad` 会正确传入原来的 `initial_time`。
+
+**这个陷阱的细节**：如果你做 UI 进度条，要**永远用 `GetTimeElapsed` 和 `initial_time`**，而不是自己算——这样存档恢复也会正确。
+
+```lua
+-- ❌ 错：硬编码 60 作为总时长
+local percent = inst.components.timer:GetTimeElapsed("buff") / 60
+
+-- ✅ 对：从 Timer 组件拿（或自己保存 initial_time）
+local timedata = inst.components.timer.timers["buff"]
+local percent = (timedata.initial_time - inst.components.timer:GetTimeLeft("buff")) / timedata.initial_time
+```
+
+或者**更优雅地暴露一个 helper**：
+
+```lua
+function Timer:GetPercent(name)
+    if not self:TimerExists(name) then return nil end
+    local t = self.timers[name]
+    return (t.initial_time - self:GetTimeLeft(name)) / t.initial_time
+end
+```
+
+你可以通过 `AddComponentPostInit("timer", function(cmp) cmp.GetPercent = ... end)` 给官方 Timer 组件**加一个方法**——这是 6.1.8 讲过的 PostInit 技巧。
+
+---
+
+### 6.4.9 小结
+
+- **Timer 组件是"命名化的、可查询的、可暂停的、可自动存档的计时器"**——比原生 `DoTaskInTime` 多出四个能力，但成本略高。
+- **核心 API 五件套**：`StartTimer(name, time, paused?, initial_time_override?)` / `StopTimer(name)` / `TimerExists(name)` / `GetTimeLeft(name)` / `GetTimeElapsed(name)`——99% 的场景用这五个就够。
+- **通过 `timerdone` 事件触发回调**：`ListenForEvent("timerdone", fn)` + `if data.name == "xxx"` 分发——一个监听器可以处理组件上任意多个计时器。
+- **进阶 API**：`PauseTimer / ResumeTimer`（玩家死亡时冻结 buff 进度）、`LongUpdate(dt)`（离散时间补偿）、`SetTimeLeft`（动态改时间）、`TransferComponent`（实体形态切换）。
+- **自动存档恢复**：`Timer:OnSave` 把 `{timeleft, paused, initial_time}` 写进存档；`Timer:OnLoad` 通过 StartTimer 恢复所有计时器——**用 Timer 就等于自动获得存档能力**。
+- **Timer vs 原生 task**：玩家可感知 / 需存档 / 需要暂停 → Timer；纯瞬态 / 高频心跳 / 不存档 → `DoTaskInTime` / `DoPeriodicTask`。两者**适用场景不同，不是替代关系**。
+- **五个实战设计模式**：多计时器统一分发（WX-78）、互斥计时器（Winona 电池）、刷新式 buff（Tillweed Salve）、短期冷却（WX 扫描仪）、状态持续标记（lunarthrall）——这些是源码里的"**标准答案**"，值得直接套用。
+- **命名习惯**：buff 用 `<buff名>_duration`、冷却用 `<skill>_cd`、状态用 `<状态名>`、防抖用 `<事件名>`、心跳用 `<系统>_ticktime`——**加 Mod 前缀防冲突**。
+- **五个陷阱**：同名重复启动（静默失败）、在 `timerdone` 里 StartTimer(0) 导致递归、Mod 间名字冲突、`OnTimerDone` 没判 `data.name`、UI 进度条硬编码总时长——每一个都有对应的防御写法。
+
+> **下一节预告**：6.5 节我们讲 **SourceModifierList**——"多来源叠加"的通用工具。当玩家同时有"加速药水 +20%"、"靴子 +10%"、"马鞍 +30%"时，最终速度怎么算？如果有一个源消失了怎么清理？这个看似简单的问题有一个**非常优雅的官方解法**。
 
 ## 6.5 SourceModifierList——多来源叠加的通用工具
 
