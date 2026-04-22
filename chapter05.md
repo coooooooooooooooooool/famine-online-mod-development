@@ -3815,3 +3815,1003 @@ Assets = {}
 
 ---
 
+### 5.7.4 进阶：让它"真正能用"—— 组件叠加
+
+新手版的灵能短剑缺少两件事：**不能打人、不能装备**。这一节我们按**组件叠加**的思路把它补齐，同时展示"给命中目标扣施法者 sanity"这种**多组件配合**的效果。
+
+#### 第一步：装备逻辑 —— `equippable` + onequip/onunequip
+
+长矛是怎么"被拿在手里"的？看 `scripts/prefabs/spear.lua` 第 7-26 行：
+
+```7:26:scripts/prefabs/spear.lua
+local function onequip(inst, owner)
+    local skin_build = inst:GetSkinBuild()
+    if skin_build ~= nil then
+        owner:PushEvent("equipskinneditem", inst:GetSkinName())
+        owner.AnimState:OverrideItemSkinSymbol("swap_object", skin_build, "swap_spear", inst.GUID, "swap_spear")
+    else
+        owner.AnimState:OverrideSymbol("swap_object", "swap_spear", "swap_spear")
+    end
+    owner.AnimState:Show("ARM_carry")
+    owner.AnimState:Hide("ARM_normal")
+end
+
+local function onunequip(inst, owner)
+    owner.AnimState:Hide("ARM_carry")
+    owner.AnimState:Show("ARM_normal")
+    local skin_build = inst:GetSkinBuild()
+    if skin_build ~= nil then
+        owner:PushEvent("unequipskinneditem", inst:GetSkinName())
+    end
+end
+```
+
+**这段代码在做什么？** 你可以把玩家的动画想象成一套"**预置骨架 + 可替换贴图**"——玩家手里有一个叫 `"swap_object"` 的挂载点，它的贴图会随着你装备不同的物品而切换。
+
+- **装备时**：把 `"swap_object"` 的贴图**替换成 `"swap_spear"`**，再显示 `"ARM_carry"` 骨骼（握着东西的手臂）、隐藏 `"ARM_normal"` 骨骼（空手）
+- **卸下时**：反过来——切回空手动画
+
+中间那段 `if skin_build ~= nil` 处理的是**皮肤**：皮肤版的长矛外观不一样，要用 `OverrideItemSkinSymbol` 的多层覆盖。我们现在不做皮肤，直接抄外层逻辑就够了。
+
+#### 第二步：战斗逻辑 —— `weapon` + `finiteuses` + 命中回调
+
+我们想让它**每次命中消耗 1 点施法者理智**——这要求在 `weapon:SetOnAttack` 里写一个回调：
+
+```lua
+local function onattack(weapon, attacker, target)
+    -- target 可能在伤害结算阶段被杀死或删除
+    if attacker ~= nil and attacker:IsValid() and attacker.components.sanity ~= nil then
+        attacker.components.sanity:DoDelta(-TUNING.PSIONIC_SHORTSWORD_SANITY_COST)
+    end
+end
+```
+
+**几个容易踩坑的点**：
+
+1. **判断 `attacker:IsValid()`**——攻击者可能在命中瞬间死了（被怪反杀），必须先判空
+2. **判断 `attacker.components.sanity ~= nil`**——不是所有实体都有 sanity 组件（比如幽灵、机器人 WX-78），怕崩溃
+3. **用 `TUNING` 常量而不是硬编码 `-1`**——方便后面 5.7.7 节做配置项
+
+在 `modmain.lua` 顶部先加一条 TUNING：
+
+```lua
+TUNING.PSIONIC_SHORTSWORD_DAMAGE = 38
+TUNING.PSIONIC_SHORTSWORD_USES = 150
+TUNING.PSIONIC_SHORTSWORD_SANITY_COST = 1
+```
+
+#### 第三步：完整的第二版 Prefab
+
+整合装备 + 战斗 + 耐久，现在的 `psionic_shortsword.lua` 完整版：
+
+```lua
+-- psionic_shortsword.lua —— 第二版：可装备 + 可战斗 + 消耗理智
+local assets =
+{
+}
+
+local function onequip(inst, owner)
+    owner.AnimState:OverrideSymbol("swap_object", "swap_spear", "swap_spear")
+    owner.AnimState:Show("ARM_carry")
+    owner.AnimState:Hide("ARM_normal")
+end
+
+local function onunequip(inst, owner)
+    owner.AnimState:Hide("ARM_carry")
+    owner.AnimState:Show("ARM_normal")
+end
+
+local function onattack(weapon, attacker, target)
+    if attacker ~= nil and attacker:IsValid() and attacker.components.sanity ~= nil then
+        attacker.components.sanity:DoDelta(-TUNING.PSIONIC_SHORTSWORD_SANITY_COST)
+    end
+end
+
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("spear")
+    inst.AnimState:SetBuild("swap_spear")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst:AddTag("sharp")
+    inst:AddTag("pointy")
+    inst:AddTag("weapon")
+
+    MakeInventoryFloatable(inst, "med", 0.05, 0.75)
+
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("weapon")
+    inst.components.weapon:SetDamage(TUNING.PSIONIC_SHORTSWORD_DAMAGE)
+    inst.components.weapon:SetOnAttack(onattack)
+
+    inst:AddComponent("finiteuses")
+    inst.components.finiteuses:SetMaxUses(TUNING.PSIONIC_SHORTSWORD_USES)
+    inst.components.finiteuses:SetUses(TUNING.PSIONIC_SHORTSWORD_USES)
+    inst.components.finiteuses:SetOnFinished(inst.Remove)
+
+    inst:AddComponent("inspectable")
+    inst:AddComponent("inventoryitem")
+
+    inst:AddComponent("equippable")
+    inst.components.equippable:SetOnEquip(onequip)
+    inst.components.equippable:SetOnUnequip(onunequip)
+
+    MakeHauntableLaunch(inst)
+
+    return inst
+end
+
+return Prefab("psionic_shortsword", fn, assets)
+```
+
+**对照 `spear.lua` 完整版**（第 28-77 行），会发现我们的代码几乎是它的一个**精简分支**——只多了 `SetOnAttack(onattack)` 一行和我们自己的 TUNING 常量。这就是**组件系统的威力**：**组合已有组件** = 造出完全新的物品，不需要写底层代码。
+
+#### 第四步：为什么 `finiteuses.SetOnFinished(inst.Remove)`
+
+对照 `spear.lua` 第 64 行：
+
+```lua
+inst.components.finiteuses:SetOnFinished(inst.Remove)
+```
+
+`finiteuses` 组件维护"剩余使用次数"——每次攻击后自动 -1（其实是 `combat` 组件触发 `weapon:OnAttack` 同时走了 finiteuses 的扣减流程，引擎内部打通）。当归零时会调用 `OnFinished` 回调。
+
+这里 `inst.Remove` 是个**方法引用**——等价于 `function() inst:Remove() end`。耐久归零 → 物品消失。
+
+> **开发逻辑**：Klei 不把"耐久归零自动 Remove"做成组件默认行为，是因为不同物品的"用完"行为不一样：
+> - **武器类**：消失（`inst.Remove`）
+> - **背包**：变成空背包（不消失）
+> - **火把**：有专属销毁动画（`torch.lua` 第 262 行的 `ErodeAway(inst)`）
+>
+> 所以 `SetOnFinished` 让你**自己决定**用完后怎么处理。
+
+#### 第五步：测试"真的能打"
+
+此时你把 Mod 重装、进游戏，控制台：
+
+```
+c_give("psionic_shortsword")    -- 直接给到背包
+c_spawn("pigman")               -- 再召个猪人当沙包
+```
+
+装备短剑、右键猪人——每次命中：
+
+- 猪人掉 38 点血（比长矛 34 点高）
+- 你自己掉 1 点 sanity（右上角数字变绿下跳）
+- 用了 150 次后剑消失
+
+**到这里它是一把完整可玩的武器了。** 下一节我们让它"看起来像自己"（物品栏图标），而不是借用长矛的外观。
+
+---
+
+### 5.7.5 进阶：STRINGS 与物品栏图标 —— 让玩家"看得见、叫得出"
+
+现在这把短剑有两个"没做的事"：
+
+- **物品栏图标是长矛**（因为我们复用了 `swap_spear` 的 build）
+- **检查物品时名字叫 `MISSING NAME`，描述叫 `MISSING DESCRIPTION`**
+
+这一节我们把它们补齐。
+
+#### 第一步：STRINGS 文本注册
+
+在 `modmain.lua` 里加上：
+
+```lua
+-- 在 modmain.lua 任意位置
+STRINGS.NAMES.PSIONIC_SHORTSWORD = "灵能短剑"
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.PSIONIC_SHORTSWORD = "锋利的刃上流淌着紫色的光。"
+STRINGS.RECIPE_DESC.PSIONIC_SHORTSWORD = "以理智为代价的锋利。"
+```
+
+**三条 STRINGS 各自的用途**：
+
+| STRINGS 路径 | 在哪里显示 |
+|--------------|------------|
+| `STRINGS.NAMES.<PREFAB_UPPER>` | 鼠标悬停、"掉落物"提示等 |
+| `STRINGS.CHARACTERS.GENERIC.DESCRIBE.<PREFAB_UPPER>` | 检查时（按 T 或右键 -> 查看）角色说的话 |
+| `STRINGS.RECIPE_DESC.<PREFAB_UPPER>` | 合成菜单里鼠标悬停时的物品描述 |
+
+**关键约定**：**键名必须用 Prefab 名的大写形式**——`psionic_shortsword` → `PSIONIC_SHORTSWORD`。这是 Klei 在 `scripts/strings.lua` 里的固定约定，查找时会 `string.upper(prefab_name)`。
+
+参考 `renwu/modmain.lua` 第 208-210 行的批量写法：
+
+```208:210:mods/联机版mod/renwu/modmain.lua
+        STRINGS.NAMES[string.upper(v.prefabname)] = v.name_cn
+        STRINGS.CHARACTERS.GENERIC.DESCRIBE[string.upper(v.prefabname)] = v.describe
+        STRINGS.RECIPE_DESC[string.upper(v.prefabname)] = v.desc
+```
+
+#### 第二步：角色专属检查文字（可选）
+
+如果你想让 WX-78 说"这玩意居然能吸灵能 01010"，可以加：
+
+```lua
+STRINGS.CHARACTERS.WX78.DESCRIBE.PSIONIC_SHORTSWORD = "灵能短剑？是某种生物兼容的武器。"
+STRINGS.CHARACTERS.WENDY.DESCRIBE.PSIONIC_SHORTSWORD = "它吸食的是你我的灵魂…"
+```
+
+引擎在 `scripts/entityscript.lua` 的 `Describe` 函数会**按角色名找不到就 fallback 到 `GENERIC`**——所以只写 `GENERIC` 也没问题，其他角色都会用那句。
+
+#### 第三步：物品栏图标（`images/inventoryimages/*`）
+
+物品栏图标是 **64x64 的 png 打包出来的 `tex` + `xml`**。制作方法超出代码范围（要用 Klei 的 `TEXTools` 或 `ktools` 打包），但**注册流程是代码层的**，我们重点讲这部分。
+
+假设你已经做好了 `images/inventoryimages/psionic_shortsword.tex` 和 `psionic_shortsword.xml` 放进 Mod 目录。在 `modmain.lua` 里注册：
+
+```lua
+-- modmain.lua —— 物品栏图标注册
+local imageassets =
+{
+    "psionic_shortsword",
+}
+
+for k, v in pairs(imageassets) do
+    table.insert(Assets, Asset("ATLAS", "images/inventoryimages/"..v..".xml"))
+    table.insert(Assets, Asset("IMAGE", "images/inventoryimages/"..v..".tex"))
+    table.insert(Assets, Asset("ATLAS_BUILD", "images/inventoryimages/"..v..".xml", 256))
+    RegisterInventoryItemAtlas("images/inventoryimages/"..v..".xml", v..".tex")
+end
+```
+
+**这段代码的四步分别做什么？**
+
+| 代码行 | 作用 |
+|--------|------|
+| `Asset("ATLAS", ...)` | 声明图集 XML（描述 tex 里每个子图的坐标） |
+| `Asset("IMAGE", ...)` | 声明贴图 TEX 本身 |
+| `Asset("ATLAS_BUILD", xml, 256)` | 把图集也作为**动画素材**注册——让引擎把它当成一个 256x256 的 build，可以被 `SetBuild` 引用 |
+| `RegisterInventoryItemAtlas(xml, tex)` | 在全局 `inventoryItemAtlasLookup` 表里登记——让其他 Mod/系统知道"这个 tex 的图集在哪" |
+
+这是 `renwu/modmain.lua` 第 110-117 行的标准写法，**几乎所有物品 Mod 都照抄**。
+
+#### 第四步：告诉 `inventoryitem` 组件用哪张图
+
+光注册了图集还不够——还要告诉 Prefab 的 `inventoryitem` 组件**"物品栏里显示的就是这张图"**。看 `haze_paperclip.lua` 第 30-31 行：
+
+```30:31:mods/联机版mod/renwu/scripts/prefabs/haze_paperclip.lua
+    inst.components.inventoryitem.imagename = 'haze_paperclip'
+    inst.components.inventoryitem.atlasname = 'images/inventoryimages/haze_paperclip.xml'
+```
+
+我们在 `psionic_shortsword.lua` 的服务端段落里加上同样两行：
+
+```lua
+-- 在 inst:AddComponent("inventoryitem") 下面加
+inst.components.inventoryitem.imagename = "psionic_shortsword"
+inst.components.inventoryitem.atlasname = "images/inventoryimages/psionic_shortsword.xml"
+```
+
+引擎会根据这两个字段**自动**选图——背包格、物品掉在地上的悬浮图标、合成菜单里的小图都是这套机制。
+
+**如果不写这两行会发生什么？** 引擎会按默认规则找 `images/inventoryimages/<prefab>.xml`——**只要你的文件名和 Prefab 名一致**（我们这里就是一致的），其实可以不写。但**显式写上**的好处是清晰、支持重命名、便于跨 Mod 引用。
+
+#### 第五步：完整的 `modmain.lua`（第三版）
+
+```lua
+-- modmain.lua —— 第三版：加上 STRINGS 和物品栏图标
+GLOBAL.setmetatable(env, {
+    __index = function(t, k)
+        return GLOBAL.rawget(GLOBAL, k)
+    end
+})
+
+TUNING.PSIONIC_SHORTSWORD_DAMAGE = 38
+TUNING.PSIONIC_SHORTSWORD_USES = 150
+TUNING.PSIONIC_SHORTSWORD_SANITY_COST = 1
+
+PrefabFiles = {
+    "psionic_shortsword",
+}
+
+Assets = {}
+
+local imageassets =
+{
+    "psionic_shortsword",
+}
+
+for k, v in pairs(imageassets) do
+    table.insert(Assets, Asset("ATLAS", "images/inventoryimages/"..v..".xml"))
+    table.insert(Assets, Asset("IMAGE", "images/inventoryimages/"..v..".tex"))
+    table.insert(Assets, Asset("ATLAS_BUILD", "images/inventoryimages/"..v..".xml", 256))
+    RegisterInventoryItemAtlas("images/inventoryimages/"..v..".xml", v..".tex")
+end
+
+STRINGS.NAMES.PSIONIC_SHORTSWORD = "灵能短剑"
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.PSIONIC_SHORTSWORD = "锋利的刃上流淌着紫色的光。"
+STRINGS.RECIPE_DESC.PSIONIC_SHORTSWORD = "以理智为代价的锋利。"
+```
+
+到这里，游戏里这把短剑：
+
+- 背包槽显示**你自己画的图标**
+- 鼠标悬停显示**灵能短剑**
+- 按 T 检查时，角色说出**"锋利的刃上流淌着紫色的光。"**
+
+**它看起来完全像一把正式的武器了。** 但目前还要靠 `c_give` 作弊给自己——下一节我们加上合成配方，让玩家能正常合成它。
+
+---
+
+### 5.7.6 进阶：添加合成配方 `AddRecipe2`
+
+有了物品、有了名字和图标，最后一步是**让玩家能合成它**。这一节讲 `AddRecipe2` 函数怎么用。
+
+#### 第一步：`AddRecipe2` 的签名
+
+看 `scripts/modutil.lua` 第 732 行：
+
+```732:756:scripts/modutil.lua
+	env.AddRecipe2 = function(name, ingredients, tech, config, filters)
+		initprint("AddRecipe2", name)
+		require("recipe")
+		mod_protect_Recipe = false
+		local rec = Recipe2(name, ingredients, tech, config)
+
+		if not rec.is_deconstruction_recipe then
+			if config ~= nil and config.nounlock then
+				env.AddRecipeToFilter(name, CRAFTING_FILTERS.CRAFTING_STATION.name)
+			else
+				env.AddRecipeToFilter(name, CRAFTING_FILTERS.MODS.name)
+			end
+
+			if filters ~= nil then
+				for _, filter_name in ipairs(filters) do
+					env.AddRecipeToFilter(name, filter_name)
+				end
+			end
+		end
+
+
+		mod_protect_Recipe = true
+		rec:SetModRPCID()
+		return rec
+	end
+```
+
+它接收 **5 个参数**：
+
+| 参数 | 类型 | 含义 |
+|------|------|------|
+| `name` | string | 合成出来的 Prefab 名（`"psionic_shortsword"`） |
+| `ingredients` | table | `Ingredient` 数组（材料列表） |
+| `tech` | `TECH.XXX` | 需要的科技等级（如 `TECH.SCIENCE_ONE`） |
+| `config` | table | 可选配置（图标、自定义图集、过滤等） |
+| `filters` | table | 可选，额外加入的分类过滤器（如 `"WEAPONS"`） |
+
+返回一个 `Recipe2` 对象（你通常不用它，除非要做后续特殊处理）。
+
+#### 第二步：定义材料列表（`Ingredient`）
+
+`Ingredient` 是什么？看 `scripts/recipe.lua` 第 5 行：
+
+```lua
+Ingredient = Class(function(self, ingredienttype, amount, atlas, deconstruct, imageoverride)
+    -- ...
+end)
+```
+
+最常用的就 **前 3 个参数**：
+
+- `ingredienttype`（string）——材料 Prefab 名
+- `amount`（number）——需要几个
+- `atlas`（string，可选）——如果材料是 Mod 物品，要指定图集路径（否则合成菜单里材料图标显示不出来）
+
+**本节的配方**：3 金块 + 1 噩梦燃料 + 2 木头。代码：
+
+```lua
+local ingredients =
+{
+    Ingredient("goldnugget", 3),
+    Ingredient("nightmarefuel", 1),
+    Ingredient("log", 2),
+}
+```
+
+#### 第三步：选择科技等级（`TECH`）
+
+`TECH` 是一张表，常见值：
+
+| TECH | 需要的工作台 |
+|------|--------------|
+| `TECH.NONE` | 无 —— 随时可合成 |
+| `TECH.SCIENCE_ONE` | 科学机器附近 |
+| `TECH.SCIENCE_TWO` | 炼金引擎附近 |
+| `TECH.MAGIC_TWO` | 暗影操纵者附近 |
+| `TECH.MAGIC_THREE` | 棱镜 / 潜影头骨附近 |
+| `TECH.ANCIENT_TWO` | 远古伪科学基地 |
+
+这些值定义在 `scripts/techtree.lua`。我们的灵能短剑涉及"噩梦燃料"，很自然应该在**炼金引擎**（`SCIENCE_TWO`）合成：
+
+```lua
+local tech = TECH.SCIENCE_TWO
+```
+
+#### 第四步：config 配置（图标、过滤器）
+
+```lua
+local config =
+{
+    atlas = "images/inventoryimages/psionic_shortsword.xml",
+    image = "psionic_shortsword.tex",
+    -- nounlock = false,      -- 默认 false，需要科学机器试玩后解锁
+    -- numtogive = 1,         -- 默认 1，合成一次得多少个
+    -- min_spacing = nil,     -- 建筑物用：最小间距
+}
+```
+
+`atlas` 和 `image` 告诉合成菜单用哪张图作为配方封面——和我们 5.7.5 节注册的图集一致。
+
+#### 第五步：`filters` 参数——归到哪个分类
+
+`filters` 决定这把剑在合成菜单里**出现在哪个分类标签下**。常见值（见 `scripts/crafting_filters.lua`）：
+
+| filter | 分类 |
+|--------|------|
+| `"TOOLS"` | 工具 |
+| `"WEAPONS"` | 武器 |
+| `"LIGHT"` | 光源 |
+| `"SURVIVAL"` | 生存 |
+| `"MAGIC"` | 魔法 |
+| `"MODS"` | Mods（默认总会加入这个） |
+
+回头看 `AddRecipe2` 源码第 739-749 行：
+
+- **默认总会加到 `CRAFTING_FILTERS.MODS`**（你不指定也会有）
+- `filters` 参数是**额外**加到其他分类
+
+既然灵能短剑是魔法武器，我们想让它同时出现在"武器"和"魔法"分类下：
+
+```lua
+local filters = { "WEAPONS", "MAGIC" }
+```
+
+#### 第六步：完整的合成注册代码
+
+在 `modmain.lua` 最后加上：
+
+```lua
+AddRecipe2(
+    "psionic_shortsword",
+    {
+        Ingredient("goldnugget", 3),
+        Ingredient("nightmarefuel", 1),
+        Ingredient("log", 2),
+    },
+    TECH.SCIENCE_TWO,
+    {
+        atlas = "images/inventoryimages/psionic_shortsword.xml",
+        image = "psionic_shortsword.tex",
+    },
+    { "WEAPONS", "MAGIC" }
+)
+```
+
+重装 Mod 进游戏，打开合成菜单 → "武器" 分类下 → 就能看到你的灵能短剑（如果当前没站在炼金引擎旁会显示**灰色 + 提示"需要炼金引擎"**）。材料齐全后点击 → 按住鼠标不放 → 合成成功。
+
+> **开发逻辑**：为什么要做分类？因为联机版有上百个可合成物品，全堆一起玩家根本找不到。分类过滤器（5.6 Uncompressed 更新后的大改）让玩家可以**按"武器"/"工具"/"光源"**等聚合浏览。作为 Mod 开发者，**一定要把配方加到合适的分类**——否则玩家得翻到 MODS 分类最底下才能找到，体验很差。
+
+#### 第七步：配方解锁——`TECH.NONE` vs 科技栏
+
+默认情况下，玩家要**先合成过一次**这个物品才能"解锁"它——下次合成时配方会自动出现。如果你想让配方**默认就显示出来**（不需要手动点合成按钮），可以设：
+
+```lua
+local config =
+{
+    atlas = "...",
+    image = "...",
+    nounlock = true,   -- 默认解锁，不需要首次合成触发
+}
+```
+
+这在**主打"无限次合成"的 Mod**（比如书籍类、特殊装备类）里常用。普通材料类物品**建议保持默认 `nounlock = false`**，让玩家自己发现新内容也是游戏乐趣的一部分。
+
+---
+
+### 5.7.7 老手进阶：`modinfo.configuration_options` 与 TUNING 联动
+
+前面我们把伤害、耐久、理智消耗都写进了 `TUNING` 常量。但每个玩家的偏好不同——有人想要"38 伤害 + 1 sanity"，有人想要"50 伤害 + 3 sanity"。**怎么让玩家在 Mod 页面自己调？** 这就需要 `modinfo.configuration_options`。
+
+#### 第一步：`configuration_options` 的格式
+
+看 `renwu/modinfo.lua` 第 19-109 行就是完整样板：
+
+```19:40:mods/联机版mod/renwu/modinfo.lua
+configuration_options = {
+    -----------------------------------
+    -- {
+    --     name = "Obrsword_navoice",--自定义选项名称,用于后续GetModConfigData设置
+    --     label = "普通攻击音效",--选项名称，用于mod设置中看见的名称
+    --     hover = "是否开启普通攻击的集中音效。",--选项标题下对应的描述
+    --     options =
+    --     {
+    --         -- {description = "自动", data = "auto"},
+    --         { 
+    --             description = "开启(默认)",--选项名称
+    --             hover = "是否开启普通攻击的集中音效。",--选项标题下对应的描述
+    --             data = true --选项的值,用于后续GetModConfigData拿到的值
+    --         },
+```
+
+每个选项是一个表，有 5 个关键字段：
+
+| 字段 | 类型 | 作用 |
+|------|------|------|
+| `name` | string | **代码里**用来读取配置的键（`GetModConfigData("name")`） |
+| `label` | string | **Mod 配置界面**显示的选项标题 |
+| `hover` | string | 鼠标悬停时显示的说明 |
+| `options` | table | 可选值的数组——每个元素有 `description`（界面文字）+ `data`（实际值） |
+| `default` | any | 默认选中哪个 `data` 值 |
+
+#### 第二步：给灵能短剑加三个配置项
+
+打开 `modinfo.lua`，把原来的 `configuration_options = {}` 改成：
+
+```lua
+configuration_options = {
+    {
+        name = "PSIONIC_SHORTSWORD_DAMAGE",
+        label = "基础伤害",
+        hover = "灵能短剑每次攻击的基础伤害。",
+        options = {
+            { description = "低（28）",       data = 28 },
+            { description = "中（38，默认）", data = 38 },
+            { description = "高（50）",       data = 50 },
+            { description = "极高（68）",     data = 68 },
+        },
+        default = 38,
+    },
+    {
+        name = "PSIONIC_SHORTSWORD_USES",
+        label = "耐久次数",
+        hover = "灵能短剑可以攻击多少次之后损毁。",
+        options = {
+            { description = "短（100）",       data = 100 },
+            { description = "标准（150，默认）", data = 150 },
+            { description = "长（250）",       data = 250 },
+            { description = "无限（9999）",    data = 9999 },
+        },
+        default = 150,
+    },
+    {
+        name = "PSIONIC_SHORTSWORD_SANITY_COST",
+        label = "命中理智消耗",
+        hover = "每次命中时，施法者扣多少理智。",
+        options = {
+            { description = "不消耗（0）",   data = 0 },
+            { description = "1（默认）",     data = 1 },
+            { description = "3",             data = 3 },
+            { description = "5（高强度）",   data = 5 },
+        },
+        default = 1,
+    },
+}
+```
+
+#### 第三步：在 `modmain.lua` 里读配置并覆盖 TUNING
+
+现在你 **不能再硬编码** `TUNING.PSIONIC_SHORTSWORD_DAMAGE = 38` 了——应该改成：
+
+```lua
+-- modmain.lua —— 读取配置项
+TUNING.PSIONIC_SHORTSWORD_DAMAGE = GetModConfigData("PSIONIC_SHORTSWORD_DAMAGE") or 38
+TUNING.PSIONIC_SHORTSWORD_USES = GetModConfigData("PSIONIC_SHORTSWORD_USES") or 150
+TUNING.PSIONIC_SHORTSWORD_SANITY_COST = GetModConfigData("PSIONIC_SHORTSWORD_SANITY_COST") or 1
+```
+
+**为什么要 `or 38` 兜底？** `GetModConfigData` 在**老存档**或**配置项被删除**的场景下可能返回 `nil`。用 `or 默认值` 兜底是一种防御性写法，让 Mod 在各种情况下都不会崩溃。
+
+#### 第四步：配置项生效的流程
+
+```
+玩家点击 Mod 管理 → 打开"配置 Mod" → 选了"高伤害"
+  │
+  ├── 游戏把选项写到 modconfiguration_<modname>.lua
+  │
+  ├── 玩家点击"启用并重启游戏"
+  │
+  ├── 游戏重启、加载 Mod
+  │     ├── 读 modinfo.lua → 加载 configuration_options 的当前值
+  │     ├── 执行 modmain.lua
+  │     │     └── GetModConfigData("PSIONIC_SHORTSWORD_DAMAGE") 返回 50
+  │     │     └── TUNING.PSIONIC_SHORTSWORD_DAMAGE = 50
+  │     │
+  │     └── 加载 scripts/prefabs/psionic_shortsword.lua
+  │           └── 执行工厂函数时 weapon:SetDamage(TUNING.PSIONIC_SHORTSWORD_DAMAGE)
+  │               → 此时拿到的是 50！
+  │
+  └── 玩家造出的每把短剑都是 50 伤害
+```
+
+**关键点**：`TUNING` 的修改必须**在 Prefab 工厂函数被执行之前**完成。`modmain.lua` 比 Prefab 文件早执行，所以在 `modmain.lua` 里改 `TUNING` 是**时机安全**的。如果你在某个运行时事件里改 `TUNING`（比如玩家切换了武器），**已经创建的物品不会生效**——它已经被 `SetDamage` 固定了伤害值。
+
+#### 第五步：运行时改数值的办法
+
+万一你真的要在游戏中途动态调整伤害（比如"每夜晚自动变强"），应该**直接改组件，不改 TUNING**：
+
+```lua
+-- 假设要让它在夜里伤害 +10
+inst:WatchWorldState("phase", function(inst, phase)
+    if phase == "night" then
+        inst.components.weapon:SetDamage(TUNING.PSIONIC_SHORTSWORD_DAMAGE + 10)
+    else
+        inst.components.weapon:SetDamage(TUNING.PSIONIC_SHORTSWORD_DAMAGE)
+    end
+end)
+```
+
+`WatchWorldState` 是监听世界状态变化的接口，`phase` 就是"day / dusk / night"。这是一个**组件即时修改**的写法，比改 TUNING 可靠得多。
+
+> **开发逻辑**：Mod 配置项有两层设计——**静态数值调参**（`GetModConfigData` + 改 `TUNING`）用于玩家在启动前定制；**动态运行时调整**（直接改组件）用于游戏进行中的机制。两者各有适用场景，不要混用。
+
+---
+
+### 5.7.8 老手进阶：`AddPrefabPostInit` —— 不创建新 Prefab 也能改原版
+
+到这里灵能短剑已经是完整的 Mod 了。但是 Mod 开发还有另一条路线：**魔改原版 Prefab**。
+
+假设你**不想造一把新武器**，而是想把**原版长矛**的伤害从 34 改成 50——怎么办？这就是 `AddPrefabPostInit` 的用武之地。
+
+#### 第一步：`AddPrefabPostInit` 的定义
+
+看 `scripts/modutil.lua` 第 592-599 行：
+
+```592:599:scripts/modutil.lua
+	env.postinitfns.PrefabPostInit = {}
+	env.AddPrefabPostInit = function(prefab, fn)
+		initprint("AddPrefabPostInit", prefab)
+		if env.postinitfns.PrefabPostInit[prefab] == nil then
+			env.postinitfns.PrefabPostInit[prefab] = {}
+		end
+		table.insert(env.postinitfns.PrefabPostInit[prefab], fn)
+	end
+```
+
+它做的事情很简单：把你传进来的 `fn` 加到 `postinitfns.PrefabPostInit[prefab]` 表里——后续会被 `RegisterPrefabsImpl`（5.1.6 节）收集到 `modprefabinitfns[prefab]`，在每次 `SpawnPrefab` 后自动执行（5.1.5 节的 `SpawnPrefabFromSim`）。
+
+**简单说**：你注册的回调会**在每次 `SpawnPrefab("spear")` 的工厂函数执行完之后**被调用，参数是刚创建好的 `inst`。
+
+#### 第二步：一个简单的例子——让长矛伤害翻倍
+
+在 `modmain.lua` 里加一行：
+
+```lua
+AddPrefabPostInit("spear", function(inst)
+    if not TheWorld.ismastersim then
+        return
+    end
+
+    if inst.components.weapon ~= nil then
+        inst.components.weapon:SetDamage(TUNING.SPEAR_DAMAGE * 2)
+    end
+end)
+```
+
+**三个要点**：
+
+1. **回调会在客户端和服务端都执行一次**——因为 `SpawnPrefabFromSim` 是两端各走一次。所以里面要**自己判断 `ismastersim`**，组件类的修改只在服务端做
+2. **判断 `inst.components.weapon ~= nil`**——防御性：万一 Klei 哪天改了 spear 的组件结构，组件不存在时你的修改会崩，不如跳过
+3. **直接改组件**——不要再改 `TUNING.SPEAR_DAMAGE`，因为原版长矛工厂函数已经用 34 初始化过一次了
+
+#### 第三步：更常见的场景——加新组件、加标签、监听事件
+
+PostInit 最常用的场景是**给原版 Prefab 加东西**。看几个实战案例：
+
+**案例 A：给所有长矛加一个"命中后 30% 概率触发流血"效果**
+
+```lua
+AddPrefabPostInit("spear", function(inst)
+    if not TheWorld.ismastersim then return end
+
+    if inst.components.weapon ~= nil then
+        local old_onattack = inst.components.weapon.onattack  -- 保留原版回调（如有）
+        inst.components.weapon:SetOnAttack(function(weapon, attacker, target)
+            if old_onattack ~= nil then
+                old_onattack(weapon, attacker, target)
+            end
+
+            if target ~= nil and target:IsValid() and math.random() < 0.3 then
+                if target.components.debuffable ~= nil then
+                    target.components.debuffable:AddDebuff("bleed_debuff", "bleed_debuff")
+                end
+            end
+        end)
+    end
+end)
+```
+
+**这里的关键技巧**：**保留原版回调**（`old_onattack`），再**在它之后追加**你的新逻辑。这样你不会破坏原版行为，又能叠加新效果——这是 Mod 兼容性最佳实践。
+
+**案例 B：给所有蜘蛛加一个"看到玩家就自动标记 mark 2 秒"**
+
+```lua
+AddPrefabPostInit("spider", function(inst)
+    if not TheWorld.ismastersim then return end
+
+    inst:ListenForEvent("newcombattarget", function(inst, data)
+        if data.target ~= nil and data.target:HasTag("player") then
+            inst:AddTag("alerted_by_mod")
+            inst:DoTaskInTime(2, function() inst:RemoveTag("alerted_by_mod") end)
+        end
+    end)
+end)
+```
+
+**案例 C：给所有合成出来的物品加一个标记（用 `AddPrefabPostInitAny`）**
+
+```lua
+AddPrefabPostInitAny(function(inst)
+    if inst.prefab ~= nil and inst:HasTag("weapon") then
+        inst:AddTag("my_mod_weapon")
+    end
+end)
+```
+
+`AddPrefabPostInitAny`（回顾 5.1.5 节的源码）会在**每一个**被生成的 Prefab 上都执行一次——慎用，性能影响大。但某些场景（如"所有武器都加上某个 buff"）只能用它。
+
+#### 第四步：PostInit 的时机回顾
+
+回顾 5.1.5 节 `SpawnPrefabFromSim` 的执行顺序：
+
+```
+1. prefab.fn(TheSim)           ← 执行原版工厂函数（长矛自己的 fn）
+2. inst:SetPrefabName(...)
+3. modprefabinitfns[prefab]    ← 执行所有 Mod 的 PrefabPostInit
+4. ModManager:GetPostInitFns("PrefabPostInitAny")  ← 执行所有 PrefabPostInitAny
+5. TheWorld:PushEvent("entity_spawned", inst)
+```
+
+所以 PostInit 拿到的 `inst` 是**已经完全初始化的原版实体**——所有组件、标签都到位了。你的修改会在它之上叠加。
+
+**容易犯的错**：有 Mod 开发者在 PostInit 里写 `inst:AddComponent("xxx")` 不检查 `inst.components.xxx` 是否已存在——如果原版已经有这个组件，再加一次会**覆盖**原版的配置。正确写法：
+
+```lua
+AddPrefabPostInit("spear", function(inst)
+    if not TheWorld.ismastersim then return end
+
+    -- 错误：直接 AddComponent 会覆盖原版
+    -- inst:AddComponent("waterproofer")
+    -- inst.components.waterproofer:SetEffectiveness(1)
+
+    -- 正确：先判断
+    if inst.components.waterproofer == nil then
+        inst:AddComponent("waterproofer")
+        inst.components.waterproofer:SetEffectiveness(1)
+    end
+end)
+```
+
+#### 第五步：什么时候用 PostInit，什么时候创建新 Prefab？
+
+这是老手最常纠结的问题。**经验法则**：
+
+| 场景 | 推荐做法 |
+|------|---------|
+| 调整原版物品的**数值**（伤害、耐久、速度） | `AddPrefabPostInit` + 改组件 |
+| 给原版物品**加新功能**（新组件、新事件监听） | `AddPrefabPostInit` |
+| 造一个**视觉/行为明显不同**的新物品 | 新建 Prefab |
+| "魔改风"——想把长矛变成完全不同的东西 | 新建 Prefab（保留原版 spear 不变，玩家可自由选择） |
+| 扩展**所有**同类物品（如"所有武器 +10% 伤害"） | `AddPrefabPostInitAny` + `inst:HasTag("weapon")` 过滤 |
+
+> **开发逻辑**：PostInit 是一种"**非侵入式**"改造——你不破坏原版代码，只在其之上挂载修改。这让你的 Mod 和其他 Mod 更容易兼容（因为大家都在同一 Prefab 上叠加，只要不互相冲突就共存）。**新建 Prefab** 则是"**平行世界**"——你的新物品和原版独立，不干扰原版玩家。两条路线各有优势，好的 Mod 通常两种都用：**核心新内容用新 Prefab，配套的微调用 PostInit**。
+
+---
+
+### 5.7.9 常见坑与排查清单
+
+Mod 开发最痛苦的不是写代码，而是"**为什么进游戏什么都看不到 / 控制台没报错却不工作**"。这一节汇总**我在写这个教程时亲手踩过的 10 个坑**，供你速查。
+
+#### 坑 1：`c_spawn("psionic_shortsword")` 返回 `Can't find prefab`
+
+**原因**：`modmain.lua` 的 `PrefabFiles` 里没加文件名。
+
+**排查**：
+
+```lua
+-- modmain.lua 里必须有：
+PrefabFiles = {
+    "psionic_shortsword",   -- ← 必须和 scripts/prefabs/xxx.lua 的文件名一致
+}
+```
+
+**相关章节**：5.6.8 坑 5。
+
+---
+
+#### 坑 2：物品栏图标是紫底红叹号
+
+**原因**：三种情况之一——
+
+1. 忘了写 `Asset("ATLAS", ...)` 和 `Asset("IMAGE", ...)` 中的任意一个
+2. 文件名大小写不对（Linux 敏感）
+3. `RegisterInventoryItemAtlas` 没调用
+
+**排查**：对照 5.7.5 节第三步的完整四行——**四行必须全写**。
+
+---
+
+#### 坑 3：名字显示 `MISSING NAME` / `MISSING DESCRIPTION`
+
+**原因**：`STRINGS.NAMES.<PREFAB_UPPER>` 没写，或键名大小写错。
+
+**排查**：键名必须**全大写**——`"psionic_shortsword"` → `"PSIONIC_SHORTSWORD"`。如果你写成 `STRINGS.NAMES.psionic_shortsword` 不会报错但也不会生效。
+
+---
+
+#### 坑 4：装备上之后玩家手里什么都没有
+
+**原因**：`onequip` 里的 `OverrideSymbol` 参数不对。
+
+**排查**：这三个参数必须对齐：
+
+```lua
+owner.AnimState:OverrideSymbol("swap_object", "swap_spear", "swap_spear")
+--                              ↑              ↑             ↑
+--                              挂载点          build 名       symbol 名
+```
+
+- 第一个是**挂载点**（`swap_object` 是 Klei 约定的手持物挂载点，几乎所有武器都用它）
+- 第二个是**被替换用的 build 名**——这个 build 必须已加载（借用 `swap_spear` 时它是原版自带加载的）
+- 第三个是**build 内的 symbol**（动画 zip 里的图层名，通常和 build 同名）
+
+---
+
+#### 坑 5：服务端一切正常，客户端看到的物品不对
+
+**原因**：把应该放在 pristine 阶段的东西写到了服务端段落，或反过来。
+
+**排查**：回顾 5.4 节——**客户端要识别的所有东西**（外观、tag）必须在 `SetPristine()` 之前；**纯逻辑**（组件、伤害数值）在 `SetPristine()` 之后。
+
+常见错误：
+
+```lua
+-- ❌ 错：客户端看不到这个 tag
+if not TheWorld.ismastersim then
+    return inst
+end
+inst:AddTag("weapon")   -- ← 客户端不知道这是武器！
+
+-- ✅ 对
+inst:AddTag("weapon")
+inst.entity:SetPristine()
+if not TheWorld.ismastersim then
+    return inst
+end
+```
+
+---
+
+#### 坑 6：合成菜单里看不到配方
+
+**原因**：三种可能——
+
+1. `AddRecipe2` 漏写或写错 Prefab 名
+2. 当前不在要求的科技工作台附近（需要炼金引擎 `TECH.SCIENCE_TWO`）
+3. 配方还没解锁，要先在有科学机器时手动触发一次
+
+**排查**：开启控制台模式 `c_unlockrecipe("psionic_shortsword")` 强制解锁，如果还看不到，就是 `AddRecipe2` 没注册成功——看游戏日志（`client_log.txt`）找 `AddRecipe2 psionic_shortsword` 这行。
+
+---
+
+#### 坑 7：材料图标显示不出（Mod 物品作为材料时）
+
+**原因**：`Ingredient` 的第三个参数 `atlas` 没写。
+
+**排查**：
+
+```lua
+-- ❌ 错：如果 my_mod_item 是 Mod 物品，图标显示不出
+Ingredient("my_mod_item", 1)
+
+-- ✅ 对：显式指定图集
+Ingredient("my_mod_item", 1, "images/inventoryimages/my_mod_item.xml")
+```
+
+原版物品（`"goldnugget"`、`"log"`）不需要这个参数——引擎有内建查找表。
+
+---
+
+#### 坑 8：`onattack` 回调里 `target` 为 nil 导致崩溃
+
+**原因**：目标可能在命中伤害结算过程中被销毁（例如低血量的怪被秒杀）。
+
+**排查**：**永远先判断** `target ~= nil and target:IsValid()`：
+
+```lua
+local function onattack(weapon, attacker, target)
+    if attacker ~= nil and attacker:IsValid()
+        and target ~= nil and target:IsValid()
+        and attacker.components.sanity ~= nil then
+        attacker.components.sanity:DoDelta(-TUNING.PSIONIC_SHORTSWORD_SANITY_COST)
+    end
+end
+```
+
+看 `torch.lua` 第 207 行官方的类似写法：`if target ~= nil and target:IsValid() and target.components.burnable ~= nil and ...`。
+
+---
+
+#### 坑 9：配置项改了但游戏里没变
+
+**原因**：两种情况——
+
+1. 只改了 `modinfo.lua` 的 `default` 但没重新启动
+2. 在 `modmain.lua` 里忘了把硬编码改成 `GetModConfigData`
+
+**排查**：对照 5.7.7 节第三步——**所有 TUNING 赋值都要走 `GetModConfigData`**，而且 Mod 配置改动**必须重启游戏才能生效**。
+
+---
+
+#### 坑 10：联机时主机能合成短剑，客户端合成不出
+
+**原因**：`modinfo.lua` 的 `all_clients_require_mod` 没设成 `true`。
+
+**排查**：
+
+```lua
+-- modinfo.lua
+all_clients_require_mod = true   -- 必须！加了新 Prefab 的 Mod 都要设
+```
+
+如果没设，主机启用 Mod 时**允许客户端没装这个 Mod 就连进来**，然后客户端本地没有 `anim/`、`images/` 的文件，一合成就崩溃。
+
+---
+
+#### 快速排查流程图
+
+遇到问题先按这个顺序查：
+
+```
+Mod 在菜单里找不到
+  ├─> 检查 modinfo.lua 的 name/version/api_version（必须 10）
+  └─> 文件夹名是否不含中文/空格
+
+c_spawn 报 Can't find prefab
+  └─> PrefabFiles 有没有加这个名字
+
+图标紫红色
+  ├─> Asset 的 ATLAS + IMAGE 是否成对
+  ├─> 文件是否真实存在（路径 + 大小写）
+  └─> RegisterInventoryItemAtlas 是否调用
+
+装备外观不对
+  ├─> OverrideSymbol 的三个参数（swap_object + build + symbol）
+  └─> 对应的 .zip 是否被加载（原版自带 or 自己声明 Asset）
+
+合成菜单找不到
+  ├─> AddRecipe2 是否正确执行（查日志）
+  ├─> TECH 等级对不对
+  └─> filters 分类是否合适
+
+联机客户端看不到
+  └─> all_clients_require_mod = true 必须设
+```
+
+---
+
+### 5.7.10 小结
+
+- **Mod 最小闭环**：目录 / `modinfo.lua` / `modmain.lua` / `scripts/prefabs/xxx.lua`——四件俱全，缺一不可。
+- **Prefab 复用动画是新手的第一步**——`SetBank("spear") / SetBuild("swap_spear")` 让你在**不做美术**的情况下也能看到物品，把精力集中到代码逻辑上。
+- **组件叠加 = 物品行为**：`weapon + finiteuses + equippable + inventoryitem + inspectable` 是武器类的标配五件套，和 `spear.lua` 完全一致。特殊效果（如命中扣 sanity）靠 `SetOnAttack` 回调实现。
+- **STRINGS 的键名规则**：`NAMES.<PREFAB_UPPER>`、`CHARACTERS.GENERIC.DESCRIBE.<PREFAB_UPPER>`、`RECIPE_DESC.<PREFAB_UPPER>`——**全大写**是约定。
+- **物品栏图标注册四件套**：`ATLAS` + `IMAGE` + `ATLAS_BUILD` + `RegisterInventoryItemAtlas`，再加上 `inventoryitem.imagename/atlasname` 告诉组件用哪张图。
+- **`AddRecipe2` 参数 5 件套**：prefab 名、`Ingredient` 数组、`TECH` 科技等级、`config`（atlas/image 等）、`filters`（武器/魔法等分类）。合理的分类能大幅提升玩家体验。
+- **`modinfo.configuration_options`** + `GetModConfigData` + 修改 `TUNING` 是**让玩家定制数值**的标准链路；`TUNING` 必须在 Prefab 工厂函数执行**之前**改，否则不会生效。
+- **`AddPrefabPostInit`** 是**不创建新 Prefab 也能魔改原版**的方法——它会在每次 `SpawnPrefab` 的原工厂函数之后被调用。**写 PostInit 时三要素**：判断 `ismastersim`、判断组件存在、保留原版回调再追加。
+- **PostInit vs 新 Prefab**：微调用 PostInit（非侵入），新机制用新 Prefab（独立）——好 Mod 通常两种都用。
+- **十大排查坑**：PrefabFiles 漏登记、ATLAS+IMAGE 没成对、STRINGS 键名大小写、onequip 的 symbol 参数、pristine 分界误用、合成菜单配方不显示、材料图集缺失、`onattack` 目标 nil、配置项没走 `GetModConfigData`、`all_clients_require_mod` 没设。
+
+> **本章收尾**：从 5.1 的"Prefab 是图纸，实体是成品"，到 5.7 的"一把完整可玩的灵能短剑"——你已经掌握了饥荒联机版中**所有"可创造的东西"**的底层机制。Chapter 6 我们将离开 Prefab 视角，进入**组件系统（Component System）**——"组件是什么、怎么自定义一个组件、replica 到底怎么工作"——那是 Mod 开发进阶的下一大关。
