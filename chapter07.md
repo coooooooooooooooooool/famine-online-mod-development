@@ -4806,8 +4806,1246 @@ end)
 ---
 
 ## 7.5 PlayerController——玩家输入如何转化为 Action
+### 本节导读
 
-（待编写）
+7.4 节我们看了 BufferedAction 的完整生命周期——但留下了一个**最关键的悬念**：
+
+> **谁创造了 BufferedAction？** 鼠标点击空地、按下空格键、推动手柄左摇杆——这些**纯粹的输入信号**怎么变成"我要砍这棵树"这种"高级语义"？引擎里有没有一个"翻译官"——把鼠标坐标、按键状态、手柄方向**翻译**成 ACTIONS.CHOP 这种动作意图？
+
+答案是 **`scripts/components/playercontroller.lua`** ——一个 **5800 多行的超大组件**，是玩家身上**最重要、最复杂**的组件之一。它和它的搭档 **`PlayerActionPicker`**（550 多行）一起，回答这个"输入到动作"的最后一公里。
+
+这一节我们把这个 6000 行的"输入翻译大厅"打开，看清楚：
+
+- 一次"**鼠标左键点击屏幕**"在代码里走过哪些路径
+- **PlayerController** 这个超大组件的字段分类、核心方法
+- **PlayerActionPicker** 怎么遍历周围实体收集 actions
+- **OnLeftClick / OnRightClick** 的执行流程
+- **DoAction** 是怎么验证 + 自动装备 + 提交的
+- **客户端预测 + RemoteBufferedAction** 的 RPC 通道
+- **actionfilter / 控制器输入 / 目标锁定** 的高级机制
+
+> **新手**从 7.5.1-7.5.3 起步——理解一次鼠标点击的完整路径、PlayerController 是个什么大组件、PlayerActionPicker 是它的 "动作采集助手"；**进阶读者**继续看 7.5.4-7.5.6，深入 OnLeftClick 流程、DoAction 的验证与提交、客户端预测的 RPC 机制；**老手**跳到 7.5.7-7.5.8，看 actionfilter 优先级栈（鬼魂/骑乘/暂停过滤）、手柄目标锁定（auto-aim）、六个最容易踩的坑——尤其是"鼠标坐标和世界坐标的转换"和"客户端预测错位"这两类微妙问题。
+
+---
+
+### 7.5.1 快速入门：一次"鼠标左键点击"的完整路径
+
+#### 第一步：完整执行链
+
+把 7.1-7.4 + 7.5 串起来，**从"按下鼠标左键"到"动作执行成功"** 的完整 16 步路径：
+
+```
+[1] 玩家按下鼠标左键
+       ↓
+[2] OS 把鼠标事件传给游戏窗口
+       ↓
+[3] 引擎的输入子系统（C++）调用绑定的 Lua 回调
+       ↓
+[4] PlayerController:OnLeftClick(true)         ← ★ 输入翻译入口 ★
+       ├── ClearActionHold() / 重置一些计时器
+       ├── 处理 placer / AOE 等特殊模式
+       └── 调 PlayerActionPicker:DoGetMouseAction
+       ↓
+[5] PlayerActionPicker:DoGetMouseAction
+       ├── 通过鼠标坐标找到 target = TheInput:GetWorldEntityUnderMouse()
+       ├── 通过鼠标坐标算出 pos = TheSim:ProjectScreenPos(...)
+       └── 调 GetLeftMouseAction(target, pos)
+       ↓
+[6] PlayerActionPicker:GetLeftMouseAction
+       ├── 用 useitem = active_item or equipped_hand
+       ├── 调 GetSceneActions(useitem, false) ←★ 关键 ★
+       │     └── target:CollectActions("SCENE", doer, actions, right=false)
+       │           └── 7.2 节讲过的 collector 们 push ACTIONS.CHOP / LOOKAT / ...
+       └── 调 SortActionList(actions, target, useitem)
+             ├── 按 priority 排序
+             └── 把每个 ACTIONS.X 包装成 BufferedAction
+       ↓
+[7] PlayerActionPicker 返回 actions[1] (优先级最高)
+       ↓
+[8] PlayerController 拿到 act = actions[1]
+       ↓
+[9] PlayerController:DoAction(act)             ← ★ 提交动作 ★
+       ├── 验证 act 仍然有效
+       ├── 检查是否重复
+       ├── DoActionAutoEquip → 自动装备所需工具
+       └── 走两个分支：
+             ├── 服务端 / 单机 → inst:PushBufferedAction(act)
+             └── 客户端       → 调 PreviewBufferedAction
+                                   └── PerformPreviewBufferedAction
+                                         └── RemoteBufferedAction
+                                               └── RPC 发送到服务端
+       ↓
+[10] 客户端：本地播放预测动画
+[10'] 服务端：收到 RPC → SetClientRequestedAction → PushBufferedAction
+       ↓
+[11] 服务端的 PushBufferedAction 走 7.4.4 节我们讲过的流程
+       ↓
+[12] SG 切到 chop_start 状态 → 玩家走过去 → 切到 chop
+       ↓
+[13] chop.timeline[第 2 帧] → PerformBufferedAction
+       ↓
+[14] BufferedAction:Do() → ACTIONS.CHOP.fn(act)
+       ↓
+[15] tree.components.workable:WorkedBy(...)
+       ↓
+[16] 树倒下、地上多了几根木头
+```
+
+**16 步**——其中 **[4]-[9] 都在 PlayerController 里**——这是 7.5 节的内容。
+
+#### 第二步：用控制台亲眼看 OnLeftClick 的工作
+
+进游戏，控制台：
+
+```lua
+-- Hook PlayerController:OnLeftClick 看每次点击发生什么
+local pc = ThePlayer.components.playercontroller
+local old_OnLeftClick = pc.OnLeftClick
+pc.OnLeftClick = function(self, down)
+    if down then
+        print("LEFT-CLICK PRESSED at frame", GetTime())
+        local target = TheInput:GetWorldEntityUnderMouse()
+        print("  target:", target and target.prefab or "nothing")
+    end
+    return old_OnLeftClick(self, down)
+end
+
+-- 然后试着点击各种东西，控制台会持续打印
+```
+
+**这是 6.6.6 节"运行时侦探"手法的延伸**——hook 关键方法看每次的输入与输出。
+
+> **新手记忆**：**PlayerController 是"输入翻译大厅"**——左键、右键、空格、F、手柄方向键——所有玩家输入都在这里被翻译成 BufferedAction。**记住完整 16 步链路**——你以后调试任何"输入不响应"问题时都能精确定位。
+
+---
+
+### 7.5.2 快速入门：PlayerController 是什么 —— 5800 行的"输入大门"
+
+#### 第一步：源码定位
+
+`scripts/components/playercontroller.lua` 第 73-180 行是构造函数——**就有 100 多行字段初始化**。整个文件 **5800 多行**——是饥荒最大的组件之一（健康/战斗/库存等都在 1000-3000 行范围）。
+
+**它有这么大的原因**：玩家身上**所有"输入与决策"** 的代码都在它里面——鼠标、键盘、手柄、双击、长按、AOE 瞄准、走位预测、放置预览（placer）、命令轮（command wheel）、目标锁定、自动装备、声音音乐——全部。
+
+#### 第二步：字段分类速查
+
+PlayerController 构造函数里**初始化了大约 50+ 字段**——按功能分类：
+
+**A 组：缓存与基础（约 10 个）**
+
+```lua
+self.map = TheWorld.Map
+self.ismastersim = TheWorld.ismastersim
+self.locomotor = self.inst.components.locomotor
+self.HasItemSlots = CacheHasItemSlots
+```
+
+**作用**：缓存高频访问的引用——每帧都用，缓存避免反复查询。
+
+**B 组：攻击控制（2-3 个）**
+
+```lua
+self.attack_buffer = nil
+self.controller_attack_override = nil
+```
+
+**作用**：管理"按下攻击键"的 buffered 状态——攻击是高优先级动作，单独管理。
+
+**C 组：远程预测变量（约 10 个）**
+
+```lua
+self.remote_vector = Vector3()
+self.remote_predict_dir = nil
+self.remote_predict_stop_tick = nil
+-- ...
+```
+
+**作用**：客户端预测玩家走位——把"我想走的方向"发给服务端、缓存预测状态。
+
+**D 组：动作 hold / repeat（约 5 个）**
+
+```lua
+self.heldactioncooldown = 0
+-- self.actionholding = false
+-- self.actionholdtime = nil
+-- self.lastheldaction = nil
+-- self.actionrepeatfunction = nil
+```
+
+**作用**：处理"长按鼠标连续触发动作"——比如长按左键反复砍树。
+
+**E 组：拖拽与双击（约 5 个）**
+
+```lua
+self.dragwalking = false
+self.directwalking = false
+self.predictwalking = false
+self.startdragtestpos = nil
+self.startdragtime = nil
+self.startdoubleclicktime = nil
+self.startdoubleclickpos = nil
+self.doubletapmem = { down = false }
+```
+
+**作用**：识别"短点 vs 长按拖拽"、双击行为。
+
+**F 组：手柄相关（约 10 个）**
+
+```lua
+self.controller_target = nil
+self.controller_target_age = math.huge
+self.controller_attack_target = nil
+self.controller_targeting_lock_target = false
+self.controller_targeting_targets = {}
+self.command_wheel_allows_gameplay = ...
+-- ...
+```
+
+**作用**：手柄目标锁定（auto-aim）、命令轮、专门的攻击目标管理。
+
+**G 组：放置预览（4 个）**
+
+```lua
+self.deploy_mode = not TheInput:ControllerAttached()
+self.deployplacer = nil
+self.placer = nil
+self.placer_recipe = nil
+self.placer_recipe_skin = nil
+self.placer_cached = nil
+```
+
+**作用**：合成时的"半透明预览"（建造箱子前的虚影）、农耕模式等。
+
+**H 组：动作缓存（2 个）**
+
+```lua
+self.LMBaction = nil
+self.RMBaction = nil
+```
+
+**作用**：缓存最近一次悬停得到的左键 / 右键动作——`OnUpdate` 里实时刷新。
+
+**I 组：客户端 / 服务端分支（5 个）**
+
+```lua
+if self.ismastersim then
+    self.is_map_enabled = true
+    self.can_use_map = true
+    self.classified = inst.player_classified
+    -- ...
+else
+    self._clearinteractiontarget = function() ... end
+    -- ...
+end
+```
+
+**作用**：客户端服务端的功能分化——服务端的字段服务于真正执行、客户端的服务于预测。
+
+#### 第三步：5 个核心方法概览
+
+| 方法 | 作用 |
+|------|------|
+| **OnLeftClick(down)** | 鼠标左键按下/抬起的入口 |
+| **OnRightClick(down)** | 鼠标右键按下/抬起的入口 |
+| **OnUpdate(dt)** | 每帧更新——刷新 LMBaction/RMBaction、处理 hold action、管理走位 |
+| **DoAction(buffaction, spellbook)** | 验证 + 自动装备 + 提交一个 BufferedAction |
+| **RemoteBufferedAction(buffaction)** | 客户端预测：把 BufferedAction 通过 RPC 发给服务端 |
+
+**还有几个高级方法**：
+
+- `GetActionButtonAction(force_target)` —— 手柄"动作键"按下时，决定要做什么动作
+- `DoActionButton()` —— 按下动作键的入口
+- `OnRemoteBufferedAction()` —— 服务端收到客户端 RPC 后的处理
+
+> **新手记忆**：**PlayerController 像一个超大的"路由器"**——所有输入信号路由到合适的处理逻辑。**你不需要全读 5800 行**——记住 5 个核心方法，知道它们在第 73 / 2089 / 2643 / 4513 / 4647 / 4942 / 5686 行附近，**用 Grep 定位 + 局部阅读**就行。
+
+---
+
+### 7.5.3 快速入门：PlayerActionPicker —— 动作的"采集器"
+
+#### 第一步：PlayerController 和 PlayerActionPicker 的分工
+
+**它们都是玩家身上的组件**，但分工明确：
+
+| 组件 | 职责 |
+|------|------|
+| **PlayerController** | 玩家**输入信号**的处理（鼠标按下、按键、手柄方向）、动作**提交**（DoAction → PushBufferedAction） |
+| **PlayerActionPicker** | 玩家**世界目标**的处理（鼠标下方实体、附近实体）、**动作收集**（CollectActions / SortActionList） |
+
+**简单类比**：
+
+- PlayerController 是"**司令官**"——发号施令（"我要做这个动作"）
+- PlayerActionPicker 是"**侦察兵**"——告诉司令官"周围有哪些目标，每个目标能做什么动作"
+
+#### 第二步：PlayerActionPicker 的关键方法
+
+源码 `playeractionpicker.lua` 第 11-20 行的构造函数：
+
+```11:20:scripts/components/playeractionpicker.lua
+local PlayerActionPicker = Class(function(self, inst)
+    self.inst = inst
+    self.map = TheWorld.Map
+    self.containers = {}
+    self.leftclickoverride = nil
+    self.rightclickoverride = nil
+    self.pointspecialactionsfn = nil
+    self.actionfilterstack = {} -- only the highest priority filter is active
+    self.actionfilter = nil
+end)
+```
+
+**字段简单**——核心方法在后面：
+
+| 方法 | 作用 |
+|------|------|
+| `GetSceneActions(useitem, right)` | 收集 SCENE 类型 actions（鼠标悬停世界实体） |
+| `GetUseItemActions(target, useitem, right)` | 收集 USEITEM actions（拖动手里物品到目标） |
+| `GetPointActions(pos, useitem, right, target)` | 收集 POINT actions（拖到地面位置） |
+| `GetEquippedItemActions(target, equipped, right)` | 收集 EQUIPPED actions（装备物品对目标） |
+| `GetInventoryActions(useitem, right)` | 收集 INVENTORY actions（背包内右键） |
+| `SortActionList(actions, target, useitem)` | 按 priority 排序 + 包装成 BufferedAction |
+| `GetLeftMouseAction(target, pos)` | 综合调用上面几个，返回左键动作 |
+| `GetRightMouseAction(target, pos)` | 综合调用上面几个，返回右键动作 |
+
+**这就是 7.2 节讲过的 6 种 ActionType 的"调度入口"** —— 每种 ActionType 对应一个 GetXxxActions 方法。
+
+#### 第三步：`SortActionList` —— 把 ACTIONS push 成 BufferedAction
+
+这是 PlayerActionPicker 最关键的代码（`playeractionpicker.lua` 第 84-107 行）：
+
+```84:107:scripts/components/playeractionpicker.lua
+function PlayerActionPicker:SortActionList(actions, target, useitem)
+    if #actions == 0 then
+        return actions
+    end
+
+    table.sort(actions, OrderByPriority)
+
+    local ret = {}
+
+    for i, v in ipairs(actions) do
+        if self.actionfilter == nil or self.actionfilter(self.inst, v) then
+            local distance = v == ACTIONS.CASTAOE and useitem ~= nil and useitem.components.aoetargeting ~= nil and useitem.components.aoetargeting:GetRange() or nil
+            if target == nil then
+                table.insert(ret, BufferedAction(self.inst, nil, v, useitem, nil, nil, distance, nil, nil))
+            elseif target:is_a(EntityScript) then
+                table.insert(ret, BufferedAction(self.inst, target, v, useitem, nil, nil, distance, nil, nil))
+            elseif target:is_a(Vector3) then
+                table.insert(ret, BufferedAction(self.inst, nil, v, useitem, target, nil, distance, nil, nil))
+            end
+        end
+    end
+
+    return ret
+end
+```
+
+**3 步流程**：
+
+**步骤 1：按 priority 降序排序**
+
+```lua
+table.sort(actions, OrderByPriority)
+```
+
+`OrderByPriority` 是一个比较函数：`return l.priority > r.priority` —— 高优先级在前。**这就是 7.1.3 节讲过的 priority 字段在这里发挥作用**——多个候选动作里"谁胜出"由 priority 决定。
+
+**步骤 2：actionfilter 过滤**
+
+```lua
+if self.actionfilter == nil or self.actionfilter(self.inst, v) then
+```
+
+——**通过 actionfilter 检查**才能进入下一步。`actionfilter` 是一个函数 —— 接收 `(inst, action)` 返回 bool。**典型用法**：
+
+- 玩家是鬼魂时——只允许 `ghost_valid=true` 的动作通过
+- 玩家骑着牛——只允许 `mount_valid=true` 的动作
+- 游戏暂停时——只允许 `paused_valid=true` 的动作
+
+**这是 7.5.7 节我们要详细讲的 `actionfilterstack`**——多个 filter 按优先级栈管理。
+
+**步骤 3：把 ACTIONS.X 包装成 BufferedAction**
+
+```lua
+if target == nil then
+    table.insert(ret, BufferedAction(self.inst, nil, v, useitem, nil, nil, distance, nil, nil))
+elseif target:is_a(EntityScript) then
+    table.insert(ret, BufferedAction(self.inst, target, v, useitem, nil, nil, distance, nil, nil))
+elseif target:is_a(Vector3) then
+    table.insert(ret, BufferedAction(self.inst, nil, v, useitem, target, nil, distance, nil, nil))
+end
+```
+
+**根据 target 的类型走三种分支**：
+
+- **target 是 nil**：动作不需要目标（如 EAT 自己背包里的东西、装备）
+- **target 是 EntityScript**：实体目标（CHOP / ATTACK / PICK 等大多数情况）
+- **target 是 Vector3**：位置目标（DEPLOY / TERRAFORM 等）—— **传给 BufferedAction 的第 5 个参数 `pos` 而不是第 2 个 `target`**
+
+**这就是 BufferedAction 的诞生地**——回顾 7.4.2 节讲过的 14 个字段——大部分在这里被填好。
+
+#### 第四步：GetSceneActions 完整流程
+
+我们看一个具体例子（`playeractionpicker.lua` 第 109-139 行）：
+
+```109:139:scripts/components/playeractionpicker.lua
+function PlayerActionPicker:GetSceneActions(useitem, right)
+    local actions = {}
+
+    useitem:CollectActions("SCENE", self.inst, actions, right)
+
+    if useitem ~= self.inst then
+        if not right and useitem.inherentsceneaction ~= nil then
+            table.insert(actions, useitem.inherentsceneaction)
+        elseif right and useitem.inherentscenealtaction ~= nil then
+            table.insert(actions, useitem.inherentscenealtaction)
+        end
+    end
+
+    local sorted_acts = self:SortActionList(actions, useitem)
+
+    if #sorted_acts == 0 and
+        useitem ~= self.inst and
+        (self.inst.CanExamine == nil or self.inst:CanExamine()) and
+        useitem:HasTag("inspectable") and
+        (self.inst.sg == nil or self.inst.sg:HasStateTag("moving") or self.inst.sg:HasStateTag("idle")) and
+        (self.inst:HasTag("moving") or self.inst:HasTag("idle")) then
+
+		--@V2C: #FORGE_AOE_RCLICK *searchable*
+		--      -Forge used to strip ALL r.click actions, so now we manually strip WALKTO action.
+		if not right or (self.inst.components.playercontroller ~= nil and not self.inst.components.playercontroller:HasAOETargeting()) then
+			sorted_acts = self:SortActionList({ ACTIONS.WALKTO }, useitem)
+		end
+    end
+
+    return sorted_acts
+end
+```
+
+**5 步**：
+
+1. **`useitem:CollectActions("SCENE", self.inst, actions, right)`** —— 调用 7.2 节讲过的 `CollectActions`，**所有 SCENE collector 把动作 push 进 actions**
+2. **inherentsceneaction**——某些实体有"内置场景动作"（不是组件 collector 给的），手动加进 actions
+3. **`SortActionList`** —— 排序 + 包装 BufferedAction
+4. **`#sorted_acts == 0` 兜底**：如果一个动作都没有但实体可检视——返回 WALKTO（兜底走过去）
+5. 返回 `sorted_acts`（一个 BufferedAction 列表，已按 priority 降序）
+
+**这是 7.5.1 第 [6] 步的完整代码** —— PlayerActionPicker 把"鼠标悬停的实体"翻译成"可执行动作列表"的关键。
+
+> **新手记忆**：**PlayerActionPicker 是 PlayerController 的"侦察兵"**——根据 6 种 ActionType 调用 7.2 节的 collector、按 priority 排序、把 ACTIONS 包装成 BufferedAction。**SortActionList 是核心**——记住它的"排序 + 过滤 + 包装"3 步。
+
+---
+
+### 7.5.4 进阶：`OnLeftClick` 与 `OnRightClick` 的执行流程
+
+#### 第一步：OnLeftClick 的入口检查
+
+`playercontroller.lua` 第 4647-4690 行：
+
+```4647:4690:scripts/components/playercontroller.lua
+function PlayerController:OnLeftClick(down)
+    if not self:UsingMouse() then
+        return
+    elseif not down then
+        self:OnLeftUp()
+        return
+    end
+
+    self:ClearActionHold()
+
+    self.startdragtime = nil
+
+	local laststartdoubleclicktime = self.startdoubleclicktime
+	local laststartdoubleclickpos = self.startdoubleclickpos
+	self.startdoubleclicktime = nil
+	self.startdoubleclickpos = nil
+
+    if not self:IsEnabled() then
+        return
+    elseif TheInput:GetHUDEntityUnderMouse() ~= nil then
+        self:CancelPlacement()
+        return
+    elseif self.placer_recipe ~= nil and self.placer ~= nil then
+
+        --do the placement
+        if self.placer.components.placer.can_build then
+
+            if self.inst.replica.builder ~= nil and not self.inst.replica.builder:IsBusy() then
+                self.inst.replica.builder:MakeRecipeAtPoint(self.placer_recipe,
+                    self.placer.components.placer.override_build_point_fn ~= nil and self.placer.components.placer.override_build_point_fn(self.placer) or self.placer:GetPosition(),
+                    self.placer:GetRotation(), self.placer_recipe_skin)
+                self:CancelPlacement()
+            end
+
+        elseif self.placer.components.placer.onfailedplacement ~= nil then
+            self.placer.components.placer.onfailedplacement(self.inst, self.placer)
+        end
+
+        return
+    end
+```
+
+**4 个 early return**：
+
+1. **`not self:UsingMouse()`** —— 用手柄玩，不处理鼠标
+2. **`not down`** —— 鼠标抬起 → 调 `OnLeftUp` 然后 return
+3. **`not self:IsEnabled()`** —— 控制被禁用（看动画、对话中等）
+4. **`TheInput:GetHUDEntityUnderMouse() ~= nil`** —— 鼠标在 UI 上 → 取消放置然后 return
+
+**第 5 个分支**：**placer 模式**——玩家正在选位置放建筑——处理建造而不是常规动作。
+
+**这种"先判断特殊状态再走常规流程"的写法**——是 PlayerController 的典型设计——**主流程在很深的层级里**。
+
+#### 第二步：判断是 AOE 模式还是常规模式
+
+继续看 `playercontroller.lua` 第 4692-4711 行：
+
+```4692:4711:scripts/components/playercontroller.lua
+	local act, spellbook, spell_id, dblclickact, trypreventdirflicker, position
+    if self:IsAOETargeting() then
+		local canrepeatcast = self.reticule.inst.components.aoetargeting:CanRepeatCast()
+		if self:IsBusy() and not (canrepeatcast and self.inst:HasTag("canrepeatcast")) then
+            TheFocalPoint.SoundEmitter:PlaySound("dontstarve/HUD/click_negative", nil, .4)
+            self.reticule:Blip()
+            return
+        end
+        act = self:GetRightMouseAction()
+        if act == nil or act.action ~= ACTIONS.CASTAOE then
+            return
+        end
+        spellbook = self:GetActiveSpellBook()
+		if spellbook ~= nil then
+			spell_id = spellbook.components.spellbook:GetSelectedSpell()
+		end
+```
+
+**AOE 模式**：玩家在用法术书选目标地区——左键确认释放法术。**这是特殊动作的特殊处理路径**——和常规动作完全不同。
+
+#### 第三步：常规模式——双击检测 + GetMouseAction
+
+继续看 4711-4750 行：
+
+```lua
+	else
+		local scrnx, scrny = TheSim:GetPosition()
+		local x, y, z = TheSim:ProjectScreenPos(scrnx, scrny)
+
+		--first see if we have double click actions
+		if x and y and z then
+			position = Vector3(x, y, z)
+
+			local target = TheInput:GetWorldEntityUnderMouse()
+			if target and not CanEntitySeeTarget(self.inst, target) then
+				target = nil
+			end
+			if target or CanEntitySeeTarget(self.inst, self.inst) then
+				local dir = GetWorldControllerVector()
+				dblclickact = self.inst.components.playeractionpicker:GetDoubleClickActions(position, dir, target)[1]
+				if dblclickact then
+					if (laststartdoubleclicktime and t < laststartdoubleclicktime + DOUBLE_CLICK_TIMEOUT) and
+						(laststartdoubleclickpos and ...) then
+						act = dblclickact
+					...
+```
+
+**关键步骤**：
+
+1. **`TheSim:GetPosition()`** —— 屏幕鼠标坐标
+2. **`TheSim:ProjectScreenPos(scrnx, scrny)`** —— **从屏幕坐标投影到世界坐标**——这是 3D 引擎里的标准操作（射线检测）
+3. **`TheInput:GetWorldEntityUnderMouse()`** —— **拿到鼠标下方的世界实体**——引擎内部已经做了射线碰撞检测
+4. **`CanEntitySeeTarget(self.inst, target)`** —— 玩家能不能"看到"这个 target（黑暗中、视线被挡都会返回 false）
+5. **`GetDoubleClickActions(position, dir, target)`** —— 看有没有双击动作可用（如双击船浆全速划船）
+6. **判断双击时机**——和上一次点击的时间差 < `DOUBLE_CLICK_TIMEOUT` (~0.4 秒) **且**位置接近 → 双击成立
+
+**双击的特殊路径**——很多玩家不知道游戏里有双击逻辑——但代码里其实有（如双击空地行走会"奔跑"）。
+
+#### 第四步：单击处理——拿到 GetLeftMouseAction
+
+如果**不是双击**，走到 4750 行附近：
+
+```lua
+		--this is the regular single-click path
+		act = self.inst.components.playeractionpicker:DoGetMouseActions(position, target)
+```
+
+——**这就是 7.5.1 第 [5] 步的入口**！调 `DoGetMouseActions` —— 拿到 LMBaction（左键动作）。
+
+**`DoGetMouseActions` 内部**：
+
+```lua
+function PlayerActionPicker:DoGetMouseActions(position, target)
+    local lmb, rmb = self:GetLeftMouseAction(target, position), self:GetRightMouseAction(target, position)
+    return lmb, rmb
+end
+```
+
+——同时拿到左键和右键动作（OnUpdate 里也用这个，每帧刷新 LMBaction/RMBaction）。
+
+#### 第五步：调 DoAction 提交
+
+如果 `act` 不为 nil，PlayerController 后面会调：
+
+```lua
+self:DoAction(act, spellbook)
+```
+
+——**进入 7.5.5 节要讲的 DoAction 流程**。
+
+#### 第六步：OnRightClick 与 OnLeftClick 的差异
+
+`OnRightClick` 函数（第 4942 行起，约 700 行）—— 整体结构和 OnLeftClick 几乎一样，**核心差异**：
+
+- **左键**：执行"主要动作"（PICK, CHOP, EAT, PICKUP）—— 大部分动作的默认入口
+- **右键**：执行"次要/特殊动作"（INTERACT_WITH, FEEDPLAYER, OPEN_CONTAINER, CHARGE_FROM）—— 7.2.8 陷阱 6 我们说"自定义动作大多用右键"
+
+**右键还有 AOE 瞄准** —— 长按右键瞄准 + 单击左键释放。**这是一种"两阶段动作"**——左右键配合完成一个动作。
+
+> **新手记忆**：**OnLeftClick / OnRightClick 是"鼠标输入的两个分发器"**。两者都先做 early return（UI、placer、AOE 等特殊状态）、再做双击检测、最后调 PlayerActionPicker:GetXxxMouseAction 拿到动作、最后调 DoAction 提交。**核心路径在第 4750 行附近的 `DoGetMouseActions` 调用**——记住这一行就抓住了主线。
+
+---
+
+### 7.5.5 进阶：`DoAction` —— 验证 + 自动装备 + 提交
+
+#### 第一步：DoAction 的完整流程
+
+`playercontroller.lua` 第 4513-4617 行：
+
+```4513:4617:scripts/components/playercontroller.lua
+function PlayerController:DoAction(buffaction, spellbook)
+	--V2C: -New support for "non_preview_cb" on non-predicting clients.
+	--     -If there's no pre_action_cb, trigger the cb to send the RPC
+	--      right away, matching old behaviour.
+	if buffaction and
+		buffaction.non_preview_cb and
+		buffaction.action.pre_action_cb == nil and
+		self.locomotor == nil
+	then
+		buffaction.non_preview_cb()
+	end
+
+    --Check if the action is actually valid.
+    --Cached LMB/RMB actions can become invalid.
+    --Also check if we're busy.
+
+	local valid = true
+    if buffaction == nil or
+        (buffaction.invobject ~= nil and not buffaction.invobject:IsValid()) or
+        (buffaction.target ~= nil and not buffaction.target:IsValid()) or
+		(buffaction.doer ~= nil and not buffaction.doer:IsValid())
+		then
+		valid = false
+	elseif self:IsBusy() then
+		if buffaction.action == ACTIONS.CASTAOE then
+			-- 特殊处理 ...
+		else
+			valid = false
+		end
+	end
+
+	if not valid then
+		self.actionholdtime = nil
+		return
+	end
+
+    --Check for duplicate actions
+    local currentbuffaction = self.inst:GetBufferedAction()
+    if currentbuffaction ~= nil and
+        currentbuffaction.action == buffaction.action and
+        currentbuffaction.target == buffaction.target and
+        ((currentbuffaction.pos == nil and buffaction.pos == nil) or
+         (currentbuffaction.pos == buffaction.pos)) and
+        not (currentbuffaction.ispreviewing and
+            self.inst:HasTag("idle") and
+            self.inst.sg:HasStateTag("idle")) then
+        return
+    end
+
+    if buffaction.action == ACTIONS.ATTACK and self.inst.sg then
+        self.inst.sg.statemem.retarget = buffaction.target
+    end
+
+    if self.handler ~= nil and buffaction.target ~= nil then
+        local highlight_guy = buffaction.target.highlightforward or buffaction.target
+        if highlight_guy.components.highlight == nil then
+            highlight_guy:AddComponent("highlight")
+        end
+        highlight_guy.components.highlight:Flash(.2, .125, .1)
+    end
+
+    --Clear any buffered attacks since we're starting a new action
+    self.attack_buffer = nil
+
+    self:DoActionAutoEquip(buffaction)
+
+    if not buffaction.action.instant and not buffaction.action.invalid_hold_action and buffaction:IsValid() then
+        self.lastheldaction = buffaction
+    else
+```
+
+#### 第二步：DoAction 6 步流程
+
+**步骤 1：non_preview_cb 处理**
+
+```lua
+if buffaction.non_preview_cb and ... then
+    buffaction.non_preview_cb()
+end
+```
+
+**non_preview_cb 是非预测客户端的回调**——某些动作有"非预测路径"（专用服务器/单机）需要立即触发。**95% 的动作不需要管这个**——只是看到要明白。
+
+**步骤 2：有效性检查**
+
+```lua
+local valid = true
+if buffaction == nil or
+    (buffaction.invobject ~= nil and not buffaction.invobject:IsValid()) or
+    (buffaction.target ~= nil and not buffaction.target:IsValid()) or
+    (buffaction.doer ~= nil and not buffaction.doer:IsValid())
+    then
+    valid = false
+elseif self:IsBusy() then
+    -- ...
+    valid = false
+end
+```
+
+**3 项检查**：
+
+- ba 本身存在
+- invobject / target / doer 都 IsValid
+- 玩家不忙（除非是 AOE 特殊情况）
+
+**注意这和 7.4.5 节的 `BufferedAction:IsValid` 6 项检查不同**——这里是 PlayerController 提交前的"轻量检查"，BufferedAction:IsValid 是执行前的"完整检查"。**两层防御**。
+
+**步骤 3：重复动作检查**
+
+```lua
+local currentbuffaction = self.inst:GetBufferedAction()
+if currentbuffaction ~= nil and
+    currentbuffaction.action == buffaction.action and
+    currentbuffaction.target == buffaction.target and
+    ... then
+    return
+end
+```
+
+**和 7.4.4 节 `PushBufferedAction` 第一步的重复检查类似**——但这里在更早的阶段（DoAction 提交前）就过滤掉重复——避免无谓的网络流量。
+
+**步骤 4：特殊动作处理 + UI 反馈**
+
+```lua
+if buffaction.action == ACTIONS.ATTACK and self.inst.sg then
+    self.inst.sg.statemem.retarget = buffaction.target
+end
+
+if self.handler ~= nil and buffaction.target ~= nil then
+    -- 给目标加 highlight 闪烁效果
+    local highlight_guy = buffaction.target.highlightforward or buffaction.target
+    if highlight_guy.components.highlight == nil then
+        highlight_guy:AddComponent("highlight")
+    end
+    highlight_guy.components.highlight:Flash(.2, .125, .1)
+end
+```
+
+**两件事**：
+
+- ATTACK 特殊处理——把目标记到 statemem（用于"自动追击"）
+- **给目标加 highlight 组件并 Flash**——这是为什么"你点击树时树会闪一下"的代码——给玩家明确的视觉反馈。
+
+**步骤 5：DoActionAutoEquip —— 自动装备工具**
+
+```lua
+self:DoActionAutoEquip(buffaction)
+```
+
+**这是 PlayerController 的"小聪明"**：玩家点击树但**手里拿的是石头**——`DoActionAutoEquip` 检查"我背包里有没有斧头？" 有就自动装备给玩家。
+
+源码 4619-4644 行（约 25 行）：
+
+```lua
+function PlayerController:DoActionAutoEquip(buffaction)
+    -- 简化版逻辑
+    if buffaction.invobject == nil and buffaction.target ~= nil then
+        local equippable = ...  -- 找背包里能完成这个动作的工具
+        if equippable then
+            -- 装备它
+            -- 标记 buffaction.autoequipped = true
+        end
+    end
+end
+```
+
+**这就是 BufferedAction 第 18 字段 `autoequipped` 的来源**——回顾 7.4.2 节。
+
+**步骤 6：提交动作 —— PushBufferedAction 或 RemoteBufferedAction**
+
+DoAction 末尾会判断：
+
+- **服务端 / 单机**：直接 `inst:PushBufferedAction(buffaction)`
+- **客户端**：调 `inst:PreviewBufferedAction(buffaction)` —— 内部会触发 RemoteBufferedAction 发 RPC
+
+**这就是 7.4.4 节的 PushBufferedAction 入口**——动作正式进入 7.4 节描述的生命周期。
+
+#### 第三步：DoAction 内部还有什么细节？
+
+**`lastheldaction`** —— 缓存"可以连发的动作"（如砍树可以按住）：
+
+```lua
+if not buffaction.action.instant and not buffaction.action.invalid_hold_action and buffaction:IsValid() then
+    self.lastheldaction = buffaction
+end
+```
+
+——回顾 7.1.3 节 `invalid_hold_action` 字段——决定"按住能不能连发"。`lastheldaction` 是连发的"模板"——按住时 PlayerController 会在 OnUpdate 里反复 PushBufferedAction(lastheldaction)。
+
+> **新手记忆**：**DoAction 是 PlayerController 的"动作提交关"**——验证、去重、自动装备、UI 反馈、最后调 PushBufferedAction（或客户端的 PreviewBufferedAction）。**理解这 6 步 = 理解整个输入到执行的"最后一公里"**。
+
+---
+
+### 7.5.6 进阶：客户端预测 + RemoteBufferedAction
+
+#### 第一步：网络游戏的"输入延迟"问题
+
+在多人联机中——**玩家的网络延迟通常是 50-150ms**。**没有客户端预测**的话：
+
+```
+0ms    玩家按下左键
+0ms    OnLeftClick → DoAction → 等服务端
+↓
+100ms  RPC 到达服务端
+100ms  服务端 PushBufferedAction → SG 切到 chop_start
+↓
+200ms  状态同步回客户端
+200ms  客户端开始播放砍树动画
+```
+
+**玩家点击 → 200ms 后才看到反馈**——感觉**"卡顿、没响应"**。
+
+**客户端预测**：
+
+```
+0ms    玩家按下左键
+0ms    OnLeftClick → DoAction → PreviewBufferedAction (本地立刻播动画)
+0ms    同时 RemoteBufferedAction → 发 RPC 到服务端
+↓
+100ms  RPC 到达 → 服务端 PushBufferedAction
+↓
+200ms  状态同步回——客户端验证：和我预测的一致 → 不需要回滚
+```
+
+**玩家点击 → 0ms 看到反馈**——感觉**"立刻响应"**。
+
+#### 第二步：`PreviewBufferedAction` 流程
+
+回顾 7.4.6 节我们看过 `EntityScript:PreviewBufferedAction`——它和 PushBufferedAction 几乎一样但调 PreviewAction 而不是 StartAction。
+
+**关键差异**：
+
+- **`PushBufferedAction`**：服务端用——真正执行业务
+- **`PreviewBufferedAction`**：客户端用——只播预测动画、不调 fn
+
+**PreviewBufferedAction 内部会调 `PerformPreviewBufferedAction`**：
+
+```1600:1607:scripts/entityscript.lua
+function EntityScript:PerformPreviewBufferedAction()
+    if self.bufferedaction ~= nil and not self.bufferedaction.ispreviewing then
+        if self.components.playercontroller ~= nil then
+            self.components.playercontroller:RemoteBufferedAction(self.bufferedaction)
+        end
+        self.bufferedaction.ispreviewing = true
+    end
+end
+```
+
+**这里调用了 `playercontroller:RemoteBufferedAction`** —— 把 BufferedAction 通过 RPC 发给服务端。
+
+#### 第三步：`RemoteBufferedAction` 看 RPC 发送
+
+```5686:5699:scripts/components/playercontroller.lua
+function PlayerController:RemoteBufferedAction(buffaction)
+	if self.classified and self.classified.iscontrollerenabled:value() then
+		if self.client_last_predict_walk.tick then
+			local x, y, z = self.inst.Transform:GetWorldPosition()
+			self:RemotePredictWalking(x, z, self.locomotor:GetTimeMoving() == 0, self.locomotor:PopOverrideTimeMoving(), self.client_last_predict_walk.direct)
+			self.client_last_predict_walk.tick = nil
+		end
+		buffaction.preview_cb()
+	else
+		self.client_last_predict_walk.tick = nil
+	end
+end
+```
+
+**`buffaction.preview_cb()`** —— 这就是 RPC 发送函数。**它是哪里来的？** 是 PlayerController 在创建 BufferedAction 时通过别的路径设置的——**关键的 RPC 发送代码隐藏在多个层级里**。
+
+**简化版理解**：客户端 BufferedAction 的 `preview_cb` 是引擎封装好的 RPC 发送回调——**直接调它就把"我要做这个动作"打包发到服务端**。
+
+#### 第四步：服务端的 `OnRemoteBufferedAction`
+
+服务端收到 RPC 后会调 `OnRemoteBufferedAction`：
+
+```5701:5746:scripts/components/playercontroller.lua
+function PlayerController:OnRemoteBufferedAction()
+    if self.ismastersim then
+        --If we're starting a remote buffered action, prevent the last
+        --movement prediction vector from cancelling us out right away
+		local pt = self:GetRemotePredictPosition()
+		if pt then
+			...
+			--Force us to interrupt and go to movement state immediately
+			self.inst.sg:HandleEvent("locomote", { dir = dir, force_idle_state = true })
+			self.locomotor:Stop()
+			self.inst.Transform:SetPosition(pt.x, 0, pt.z)
+		end
+        ...
+```
+
+**做的事**：**强制服务端的玩家位置同步到客户端预测的位置**——避免"客户端预测玩家在 A 位置、服务端实际在 B 位置"的不一致。
+
+**这是网络同步的核心难题**——客户端按预测移动了一段距离、服务端因为延迟还没收到、双方位置不一致。`OnRemoteBufferedAction` 通过"以客户端预测为准"来快速对齐。
+
+#### 第五步：`SetClientRequestedAction` 全局函数
+
+我们在 7.1 节看过：
+
+```262:268:scripts/actions.lua
+function SetClientRequestedAction(actioncode, mod_name)
+    if mod_name then
+        CLIENT_REQUESTED_ACTION = MOD_ACTIONS_BY_ACTION_CODE[mod_name] and MOD_ACTIONS_BY_ACTION_CODE[mod_name][actioncode] or nil
+    else
+        CLIENT_REQUESTED_ACTION = ACTIONS_BY_ACTION_CODE[actioncode]
+    end
+end
+```
+
+——**RPC 包到达服务端后**，先调 `SetClientRequestedAction(code, mod_name)` 把"客户端请求的动作"设到全局变量 `CLIENT_REQUESTED_ACTION`。然后服务端的 PlayerController/StateGraph 在处理输入时会查这个变量——决定要执行哪个动作。
+
+**为什么用全局变量**？因为**输入处理涉及多个组件**——PlayerController、StateGraph、各个 collector 函数都可能需要访问"当前请求的动作"——用全局变量比传参方便。**全局变量的副作用**——必须在使用后立刻 `ClearClientRequestedAction()` 清空——防止跨帧污染。
+
+> **新手记忆**：**客户端预测 = 客户端立刻播动画 + 同时发 RPC、服务端确认 + 必要时回滚**。**绝大多数自定义动作不需要管预测**——引擎已经实现好了。**只在你的动作有"客户端必要立即响应"的需求时才需要深入**。
+
+---
+
+### 7.5.7 老手进阶：actionfilter / 控制器输入 / 手柄目标锁定
+
+#### 第一步：actionfilter 优先级栈
+
+回顾 7.5.3 节 SortActionList 里的 `if self.actionfilter == nil or self.actionfilter(self.inst, v) then`——**`actionfilter` 是个过滤函数**。
+
+**`PlayerActionPicker` 的 actionfilterstack 实现**（playeractionpicker.lua 第 1-77 行）：
+
+```1:9:scripts/components/playeractionpicker.lua
+ACTION_FILTER_PRIORITIES =
+{
+	paused = 999,
+	ghost = 99,
+	mounted = 20,
+	floaterheld = 15,
+	heavylifting = 10,
+	default = -99,
+}
+```
+
+**5 种 ActionFilter 优先级**：
+
+- `paused`（999）—— 最高，游戏暂停时
+- `ghost`（99）—— 玩家是鬼魂时
+- `mounted`（20）—— 玩家骑着牛/恐鸟时
+- `floaterheld`（15）—— 拿着浮动物品（如船桨）时
+- `heavylifting`（10）—— 拿着大件物品时
+
+**`PushActionFilter / PopActionFilter`**（第 58-76 行）—— 管理过滤栈：
+
+```58:76:scripts/components/playeractionpicker.lua
+function PlayerActionPicker:PushActionFilter(filterfn, priority)
+    table.insert(self.actionfilterstack, { fn = filterfn, priority = priority or 0 })
+    self:OnUpdateActionFilterStack()
+end
+
+function PlayerActionPicker:PopActionFilter(filterfn)
+    if filterfn ~= nil then
+        for i = #self.actionfilterstack, 1, -1 do
+            if self.actionfilterstack[i].fn == filterfn then
+                table.remove(self.actionfilterstack, i)
+                self:OnUpdateActionFilterStack()
+                return
+            end
+        end
+    else
+        table.remove(self.actionfilterstack, #self.actionfilterstack)
+        self:OnUpdateActionFilterStack()
+    end
+end
+```
+
+**典型用法**：
+
+```lua
+-- 玩家变成鬼魂时
+ThePlayer.components.playeractionpicker:PushActionFilter(function(inst, action)
+    return action.ghost_valid
+end, ACTION_FILTER_PRIORITIES.ghost)
+
+-- 玩家复活时
+ThePlayer.components.playeractionpicker:PopActionFilter(...)
+```
+
+**actionfilter 在 SortActionList 里被调用**——**所有 action 都要通过当前 filter 才能进入候选**。
+
+> **进阶提示**：**只有最高优先级的 filter 生效**——回顾 `OnUpdateActionFilterStack` 第 42-56 行——遍历 stack 找最高 priority 的 filter。**这种"栈式过滤"让多个状态可以叠加**——但只激活最严格的那个。
+
+#### 第二步：手柄输入与 GetActionButtonAction
+
+PC 玩家用鼠标——但**主机玩家用手柄**。手柄没有"鼠标光标"——怎么选目标？
+
+**答案**：**`controller_target` 字段**——手柄玩家的"自动锁定目标"。
+
+`OnUpdate` 里有这样的代码：
+
+```lua
+self.controller_target = ...  -- 选择附近最近的可交互目标
+```
+
+**自动选择的规则**：
+
+- 距离最近 + 可交互（CollectActions 能产生 action 的）
+- 玩家面向方向优先
+- 排除已锁定的攻击目标（避免冲突）
+
+然后**手柄"动作键"**（默认是 X / A）按下时：
+
+```2089:2270:scripts/components/playercontroller.lua
+function PlayerController:GetActionButtonAction(force_target)
+    -- 用 controller_target 作为目标
+    -- 调 PlayerActionPicker:GetSceneActions(useitem)[1]
+    -- 返回 BufferedAction
+end
+```
+
+**`GetActionButtonAction` 是手柄输入的核心入口**——和鼠标的 `GetLeftMouseAction` 平行。
+
+#### 第三步：手柄目标锁定
+
+注意 PlayerController 字段里的 `controller_targeting_lock_target`——**目标锁定**功能。
+
+**作用**：玩家可以**长按某个键锁定一个目标**——之后所有手柄动作都对这个目标——**直到解除锁定**。
+
+**典型应用**：远程攻击时锁定一只"远处的怪物"——避免攻击近处的友方目标。
+
+**实现位置**：PlayerController 的 `controller_targeting_lock_*` 系列字段——配合 `OnUpdate` 里的目标筛选逻辑。
+
+**新手不需要细究这部分**——但**写"自定义远程攻击物品 Mod"** 时会遇到：你的物品默认在手柄上不可锁定——你要在 collector 里 push 你的动作，并且确保目标具有合适的 tag。
+
+#### 第四步：DoubleClick 动作
+
+PlayerActionPicker 还有 `GetDoubleClickActions(pos, dir, target)` —— 处理"双击触发的特殊动作"。
+
+**典型场景**：
+
+- **双击地面** —— 触发 `WALKTO_PROJECTILE` 之类的瞬间反应
+- **双击船桨** —— 触发"快速划船" 模式
+
+**实现**：每个组件可以在 `COMPONENT_ACTIONS` 里注册一种叫 "DOUBLECLICK" 的特殊 ActionType（实际不是 7.2.3 节列的 6 种之一，是更高级的扩展）。
+
+---
+
+### 7.5.8 老手进阶：六个常见陷阱与设计经验
+
+#### 陷阱 1：在 OnLeftClick 里直接调 PushBufferedAction
+
+```lua
+-- ❌ 错：自定义 Mod 想拦截左键
+local pc = ThePlayer.components.playercontroller
+local old = pc.OnLeftClick
+pc.OnLeftClick = function(self, down)
+    if down then
+        -- 直接 push 自己的动作
+        self.inst:PushBufferedAction(BufferedAction(self.inst, target, ACTIONS.MYACTION))
+        return  -- 跳过原版逻辑
+    end
+    return old(self, down)
+end
+```
+
+**问题**：
+
+- **跳过了 placer / AOE / 双击等特殊路径**
+- **没有 DoAction 的验证 / 自动装备 / UI 反馈**
+- **客户端没有发 RPC**（直接 PushBufferedAction 在客户端不会同步到服务端）
+
+**正解**：**hook 时返回原版让它走完，只在你需要的时机加自己逻辑**：
+
+```lua
+-- ✅ 对：监听事件而不是劫持方法
+ThePlayer:ListenForEvent("performaction", function(inst, data)
+    if data.action.action == ACTIONS.MYACTION then
+        -- 我的反应
+    end
+end)
+```
+
+或者**用 `AddComponentPostInit`** 给 PlayerController 加新方法、不修改原版方法。
+
+#### 陷阱 2：在客户端访问 components.xxx
+
+```lua
+-- ❌ 错：客户端代码
+ThePlayer.components.health:DoDelta(-10)  -- ❌ 客户端没有 health 组件！
+```
+
+**问题**：客户端的 `inst.components` 表里大部分组件是 nil——只有 `replica` 才完整。
+
+**正解**：
+
+```lua
+-- 在 collector 里
+if doer.replica.health and doer.replica.health:GetPercent() > 0.5 then
+    -- ...
+end
+
+-- 真要修改字段：发 RPC 到服务端做
+SendModRPCToServer(MOD_RPC.MyMod.DamagePlayer, target.GUID, 10)
+-- 服务端 RPC handler 里：
+target.components.health:DoDelta(-10)
+```
+
+**回顾 6.2 / 7.2.8 的同款经验**——客户端只读不写、写操作走 RPC。
+
+#### 陷阱 3：actionfilter 写在 modmain 顶层
+
+```lua
+-- ❌ 错：modmain.lua 顶层
+ThePlayer.components.playeractionpicker:PushActionFilter(myfilter, 50)
+-- ThePlayer 在 modmain 加载时还不存在！
+```
+
+**问题**：modmain 在世界生成前就跑——ThePlayer 还没创建——直接报错或者 nil。
+
+**正解**：用 `AddPlayerPostInit` 推迟到玩家实例化后：
+
+```lua
+AddPlayerPostInit(function(inst)
+    if inst.components.playeractionpicker then  -- 客户端可能没有
+        inst.components.playeractionpicker:PushActionFilter(myfilter, 50)
+    end
+end)
+```
+
+#### 陷阱 4：自定义 Action 在客户端 PlayerActionPicker 里没注册 collector
+
+```lua
+-- 你写了：
+AddAction("MYACTION", "做我的动作", function(act) ... end)
+-- 但是没写 AddComponentAction
+```
+
+**症状**：玩家鼠标悬停目标——**右键菜单不出现"做我的动作"**——因为 PlayerActionPicker 在 `GetSceneActions` 里通过 collector 收集 actions——**collector 是 7.2 节的产物，必须用 `AddComponentAction` 注册**。
+
+**正解**：**回顾 7.2.7 节自定义动作三步走**——三步缺一不可。
+
+#### 陷阱 5：忽略 isclientcontrollerattached
+
+PlayerController 字段：
+
+```lua
+self.isclientcontrollerattached = false
+```
+
+——**当前玩家是不是用手柄玩**。
+
+**问题**：你写的 collector 假设玩家用鼠标——但手柄玩家有不同 UX 需求（比如手柄玩家不需要 deploy_mode 切换）。
+
+**正解**：检查 `playercontroller.isclientcontrollerattached` 决定 UX：
+
+```lua
+AddComponentAction("INVENTORY", "deployable", function(inst, doer, actions)
+    if doer.components.playercontroller ~= nil and not doer.components.playercontroller.deploy_mode then
+        local inventoryitem = inst.replica.inventoryitem
+		if inventoryitem ~= nil and inventoryitem:IsGrandOwner(doer) and inventoryitem:IsDeployable(doer) then
+			local inventory = doer.replica.inventory
+			if not (inventory and inventory:IsFloaterHeld()) or inst:HasTag("boatbuilder") then
+				table.insert(actions, ACTIONS.TOGGLE_DEPLOY_MODE)
+			end
+		end
+    end
+end)
+```
+
+——这是 `componentactions.lua` 里 `deployable` 的真实代码。
+
+#### 陷阱 6：在 OnUpdate 里做高耗 IO
+
+```lua
+-- ❌ 错：每帧扫描全图
+local old_OnUpdate = pc.OnUpdate
+pc.OnUpdate = function(self, dt)
+    local all = TheSim:FindEntities(0, 0, 0, 1000, {"player"})  -- 全图扫描
+    for _, p in ipairs(all) do
+        ProcessPlayer(p)
+    end
+    return old_OnUpdate(self, dt)
+end
+```
+
+**问题**：PlayerController:OnUpdate **每帧调一次**——60fps 就是每秒 60 次。**全图扫描是性能噩梦**。
+
+**正解**：
+
+- **降频**：用 `inst:DoPeriodicTask(1, fn)` 每秒扫一次
+- **限定范围**：`TheSim:FindEntities(x, y, z, 30, {"player"})` 只扫附近
+
+#### 设计经验三条
+
+**经验 1：永远用事件而不是劫持方法**
+
+```lua
+-- ❌ 不好：劫持 OnLeftClick 看每次点击
+local old = pc.OnLeftClick
+pc.OnLeftClick = function(self, down)
+    -- 我的逻辑
+    return old(self, down)
+end
+
+-- ✅ 好：监听 performaction 事件
+ThePlayer:ListenForEvent("performaction", function(inst, data)
+    -- 我的逻辑
+end)
+```
+
+**事件机制**让多个 Mod 可以同时观察同一事件——**不会互相覆盖**。
+
+**经验 2：动作的客户端预测尽量简单**
+
+如果你的自定义动作有特殊的客户端预测——**让预测逻辑简单**——预测错了能"软回滚"。**复杂预测 = 永远的 bug 源**。**简单粗暴的"先播 idle 动画、等服务端确认"也比错误的预测好**。
+
+**经验 3：模仿原版动作而不是从零写**
+
+写自定义"工具型物品" → 抄 `axe.lua` 和 `actions.lua` 里 CHOP 的写法
+写自定义"可吃物品" → 抄 `berries.lua` 和 EAT 的写法
+
+**99% 的需求** Klei 的代码里都有原型。**找到最接近的那个、复制 + 改几行**——比从空文件写快十倍。
+
+---
+
+### 7.5.9 小结
+
+- **PlayerController** 是玩家身上**最大的组件**（5800+ 行）——**输入翻译大门**。**PlayerActionPicker** 是它的"采集助手"（550 行）——根据 6 种 ActionType 收集 actions。
+- **完整 16 步路径**：鼠标点击 → OnLeftClick → PlayerActionPicker 收集 → SortActionList 排序+包装 → DoAction 验证+提交 → PushBufferedAction（服务端）/ PreviewBufferedAction（客户端）→ SG → State.timeline → Do → fn → 业务执行。
+- **PlayerController 字段分 9 组**——缓存 / 攻击 / 远程预测 / 动作 hold / 拖拽 / 手柄 / 放置预览 / 动作缓存 / 客户端服务端分支。**5 个核心方法**：`OnLeftClick / OnRightClick / OnUpdate / DoAction / RemoteBufferedAction`。
+- **PlayerActionPicker.SortActionList** 是 BufferedAction 的诞生地——**按 priority 排序 + actionfilter 过滤 + 包装成 BufferedAction**。**3 种 BufferedAction 构造分支**（target=nil / EntityScript / Vector3）。
+- **`OnLeftClick` 流程**：early return（UI/placer/AOE）→ 双击检测 → DoGetMouseActions → DoAction。**`OnRightClick` 类似但产生不同动作（次要 / AOE 瞄准）**。
+- **`DoAction` 6 步**：non_preview_cb → 有效性检查 → 重复检查 → 特殊处理（ATTACK 重定向 / highlight 闪烁）→ DoActionAutoEquip → PushBufferedAction / PreviewBufferedAction。
+- **客户端预测**：DoAction 在客户端调 PreviewBufferedAction → 立即播预测动画 + 调 RemoteBufferedAction 发 RPC。**服务端 OnRemoteBufferedAction 做位置同步**——避免客户端服务端不一致。
+- **`actionfilter` 优先级栈**（playeractionpicker.lua 第 1-9 行）：paused(999) > ghost(99) > mounted(20) > floaterheld(15) > heavylifting(10) > default(-99)。**只有最高优先级 filter 生效**。
+- **6 个常见陷阱**：① 直接 hook OnLeftClick ② 客户端访问 components ③ actionfilter 在 modmain 顶层 ④ 没注册 collector ⑤ 忽略手柄分支 ⑥ OnUpdate 高耗 IO。
+- **3 条设计经验**：① 用事件而不是劫持方法 ② 客户端预测尽量简单 ③ 模仿原版动作而不是从零写。
+
+> **下一节预告**：7.6 节我们专门讲**动作的优先级与冲突解决**——一棵树**同时挂着 workable / inspectable / pickable** 等多个组件——它们的 collector 都 push 了 action——但玩家点击只能执行**一个**——引擎到底怎么挑？除了 priority 字段，还有哪些隐藏的"优先级层"？我们会从 PlayerActionPicker.SortActionList 出发，把整个"动作冲突解决"机制讲清楚——包括 priority、actionfilter、ISVALID、left vs right、双击 等多层筛选规则，以及自定义动作时**如何避免和原版动作互相打架**的实战指南。
+
+---
+
 
 ## 7.6 动作的优先级与冲突解决
 
