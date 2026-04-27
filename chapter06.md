@@ -6093,4 +6093,1850 @@ Klei 不同时期的代码风格不同，能从中推断时期：
 
 ## 6.7 实战：编写一个自定义组件（含 Replica）
 
-（待编写）
+### 本节导读
+
+前 6 节我们一直在**读**——读 `health.lua`、`fueled.lua`、`perishable.lua`，读 `entityreplica.lua`、`entityscript.lua`，读 `SourceModifierList`，读完一遍组件系统的"教科书"。这一节我们换个姿势——**自己动手写**。
+
+我们要做的，是**把第 5.7 节的故事延伸下去**：
+
+> 5.7 节我们做了一把"**灵能短剑**"——攻击时消耗玩家理智作为施法代价。但"灵能"这种东西本身**只是被吸食的对象**，它从哪里来、能否储存、能否反过来释放？这一节我们把"灵能"**独立成一个真正的组件 `psionic`**，并给它配一颗可以拾起、自动充能、充满后释放净化效果的**灵能晶簇**（`psionic_crystal`）。
+
+这个例子之所以选它，是因为它能**完整覆盖 6.1-6.6 的全部知识点**：
+
+| 6.1-6.6 学到的知识 | 在 6.7 中的对应实现 |
+|--------------------|-------------------|
+| 6.1 组件生命周期五钩子 | `psionic` 完整实现 OnSave/OnLoad/OnEntitySleep/OnEntityWake/OnRemoveFromEntity |
+| 6.1 onset 同步机制 | 用 onset 在 `current/max` 变化时自动 PushEvent + 同步给 replica |
+| 6.2 Replica 客户端影子 | 写一份 `psionic_replica.lua`，用 net_smallbyte 同步给客户端 |
+| 6.3 net 变量 / 父子结构 | 选用**轻型 net_xxx 方案**（不依赖 classified 实体），并解释何时该用 classified |
+| 6.4 Timer 与定时任务 | 用 `DoPeriodicTask` 实现自动充能；附带"何时改用 timer 组件"的判断 |
+| 6.5 SourceModifierList | 充能率支持多来源叠加（"附近有花/有恶魔花/装备 buff"等都能影响速率） |
+| 6.6 阅读组件源码的方法 | 组件写完后用 6.6 的"五步读法"自己再读一遍，确认结构清晰 |
+
+> **新手**从 6.7.1-6.7.3 起步——理解项目目标、建好文件骨架、写出最小可运行版本，进游戏 `c_spawn("psionic_crystal")` 就能看到一颗会自动发光的水晶；**进阶读者**继续到 6.7.4-6.7.6，把存档恢复、休眠优化、Replica 同步都接好——它就是一颗"工业级"的水晶了；**老手**跳到 6.7.7-6.7.8，看 `SourceModifierList` 的实战用法、调试技巧、五个常见陷阱，以及如何把这个组件**反过来挂到玩家身上**变成"法力值条"。最后 6.7.9 把 6.1-6.6 所有知识点和这一节的代码做对照表，整章闭环。
+
+> **重要前置说明**：本节涉及的资源（`.tex`/`.xml`/`.zip`）我们**全部复用游戏里已有的紫宝石**（`purplegem`），不需要你做任何美术工作——这样你可以专注在 Lua 代码上。如果你想换成自己的图标，参考 5.7.5 节的步骤即可。
+
+---
+
+### 6.7.1 快速入门：项目目标 —— 一颗能自动充能的"灵能晶簇"
+
+#### 第一步：先讲清楚要做什么
+
+我们要做的东西，从玩家视角看是这样的：
+
+| 维度 | 设定 |
+|------|------|
+| **名字** | 灵能晶簇（`psionic_crystal`） |
+| **外观** | 借用游戏里紫宝石（`purplegem`）的模型和图标 |
+| **行为** | 放在地上时，它会**自动以每秒 1 点的速度充能**，最多充到 100 |
+| **互动** | 充满后**自动触发"灵能净化"**——使用方式见下文 |
+| **可交互** | 玩家可以拾起放进背包、丢出去、在地上扔下，统统支持 |
+| **存档** | 退出游戏再进——剩余灵能值**保持不变** |
+| **休眠** | 玩家走远——晶簇停止 tick；走回来——按真实时间补充刚才"应充上的"灵能 |
+| **多源叠加** | 附近有**罂粟花**时充能 ×1.5、附近有**恶魔花**时充能 ×0.5（演示 `SourceModifierList`） |
+| **客户端可见** | 客户端可以通过 `inst.replica.psionic:GetPercent()` 读到当前百分比（用于 UI 显示） |
+
+实现这些功能，我们需要**一个新组件 `psionic` + 一个新 Prefab `psionic_crystal`**。
+
+#### 第二步：把功能拆成"组件能力"和"Prefab 配置"两层
+
+回顾 5.1 节我们讲过的"**Prefab 是图纸、组件是能力模块**"——这次我们要清晰地把功能分到两层：
+
+**`psionic` 组件（能力层）** —— 不知道自己挂在什么实体上，只负责"灵能值的管理"：
+
+```
+[职责清单]
+- 维护当前灵能值 / 最大灵能值
+- 自动充能（每秒按 rate 增加）
+- 充能率支持多来源叠加（rate_modifiers）
+- 满了 → PushEvent("psionic_full")
+- 空了 → PushEvent("psionic_empty")
+- 数值变化 → PushEvent("psionicchange") 通知所有监听者
+- 存档/读档自动恢复
+- 休眠时停 tick、唤醒时按时间补偿
+- 提供 Burst() 方法：消耗灵能释放范围效果
+```
+
+**`psionic_crystal` Prefab（具体物体层）** —— 决定"要什么样的实体":
+
+```
+[职责清单]
+- 一个可拾起的物品（inventoryitem）
+- 模型来自 purplegem
+- 挂上 psionic 组件，最大值 100、自动充能 rate=1
+- 监听 "psionic_full" 事件，触发时调用组件的 Burst() 释放净化效果
+- 一些细节：浮在水面、可被影投掷、可被检视
+```
+
+> **开发逻辑**：**组件不应该知道自己挂在哪个实体上**——这是组件设计的核心原则。比如 `health` 组件不会写"如果我挂的是猪人，做 X；如果我挂的是兔人，做 Y"。**所有"实体特化的逻辑"都应该放在 Prefab 文件里**——通过监听组件抛出的事件、或者覆盖组件的回调函数来定制。这样一个组件可以被**多种 Prefab 复用**，6.7.8 节我们会把 `psionic` 反过来挂到玩家身上演示这一点。
+
+#### 第三步：跟"灵能短剑"的故事如何衔接？
+
+5.7 节里我们写过这一段：
+
+```5.7.4(伪行号):psionic_shortsword.lua
+local function onattack(inst, attacker, target)
+    if attacker.components.sanity then
+        attacker.components.sanity:DoDelta(-TUNING.PSIONIC_SHORTSWORD_SANITY_COST)
+    end
+end
+```
+
+——攻击时**消耗玩家理智**作为施法代价。
+
+6.7 节我们做出 `psionic` 组件后，可以**自然延伸**这个故事：
+
+> **设想**：在 6.7.8 节末尾我们会展示——给玩家身上也挂一个 `psionic` 组件后，灵能短剑的 `onattack` 可以改成"**优先消耗灵能值，灵能不够时才扣理智**"。这样灵能晶簇就成了战士的"魔力电池"——你打一只蜘蛛吸不到灵能，但你**抱着一颗灵能晶簇出门**，就有 100 点灵能预算可以挥霍。
+
+虽然这个延伸不是 6.7 主线，但**整个故事是连贯的**——5.7 是"消耗"、6.7 是"储存"，下一章我们会进一步讲"事件系统"，让"消耗"和"储存"通过事件无缝对接。
+
+> **新手记忆**：**先想清楚"组件"和"Prefab"的边界**——组件解决"通用的能力"，Prefab 解决"具体的物体"。能力不绑定实体、实体可以叠加多种能力。这是饥荒组件系统设计的核心原则，也是 ECS（Entity-Component-System）思想的精髓。
+
+---
+
+### 6.7.2 快速入门：搭好骨架 —— 五个文件各管什么
+
+#### 第一步：建立 Mod 目录结构
+
+回顾 5.7.1 节，我们已经知道一个完整 Mod 的目录长什么样。这次我们建一个新的：
+
+```
+psionic_crystal_mod/
+├── modinfo.lua                         ← Mod 元信息
+├── modmain.lua                         ← Mod 启动脚本
+└── scripts/
+    ├── components/
+    │   ├── psionic.lua                 ← 我们的组件（核心）
+    │   └── psionic_replica.lua         ← Replica（客户端影子）
+    └── prefabs/
+        └── psionic_crystal.lua         ← Prefab（图纸）
+```
+
+**五个文件**，每个职责清晰：
+
+| 文件 | 在 6.x 节里学到的对应概念 | 职责 |
+|------|--------------------------|------|
+| `modinfo.lua` | 5.6.6 | Mod 名称/版本/兼容性声明，告诉游戏"这是个 Mod" |
+| `modmain.lua` | 5.6.7 / 6.2.4 | 注册 Prefab、注册 ReplicableComponent、调整 TUNING |
+| `psionic.lua` | 6.1（生命周期）+ 6.5（多源叠加） | 组件主体：状态、行为、生命周期 |
+| `psionic_replica.lua` | 6.2（Replica） | 客户端影子：读取同步过来的数据 |
+| `psionic_crystal.lua` | 5.2-5.7（Prefab 全套） | 装配体：把组件 + 标签 + 资源拼成具体物品 |
+
+#### 第二步：先把空骨架建起来
+
+很多新手喜欢"一口气写完一个文件再写下一个"——我建议反过来——**先把所有文件的"空骨架"建起来**，让目录结构完整，再逐个填血肉。这样你能**早早地看到 Mod 在游戏里被识别**（虽然功能为零），调试节奏更稳。
+
+**`modinfo.lua`**：
+
+```lua
+name = "灵能晶簇"
+description = "一颗能自动累积并释放灵能的水晶。教程示例 Mod。"
+author = "你的名字"
+version = "1.0.0"
+
+api_version = 10
+
+dst_compatible = true
+dont_starve_compatible = false
+reign_of_giants_compatible = false
+
+all_clients_require_mod = true
+
+icon_atlas = "modicon.xml"
+icon = "modicon.tex"
+
+server_filter_tags = {"灵能", "教程"}
+
+configuration_options = {
+    {
+        name = "MAX_PSIONIC",
+        label = "最大灵能值",
+        options = {
+            {description = "50",  data = 50},
+            {description = "100", data = 100},
+            {description = "200", data = 200},
+        },
+        default = 100,
+    },
+}
+```
+
+> **复习要点**：`all_clients_require_mod = true` 表示"客户端必须本地有这个 Mod"——因为我们注册了**新组件 `psionic`**（5.6.8 节坑 6 讲过：注册新组件、新 Prefab 都必须勾选这个）。`api_version = 10` 是 DST 联机版的固定值（5.6.6 节说过）。
+
+**`modmain.lua`**：
+
+```lua
+PrefabFiles = {
+    "psionic_crystal",
+}
+
+Assets = {
+}
+
+GLOBAL.TUNING.PSIONIC = {
+    DEFAULT_MAX  = GetModConfigData("MAX_PSIONIC") or 100,
+    DEFAULT_RATE = 1,                  -- 每秒 1 点
+    PERIOD       = 1,                  -- 每秒 tick 一次
+    BURST_RANGE  = 8,                  -- Burst 影响范围
+    BURST_SANITY = 15,                 -- Burst 给附近玩家恢复的理智
+}
+
+AddReplicableComponent("psionic")
+```
+
+> **复习要点**：
+>
+> - `PrefabFiles` 让游戏在启动时加载 `scripts/prefabs/psionic_crystal.lua`（5.6.7 节）
+> - `GetModConfigData` 从 `modinfo.lua` 的 `configuration_options` 读配置（5.7.7 节）
+> - `AddReplicableComponent("psionic")` 把 `psionic` 加进 `REPLICATABLE_COMPONENTS` 白名单（6.2.4 节）——这一行**一旦遗漏**，客户端就不会有 `inst.replica.psionic`，UI 全部失效
+
+**`scripts/components/psionic.lua`**：
+
+```lua
+local Psionic = Class(function(self, inst)
+    self.inst = inst
+end)
+
+return Psionic
+```
+
+**`scripts/components/psionic_replica.lua`**：
+
+```lua
+local Psionic = Class(function(self, inst)
+    self.inst = inst
+end)
+
+return Psionic
+```
+
+**`scripts/prefabs/psionic_crystal.lua`**：
+
+```lua
+local assets = {
+    Asset("ANIM", "anim/purple_gem.zip"),
+    Asset("ATLAS", "images/inventoryimages/purplegem.xml"),
+}
+
+local function fn()
+    local inst = CreateEntity()
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("purple_gem")
+    inst.AnimState:SetBuild("purple_gem")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inspectable")
+    inst:AddComponent("inventoryitem")
+    inst.components.inventoryitem.atlasname = "images/inventoryimages/purplegem.xml"
+
+    return inst
+end
+
+return Prefab("psionic_crystal", fn, assets)
+```
+
+#### 第三步：第一次进游戏验证骨架
+
+把这五个文件丢进 `mods/psionic_crystal_mod/` 文件夹（根据你的 DST 安装位置），主菜单 → Mods → 启用我们的 Mod → 进存档 → 控制台：
+
+```lua
+c_give("psionic_crystal")
+```
+
+**预期结果**：
+
+- ✅ 你拿到一颗紫色宝石，可以放进背包
+- ✅ 控制台**不报错**
+- ⚠️ 它什么"灵能"功能都没有——因为 `psionic` 组件还没真的添加到这个 Prefab 上
+
+> **新手记忆**：**先让骨架跑起来，再加血肉**——这是写 Mod 的黄金法则。如果你直接写完整代码再启动，碰到错误你完全不知道是 modinfo 问题、还是 prefab 问题、还是 component 问题。**先空骨架 → 再每加一段就回游戏验证**——这样错误定位永远在 5 行代码之内。
+
+#### 第四步：进阶提示——`AddReplicableComponent` 的两个时机
+
+注意 `modmain.lua` 里的 `AddReplicableComponent("psionic")`——它**必须在游戏加载组件之前调用**。看 `entityreplica.lua` 第 5-26 行的白名单：
+
+```5:26:scripts/entityreplica.lua
+local REPLICATABLE_COMPONENTS =
+{
+    builder = true,
+    combat = true,
+    container = true,
+    constructionsite = true,
+    equippable = true,
+    fishingrod = true,
+    follower = true,
+    health = true,
+    hunger = true,
+    inventory = true,
+    inventoryitem = true,
+    moisture = true,
+    named = true,
+    oceanfishingrod = true,
+    rider = true,
+    sanity = true,
+    sheltered = true,
+    stackable = true,
+    writeable = true,
+}
+```
+
+我们 `AddReplicableComponent("psionic")` 就是把 `psionic = true` 加进这张表。**`modmain.lua` 是顶层执行的脚本**，所有 `Add*` 系列接口都在这里调用一次就行。
+
+> **老手提示**：如果你看到论坛上有人问"我的自定义组件 `inst.replica.xxx` 一直是 `nil`"——99% 是忘了 `AddReplicableComponent`，1% 是 `_replica.lua` 文件名拼错（必须是 `xxx_replica.lua`，看 6.2.7 节）。
+
+---
+
+### 6.7.3 快速入门：组件主体 v1 —— 字段、Setter、DoDelta、自动充能
+
+骨架已经跑起来了。现在我们让 `psionic` 组件**真正能用**——v1 版本只解决三件事：
+
+1. **维护当前/最大灵能值**
+2. **每秒自动充能**
+3. **数值变化时抛出事件**（让监听者能反应）
+
+存档、同步、休眠这些"工业级"细节我们留到 6.7.4 之后再加。
+
+#### 第一步：先想清楚字段和"事件"
+
+写组件之前，先问自己三个问题：
+
+1. **我有哪些状态字段？** —— `current`（当前值）、`max`（最大值）、`rate`（每秒充能速率）、`task`（定时任务的引用，用来取消）
+2. **谁会改这些字段？** —— 只通过 `SetMax` / `SetCurrent` / `DoDelta` 改，**不允许外部直接 `cmp.current = 99`**（避免漏掉同步、漏掉事件）
+3. **变化时谁需要知道？** —— Prefab 的代码会监听 `psionic_full` 事件触发 Burst、UI 会监听 `psionicchange` 事件刷新百分比、Replica 会通过 onset 拿到通知
+
+**这就是组件的"对外契约"**——字段是私有的，方法和事件是公开的。这跟 `health.lua`、`fueled.lua` 的设计哲学完全一致。
+
+#### 第二步：完整代码（v1 版）
+
+替换 `scripts/components/psionic.lua`：
+
+```lua
+local function oncurrent(self, current)
+    if current >= self.max then
+        self.inst:AddTag("psionic_full")
+    else
+        self.inst:RemoveTag("psionic_full")
+    end
+    if current <= 0 then
+        self.inst:AddTag("psionic_empty")
+    else
+        self.inst:RemoveTag("psionic_empty")
+    end
+end
+
+local function onmax(self, max)
+    if self.current > max then
+        self.current = max
+    end
+    oncurrent(self, self.current)
+end
+
+local Psionic = Class(function(self, inst)
+    self.inst = inst
+
+    self.max = TUNING.PSIONIC.DEFAULT_MAX
+    self.current = 0
+    self.rate = TUNING.PSIONIC.DEFAULT_RATE
+    self.period = TUNING.PSIONIC.PERIOD
+
+    self.task = nil
+end,
+nil,
+{
+    current = oncurrent,
+    max = onmax,
+})
+
+function Psionic:SetMax(max)
+    self.max = max
+end
+
+function Psionic:SetCurrent(current)
+    self.current = math.clamp(current, 0, self.max)
+end
+
+function Psionic:SetRate(rate)
+    self.rate = rate
+end
+
+function Psionic:GetPercent()
+    return self.max > 0 and self.current / self.max or 0
+end
+
+function Psionic:GetCurrent() return self.current end
+function Psionic:GetMax()     return self.max end
+function Psionic:IsFull()     return self.current >= self.max end
+function Psionic:IsEmpty()    return self.current <= 0 end
+
+function Psionic:DoDelta(amount, source)
+    local oldcurrent = self.current
+    self.current = math.clamp(self.current + amount, 0, self.max)
+    local delta = self.current - oldcurrent
+
+    if delta == 0 then
+        return 0
+    end
+
+    self.inst:PushEvent("psionicchange", {
+        current = self.current,
+        max     = self.max,
+        delta   = delta,
+        percent = self:GetPercent(),
+        source  = source,
+    })
+
+    if self.current >= self.max and oldcurrent < self.max then
+        self.inst:PushEvent("psionic_full")
+    elseif self.current <= 0 and oldcurrent > 0 then
+        self.inst:PushEvent("psionic_empty")
+    end
+
+    return delta
+end
+
+local function OnTick(inst, self)
+    self:DoDelta(self.rate * self.period)
+end
+
+function Psionic:StartCharging()
+    if self.task == nil then
+        self.task = self.inst:DoPeriodicTask(self.period, OnTick, nil, self)
+    end
+end
+
+function Psionic:StopCharging()
+    if self.task ~= nil then
+        self.task:Cancel()
+        self.task = nil
+    end
+end
+
+function Psionic:Burst()
+    if self.current <= 0 then
+        return false
+    end
+    local x, y, z = self.inst.Transform:GetWorldPosition()
+    local players = TheSim:FindEntities(x, y, z, TUNING.PSIONIC.BURST_RANGE, {"player"})
+    for _, p in ipairs(players) do
+        if p.components.sanity then
+            p.components.sanity:DoDelta(TUNING.PSIONIC.BURST_SANITY)
+        end
+    end
+    self.inst:PushEvent("psionic_burst", {
+        amount = self.current,
+        targets = players,
+    })
+    self:SetCurrent(0)
+    return true
+end
+
+function Psionic:GetDebugString()
+    return string.format("%2.1f / %2.1f (rate=%2.2f/s, %s)",
+        self.current, self.max, self.rate, self.task and "ON" or "OFF")
+end
+
+return Psionic
+```
+
+#### 第三步：逐段拆解——为什么这么写？
+
+**(1) `oncurrent` / `onmax` 这两个 onset 回调**
+
+```lua
+{
+    current = oncurrent,
+    max = onmax,
+}
+```
+
+回顾 6.1.1 节，`Class` 的第三个参数是 **onset 回调表**——任何对 `self.current` / `self.max` 的赋值都会触发对应的回调。
+
+我们用它做了**两件事**：
+
+- **`oncurrent`**：根据当前值自动加/移除 `"psionic_full"` 和 `"psionic_empty"` 这两个 tag。这样**外部代码可以用 `inst:HasTag("psionic_full")` 来判断状态**——而无需 `inst.components.psionic.current >= max`，**客户端也能用**（tag 是网络同步的，回顾 5.5 节）。
+- **`onmax`**：当最大值被改小时，自动把当前值 clamp 下来——避免出现"current > max"的非法状态。
+
+> **开发逻辑**：**onset 回调让"状态"和"派生表现"自动同步**。如果你不用 onset，就要在每个 `SetCurrent` / `DoDelta` 后手动加 `if self.current >= self.max then ... end` ——又啰嗦又容易漏。**这是 Klei 引擎给组件作者的免费工具**，应该用起来。
+
+**(2) `SetCurrent` 用 `math.clamp` 而不是直接赋值**
+
+```lua
+function Psionic:SetCurrent(current)
+    self.current = math.clamp(current, 0, self.max)
+end
+```
+
+**永远不要相信调用方传的值是合理的**。如果有人写 `cmp:SetCurrent(99999)` 或 `cmp:SetCurrent(-50)`——`math.clamp` 帮你把它压在合法范围。这是**防御式编程**的体现。
+
+**(3) `DoDelta` 是**修改值的"唯一正门"**
+
+```lua
+function Psionic:DoDelta(amount, source)
+    local oldcurrent = self.current
+    self.current = math.clamp(self.current + amount, 0, self.max)
+    local delta = self.current - oldcurrent
+    ...
+end
+```
+
+注意 `delta` 是**实际发生的变化量**——可能小于 `amount`（因为 clamp 截断）。返回这个真实 delta，让调用方知道"我请求加 50，但只加了 30，因为已经满了"。这是 `health.lua` 的 `DoDelta` 同款写法，回顾 6.6.7 节。
+
+**为什么 `PushEvent` 要带 `source`？** —— 让监听者能区分变化来源。比如 UI 可以做"被攻击时屏幕红屏（source 是攻击者）、自然回血时不红屏（source 是 nil）"。
+
+**(4) 三个事件的语义**
+
+```lua
+"psionicchange"   -- 任何变化都抛（含 +1、-1）
+"psionic_full"    -- 从"未满"到"满了"瞬间抛（不会重复抛）
+"psionic_empty"   -- 从"非空"到"空了"瞬间抛（不会重复抛）
+```
+
+**`_full` 和 `_empty` 是"边界事件"**——只在跨越边界时抛一次。这避免了"满了之后每 tick 都抛 full 事件"的灾难。看 `health.lua` 的 `death` 事件、`fueled.lua` 的 `onfueldsectionchanged` 事件——都是这种"边界触发"模式。
+
+**(5) `OnTick` 写在外面而不是闭包**
+
+```lua
+local function OnTick(inst, self)
+    self:DoDelta(self.rate * self.period)
+end
+
+function Psionic:StartCharging()
+    self.task = self.inst:DoPeriodicTask(self.period, OnTick, nil, self)
+end
+```
+
+**注意 `OnTick` 是模块级的局部函数**，而不是写成 `self.inst:DoPeriodicTask(self.period, function() self:DoDelta(...) end)`。
+
+为什么？**因为闭包每次 `StartCharging` 都创建一个新函数对象**——内存占用 + GC 压力。**模块级函数只创建一次，被所有实例共享**——这是 Klei 在 `fueled.lua` 第 265-267 行用的同款手法：
+
+```265:267:scripts/components/fueled.lua
+local function OnDoUpdate(inst, self, period)
+    self:DoUpdate(period)
+end
+```
+
+> **新手记忆**：**`DoPeriodicTask` 的回调要尽量用模块级函数**——把 `self` 作为参数传进去（`DoPeriodicTask` 第 4 个参数后是任意 user data）。这是写性能敏感组件时的好习惯。
+
+**(6) `Burst` 是业务方法的示范**
+
+```lua
+function Psionic:Burst()
+    ...
+    local players = TheSim:FindEntities(x, y, z, TUNING.PSIONIC.BURST_RANGE, {"player"})
+    ...
+end
+```
+
+`TheSim:FindEntities(x, y, z, radius, must_tags, cant_tags, one_of_tags)` 是 6.5.7 节我们提过的"**范围查找**"API——按位置和标签过滤实体，**性能优于自己遍历 `Ents`**。这里用 `{"player"}` 表示"只找带 player tag 的实体"。
+
+`Burst` 设计成**返回 bool**：成功返回 `true`、灵能不足返回 `false`——让外部调用方知道"是否真的释放了"。这是 `health.lua` 的 `Kill`、`fueled.lua` 的 `TakeFuelItem` 同款返回值习惯。
+
+#### 第四步：把组件挂到 Prefab 上
+
+修改 `scripts/prefabs/psionic_crystal.lua`，在 `inst.entity:SetPristine()` **之后**的服务端段加上：
+
+```lua
+inst:AddComponent("psionic")
+inst.components.psionic:StartCharging()
+
+inst:ListenForEvent("psionic_full", function(inst)
+    inst.components.psionic:Burst()
+end)
+```
+
+**两段代码各做什么**：
+
+- **`AddComponent("psionic")`**：实例化组件、自动 ReplicateComponent（因为 modmain 已经 `AddReplicableComponent`）、执行所有 `AddComponentPostInit` 注册的回调
+- **`StartCharging`**：启动每秒 +1 的定时任务
+- **`ListenForEvent("psionic_full", ...)`**：把"满了就 Burst"这个**特化逻辑放在 Prefab 层**——组件本身不知道"满了之后该做什么"，由 Prefab 决定
+
+> **复习 5.4 节的 Pristine 分界线**：`AddComponent` **必须在 `SetPristine` 之后**——因为只有服务端需要持有真实的组件实例，客户端只需要 `replica` 影子。`ListenForEvent` 同理。
+
+#### 第五步：进游戏验证 v1
+
+存档 → `c_give("psionic_crystal")` → 把它扔到地上：
+
+```lua
+c_sel().components.psionic:GetDebugString()
+-- 输出: 0.0 / 100.0 (rate=1.00/s, ON)
+
+-- 等 5 秒
+c_sel().components.psionic:GetDebugString()
+-- 输出: 5.0 / 100.0 (rate=1.00/s, ON)
+
+-- 等 100 秒（或者直接快进）
+-- 屏幕上：附近玩家恢复 +15 理智
+-- 控制台：current 回到 0，重新开始充能
+
+-- 验证 tag
+c_sel():HasTag("psionic_full")  -- 在某一刻会 true
+c_sel():HasTag("psionic_empty") -- 一直 true 直到第一次 +1
+```
+
+✅ **如果你看到这些输出，恭喜——你的第一个自定义组件成功跑起来了！**
+
+#### 第六步：v1 版本的"未完成清单"
+
+但 v1 还有 4 个问题（这正是后面 5 节要解决的）：
+
+| 问题 | 后果 | 解决章节 |
+|------|------|---------|
+| ❌ 没存档 | 退出再进游戏，灵能值清零 | 6.7.4 |
+| ❌ 没休眠 | 玩家走远，task 还在跑（浪费 CPU） | 6.7.5 |
+| ❌ 客户端看不到 current/max | UI 没法显示百分比 | 6.7.6 |
+| ❌ 充能率没法叠加 | 想做"附近有花充能更快"做不到 | 6.7.7 |
+
+> **新手记忆**：**先做能跑的最小版本，再迭代加功能**——这种"**Walking Skeleton**"开发模式让你**任何时刻代码都能运行**，调试和阅读都更轻松。Klei 的源码很多组件也是这样从最简单版本演化来的，看 `health.lua` 的注释里能找到 V2C（一个 Klei 程序员）几年里加的几十处 bug fix 和功能扩展。
+
+---
+
+### 6.7.4 进阶：让灵能"活下去" —— OnSave / OnLoad
+
+#### 第一步：明确"该存什么、不该存什么"
+
+回顾 6.1.4 节我们总结的 5 条潜规则：
+
+1. 返回 nil 不存
+2. 只存"必要的"字段
+3. 默认值不存
+4. 不存可重新计算的字段
+5. 不存函数引用
+
+套用到我们的 `psionic`：
+
+| 字段 | 存？ | 理由 |
+|------|-----|------|
+| `self.current` | ✅ | 必须保存，否则游戏重启就清零 |
+| `self.max` | 看情况 | **大多数时候不存**——Prefab 会重新初始化为 100；但如果有人通过 `cmp:SetMax(200)` 改过最大值，就要存 |
+| `self.rate` | ❌ | Prefab 会重新初始化；如果想运行时改变可存（少见） |
+| `self.task` | ❌ | 函数引用不能存；OnLoad 时根据 current 状态重启 |
+| `self.period` | ❌ | 配置常量，不变 |
+
+#### 第二步：完整代码
+
+在 `psionic.lua` 里加上这两个方法（放在 `DoDelta` 之后）：
+
+```lua
+function Psionic:OnSave()
+    if self.current <= 0 and self.max == TUNING.PSIONIC.DEFAULT_MAX then
+        return nil
+    end
+    return {
+        current = self.current > 0 and self.current or nil,
+        max = self.max ~= TUNING.PSIONIC.DEFAULT_MAX and self.max or nil,
+        add_component_if_missing = true,
+    }
+end
+
+function Psionic:OnLoad(data)
+    if data == nil then
+        return
+    end
+
+    if data.max ~= nil then
+        self.max = data.max
+    end
+
+    if data.current ~= nil then
+        self:SetCurrent(data.current)
+    end
+end
+```
+
+#### 第三步：逐句拆解——三个有意思的细节
+
+**(1) "全默认状态时返回 nil"**
+
+```lua
+if self.current <= 0 and self.max == TUNING.PSIONIC.DEFAULT_MAX then
+    return nil
+end
+```
+
+如果当前值是 0、最大值是默认 100——**完全可以由 Prefab 重新初始化**，不需要存档。回顾 6.1.4 第 5 条：
+
+> 默认值不存。如 `fueled.lua` 第 133-137 行的 `OnSave` 在燃料满时直接返回 nil。
+
+**好处**：节省存档体积。一颗刚生成的灵能晶簇，存档里**完全没有它的 psionic 数据**。
+
+**(2) `max` 字段的"按需保存"**
+
+```lua
+max = self.max ~= TUNING.PSIONIC.DEFAULT_MAX and self.max or nil,
+```
+
+只在 `max` **被改过**（不等于默认值）时才保存。这是 Lua 里的"条件赋值"惯用法——`A and B or C` 等效于 `A ? B : C`。
+
+> **进阶提示**：这种写法在 `health.lua` 第 154-161 行可以看到：
+>
+> ```154:161:scripts/components/health.lua
+> function Health:OnSave()
+>     return
+>     {
+>         health = self.currenthealth,
+>         penalty = self.penalty > 0 and self.penalty or nil,
+> 		maxhealth = self.save_maxhealth and self.maxhealth or nil
+>     }
+> end
+> ```
+>
+> Klei 用 `penalty > 0 and self.penalty or nil` 让 `penalty == 0` 时不存。我们用相同的手法。
+
+**(3) `add_component_if_missing = true` 的妙用**
+
+这是回顾 6.1.4 第四步里讲过的**特殊标记**：
+
+```lua
+add_component_if_missing = true,
+```
+
+**作用**：如果某天你**改了 Prefab、把 `inst:AddComponent("psionic")` 删了**——但**老存档里有这颗晶簇带着 psionic 数据**——引擎会**自动给它补上 psionic 组件**，然后 OnLoad 数据。
+
+回顾 `entityscript.lua` 第 1954-1984 行的 `SetPersistData` 流程，那段代码会检测这个标记。
+
+**什么时候用？** —— 当你想**保证存档兼容性**时。比如老版本 Mod 没有 `psionic` 组件、新版本加了——玩家升级 Mod 后，老存档里没有 `psionic` 数据，所以这个标记是**新版本对老版本的兼容**；反过来，如果你哪天要拆掉这个组件，**新版本不再 AddComponent**，但老存档里仍有 psionic 数据——这个标记保证组件被自动补上、数据被读回来。
+
+> **老手提示**：这个标记**不需要每个组件都加**——只对那些"**绝对不能丢数据**"的组件加。比如 `health` 没有这个标记（因为生物总会再 `AddComponent("health")`）；但**自定义组件**最好加上，避免 Mod 升级造成的数据丢失。
+
+**(4) `OnLoad` 的防御式 nil 检查**
+
+```lua
+if data == nil then
+    return
+end
+
+if data.max ~= nil then
+    self.max = data.max
+end
+
+if data.current ~= nil then
+    self:SetCurrent(data.current)
+end
+```
+
+**每一个字段都要 nil 检查**。看 `perishable.lua` 第 339-351 行的同款写法（6.1.4 节讲过）。原因有二：
+
+- **新版本 Mod 加了字段**：老存档里没有这个字段，直接 `data.newfield` 是 `nil`
+- **被截断的存档**：极少数情况下存档可能不完整，nil 检查避免崩溃
+
+**注意 `current` 用 `SetCurrent`，而不是 `self.current = data.current`**：
+- `SetCurrent` 会做 clamp（防止存档里有非法值）
+- `SetCurrent` 会触发 `oncurrent` onset 回调（自动加 tag）
+
+**这是组件作者的"自我保护"——尽量走自己设计的"正门"，避免直接改字段**。
+
+#### 第四步：注意 `OnLoad` 之后要不要 StartCharging？
+
+你可能会问：**`OnLoad` 完之后我们应该 `StartCharging` 吗？**
+
+答案是**不需要**——因为 `psionic_crystal.lua` 的工厂函数里**已经调用了** `StartCharging`：
+
+```lua
+inst:AddComponent("psionic")
+inst.components.psionic:StartCharging()    -- 工厂函数里已经启动了任务
+```
+
+实体生成的流程是：
+
+```
+SpawnPrefab("psionic_crystal")
+    ├── 执行 fn() 工厂函数
+    │     ├── AddComponent("psionic")
+    │     └── StartCharging   ← 任务已启动
+    └── 引擎 SetPersistData(data)
+          └── psionic:OnLoad(data)   ← 此时再恢复 current 值
+```
+
+**任务在 OnLoad 之前就已经启动了**——OnLoad 只负责把"血量"补回来。这是一种**关注点分离**：定时任务由 Prefab 启动、数据由组件自管。
+
+> **陷阱预警**：**不要在 `OnLoad` 里 `StartCharging`**——会和 Prefab 的工厂函数重复启动（虽然 `StartCharging` 内部有 `if self.task == nil` 防御，但语义上不清晰）。**让 Prefab 控制启动/停止时机，让组件管理数据状态**。
+
+#### 第五步：进游戏验证存档
+
+```
+1. 进游戏，c_give("psionic_crystal")，等到 current 大约 30
+2. 控制台：c_sel().components.psionic:GetCurrent() → 30
+3. 退出游戏（让世界存档）
+4. 重新进游戏
+5. c_sel().components.psionic:GetCurrent() → 30  ✅ 数据保住了
+```
+
+✅ **验证通过**——OnSave/OnLoad 接好了。
+
+> **新手记忆**：**只要你的组件有"运行时可变"的状态字段，就要写 OnSave/OnLoad**。规则三句话：① 默认值不存、② nil 检查防御、③ 用 setter 而不是直接赋值。
+
+---
+
+### 6.7.5 进阶：性能与时间补偿 —— OnEntitySleep / OnEntityWake
+
+#### 第一步：先回顾 6.1.5 的判断标准
+
+回顾 6.1.5 节末尾我们总结的判断原则：
+
+> - **有定时任务 / 心跳回调的组件** → **需要** `OnEntitySleep/Wake`
+> - **有"时间流逝自动变化"状态的组件** → **需要**（而且可能需要补偿）
+> - **纯被动、事件驱动的组件** → **不需要**
+
+我们的 `psionic` **同时满足前两条**——它有一个 `task` 在每秒 tick，还有"时间一过 current 就增长"的隐含状态。所以**必须实现 sleep/wake**，而且要带**时间补偿**。
+
+#### 第二步：完整代码
+
+在 `psionic.lua` 的 `StopCharging` 之后加上：
+
+```lua
+function Psionic:OnEntitySleep()
+    self:StopCharging()
+    self._sleeptime = GetTime()
+end
+
+function Psionic:OnEntityWake()
+    if self._sleeptime ~= nil then
+        local elapsed = GetTime() - self._sleeptime
+        self._sleeptime = nil
+
+        if elapsed > 0 then
+            self:LongUpdate(elapsed)
+        end
+    end
+
+    if self.task == nil and not self:IsFull() then
+        self:StartCharging()
+    end
+end
+
+function Psionic:LongUpdate(dt)
+    if self.rate > 0 and dt > 0 then
+        self:DoDelta(self.rate * dt)
+    end
+end
+```
+
+并且在 `OnRemoveFromEntity`（如果还没有就加上）里加清理：
+
+```lua
+function Psionic:OnRemoveFromEntity()
+    self:StopCharging()
+    self.inst:RemoveTag("psionic_full")
+    self.inst:RemoveTag("psionic_empty")
+    self._sleeptime = nil
+end
+```
+
+#### 第三步：逐句拆解
+
+**(1) `OnEntitySleep`：停 task + 记时间戳**
+
+```lua
+self:StopCharging()
+self._sleeptime = GetTime()
+```
+
+两件事：
+
+- **停 task**：玩家走远了，没必要继续 tick——这是性能优化的核心。看 `combat.lua` 第 284-289 行的同款写法（6.1.5 节讲过）。
+- **记时间戳**：用 `GetTime()` 拿到当前游戏时间（不是真实时间！），存到一个**带下划线前缀的临时字段** `self._sleeptime`——下划线前缀是 Klei 的命名约定，表示"内部状态、不要从外部访问"。
+
+> **进阶提示**：`GetTime()` 返回的是**游戏内累计时间（秒）**——不受暂停影响、不受真实时间影响。看 `inventoryitemmoisture.lua` 第 91-113 行的同款写法（6.1.5 节讲过）。
+
+**(2) `OnEntityWake`：补偿 + 重启**
+
+```lua
+if self._sleeptime ~= nil then
+    local elapsed = GetTime() - self._sleeptime
+    self._sleeptime = nil
+    if elapsed > 0 then
+        self:LongUpdate(elapsed)
+    end
+end
+```
+
+**核心思路**：
+
+- 算出休眠时长 `elapsed`
+- 调 `LongUpdate(elapsed)`——一次性把"应该发生的变化"补上
+- **清空 `_sleeptime`**（避免下次 wake 时被错误使用）
+
+**为什么要单独抽 `LongUpdate` 方法？** —— Klei 的命名约定：**`LongUpdate(dt)` 是"一次性追赶时间"的标准接口**。除了 sleep/wake，**控制台命令 `c_longupdate(86400)` 也会调用每个组件的 `LongUpdate`**——比如让玩家"快进 24 小时"看看食物变质、植物生长效果。
+
+看 `fueled.lua` 第 351 行的写法：
+
+```351:351:scripts/components/fueled.lua
+Fueled.LongUpdate = Fueled.DoUpdate
+```
+
+——**直接把 `LongUpdate` 别名为 `DoUpdate`**！为什么我们不这么写？因为我们的 `DoUpdate` 是模块级局部函数 `OnTick`，不是 method，没法直接别名。所以单独写一个 `LongUpdate(self, dt)` 更清晰。
+
+**(3) `OnEntityWake` 末尾的"重启 task"**
+
+```lua
+if self.task == nil and not self:IsFull() then
+    self:StartCharging()
+end
+```
+
+**两个判断**：
+
+- `self.task == nil` —— 防御式：万一 sleep 时 stop 失败、或者 sleep 时 task 已经 nil
+- `not self:IsFull()` —— 满了就别重启了（`StartCharging` 不会自动检查满状态）
+
+> **设计哲学**：**OnEntityWake 应该让组件"恢复到正常运行状态"**——但"正常运行"的定义可能依赖当前数据。如果 `LongUpdate` 已经把 current 充到满了，task 就不该再启动（不过即使启动了，下一个 tick 看到 IsFull 也不会真的 +1，因为 DoDelta 有 clamp）。**多一层判断让代码意图更明确**。
+
+**(4) `OnRemoveFromEntity` 的清理三件套**
+
+```lua
+self:StopCharging()
+self.inst:RemoveTag("psionic_full")
+self.inst:RemoveTag("psionic_empty")
+self._sleeptime = nil
+```
+
+回顾 6.1.6 节我们说过 `OnRemoveFromEntity` 的核心原则：**"谁污染谁治理"**——加了 task 就停 task、加了 tag 就移 tag、加了字段就置 nil。
+
+注意 **`psionic_full` / `psionic_empty` 这两个 tag 是 onset 回调加上去的**，外部代码可能还在用 `inst:HasTag("psionic_full")` 做判断——如果不清理，就成了"幽灵 tag"（6.1.6 节讲过这个坑）。
+
+#### 第四步：进游戏验证休眠补偿
+
+最难验证的就是这个——因为你需要让实体真正进入"sleep"状态。在 DST 里实体距离玩家**一定距离**之外才会休眠（默认大约 35 个 tile）。
+
+**测试步骤**：
+
+```
+1. c_give("psionic_crystal")，扔到地上
+2. 控制台：c_sel().components.psionic:GetCurrent() → 假设为 5
+3. 用 c_setseason("autumn") + c_setphase("day") 减少干扰
+4. 玩家走远到 50 tile 之外，等 60 秒
+5. 走回来，立刻：c_sel().components.psionic:GetCurrent()
+   → 应该是 5 + 60 = 65 ✅（如果没补偿就还是 5+1=6）
+```
+
+**或者用 c_longupdate 测试 LongUpdate**：
+
+```lua
+-- 不需要走远，直接快进
+c_longupdate(60)
+-- 控制台输出会调用所有组件的 LongUpdate，包括我们的
+-- 验证：c_sel().components.psionic:GetCurrent() 应该 +60
+```
+
+#### 第五步：性能数字感
+
+**没做休眠时**：每颗灵能晶簇每秒 tick 一次，地图上有 50 颗 = 每秒 50 次回调
+**做了休眠后**：玩家附近大约 5-10 颗在 tick，远处 40 颗都暂停 = 每秒 5-10 次回调
+
+**虽然单次 tick 很轻**（只是 `current += rate`），但游戏里**这种"小定时任务"加起来非常可观**——尤其是 perishable、fueled、growable、grower、burnable 等组件，每个实体可能挂 3-5 个有 task 的组件。**做休眠优化能把"远处实体"的 CPU 占用降到接近零**。
+
+> **新手记忆**：**只要你写了 `DoPeriodicTask`，就要写 `OnEntitySleep` 取消它**——这是组件作者的基本职业道德。哪怕你的组件再轻量，没人能保证它不会被"刷怪 mod"加到几百个实体上。
+
+---
+
+### 6.7.6 进阶：写一个轻型 Replica —— 让客户端也能看见灵能
+
+#### 第一步：明确"客户端为什么需要看到"
+
+如果只有服务端能读 `current` / `max` —— 谁来画 UI？
+
+- **HUD 上的灵能进度条**：客户端绘制
+- **拖拽到背包时鼠标提示"剩余 30/100 灵能"**：客户端渲染
+- **第三方 UI Mod 想读取这个值显示**：客户端访问
+
+回顾 6.2.1 节的核心结论：
+
+> **服务端持有"真"组件、客户端持有"影子"replica，引擎自动同步两边的状态**。
+
+所以我们要写 `psionic_replica.lua`——客户端版本的 `psionic`。
+
+#### 第二步：选哪种 Replica 方案？
+
+回顾 6.2 节我们看过两种方案：
+
+| 方案 | 代价 | 适用场景 |
+|------|------|---------|
+| **A. classified 实体方案** | 多写 `psionic_classified.lua`、SpawnPrefab 一个隐形实体跟随主实体 | 字段多、需要 RPC 调用、玩家专属（如 health/sanity/inventory） |
+| **B. 轻型 net_xxx 方案** | 在 `_replica.lua` 里直接 `net_smallbyte(inst.GUID, ...)` 挂到 inst 上 | 字段少、单向同步、非玩家实体（如 inventoryitem 的小字段） |
+
+我们的 `psionic` **只有 3 个字段需要同步**（current / max / rate），而且**主要是单向**（服务端 → 客户端，客户端不需要主动设置）——**B 方案最合适**。
+
+> **进阶提示**：B 方案的代价是"**没法做太多优化**"——每个 net 变量在网络层都是独立的字段。如果你有 30 个字段要同步，每个都用 net_xxx 会让网络包变大。这时候就该用 classified 把它们打包成一个实体。`psionic` 才 3 个字段，B 完全够用。
+
+#### 第三步：先了解 `net_smallbyte` 等 net 变量
+
+回顾 6.3.3 节的 net 变量基础类型：
+
+| 类型 | 容量 | 适用 |
+|------|------|------|
+| `net_bool` | 1 bit | 二值开关 |
+| `net_smallbyte` | 6 bits = 0-63 | 小整数 |
+| `net_byte` | 8 bits = 0-255 | 中等整数 |
+| `net_ushortint` | 16 bits = 0-65535 | 大整数 |
+| `net_int` | 32 bits = -2^31 ~ 2^31-1 | 通用整数 |
+| `net_float` | 32 bits | 浮点 |
+| `net_string` | 变长 | 字符串 |
+| `net_hash` | 32 bits | 字符串哈希（节省带宽） |
+
+我们的灵能值范围 0-100（默认）—— `net_byte` 完全够（如果未来想支持上千就换 `net_ushortint`）。`rate` 是浮点，但我们可以**乘 100 转成整数**传递（节省带宽，6.3.3 节讲过这个 trick）。
+
+> **设计权衡**：**用 `net_byte` 还是 `net_ushortint`？** —— 取决于你预期的最大值。如果你知道未来某个 Mod 会改 `cmp:SetMax(500)`，就用 `net_ushortint`。这里我们用 `net_byte`，假设没人会用超过 255。**实际工程里，宁可多用 8 bit 也别反复改类型**——网络变量类型一旦发布、玩家存档建立后，再改类型可能导致兼容性灾难。
+
+#### 第四步：完整代码
+
+替换 `scripts/components/psionic_replica.lua`：
+
+```lua
+local Psionic = Class(function(self, inst)
+    self.inst = inst
+
+    self._current = net_ushortint(inst.GUID, "psionic._current", "psionicchangedirty")
+    self._max     = net_ushortint(inst.GUID, "psionic._max",     "psionicchangedirty")
+
+    if not TheWorld.ismastersim then
+        self._sub = inst:ListenForEvent("psionicchangedirty", function(inst)
+            self.inst:PushEvent("psionicchange", {
+                current = self._current:value(),
+                max     = self._max:value(),
+                percent = self._max:value() > 0 and self._current:value() / self._max:value() or 0,
+            })
+        end)
+    end
+end)
+
+function Psionic:SetCurrent(current)
+    self._current:set(math.floor(current + 0.5))
+end
+
+function Psionic:SetMax(max)
+    self._max:set(math.floor(max + 0.5))
+end
+
+function Psionic:GetCurrent()
+    if self.inst.components.psionic ~= nil then
+        return self.inst.components.psionic.current
+    else
+        return self._current:value()
+    end
+end
+
+function Psionic:GetMax()
+    if self.inst.components.psionic ~= nil then
+        return self.inst.components.psionic.max
+    else
+        return self._max:value()
+    end
+end
+
+function Psionic:GetPercent()
+    local max = self:GetMax()
+    return max > 0 and self:GetCurrent() / max or 0
+end
+
+function Psionic:IsFull()  return self:GetCurrent() >= self:GetMax() end
+function Psionic:IsEmpty() return self:GetCurrent() <= 0 end
+
+return Psionic
+```
+
+#### 第五步：逐段拆解
+
+**(1) net 变量声明位置**
+
+```lua
+self._current = net_ushortint(inst.GUID, "psionic._current", "psionicchangedirty")
+self._max     = net_ushortint(inst.GUID, "psionic._max",     "psionicchangedirty")
+```
+
+**注意 net 变量必须在两端都声明**——也就是 **Replica 的构造函数里两端都跑**。这就是回顾 6.3.6 节为什么 net 变量要写在 pristine 之前的原因。
+
+**三个参数**：
+
+- **inst.GUID**：归属哪个实体
+- **`"psionic._current"`**：唯一变量名（用 `组件名._字段名` 命名约定避免冲突）
+- **`"psionicchangedirty"`**：dirty event 名——值变化时 PushEvent 这个事件
+
+**两个变量共用一个 dirty event** 是惯用法——只要任何一个变了 UI 就会刷新。如果分开监听就需要两个回调，反而更麻烦。
+
+**(2) 客户端监听 dirty event 转抛业务事件**
+
+```lua
+if not TheWorld.ismastersim then
+    self._sub = inst:ListenForEvent("psionicchangedirty", function(inst)
+        self.inst:PushEvent("psionicchange", { ... })
+    end)
+end
+```
+
+**只在客户端监听** —— 因为服务端的 `psionic` 组件已经在 `DoDelta` 里 PushEvent 过 `psionicchange`。客户端没有真组件，需要在收到 net 变量更新时**模拟一下**这个事件。
+
+**这样 UI 代码就可以这么写**（不区分 client/server）：
+
+```lua
+inst:ListenForEvent("psionicchange", function(inst, data)
+    local pct = data.percent
+    badge:SetPercent(pct)
+end)
+```
+
+——**两端都能用同一份监听代码**！这是 Replica 系统的精髓。
+
+**(3) `Set` 方法只在服务端调用**
+
+```lua
+function Psionic:SetCurrent(current)
+    self._current:set(math.floor(current + 0.5))
+end
+```
+
+`net_xxx:set(value)` 是写入 net 变量。**只有服务端有权限改**——客户端调用会被引擎忽略（甚至报警告）。
+
+**`math.floor(current + 0.5)` 是四舍五入**——因为 `net_ushortint` 只能存整数，但 `current` 在服务端可能是 65.7 这种浮点。如果直接 `set(65.7)`，引擎会做 `math.floor` 截断成 65。**主动四舍五入更精确**。
+
+**(4) `Get` 方法的"双向兼容"**
+
+```lua
+function Psionic:GetCurrent()
+    if self.inst.components.psionic ~= nil then
+        return self.inst.components.psionic.current
+    else
+        return self._current:value()
+    end
+end
+```
+
+**这是 Replica 的标准模式**：
+
+- 服务端：`inst.components.psionic` 存在 → 直接读真组件，**精确到浮点**
+- 客户端：没有真组件 → 读 net 变量，**取整数版本**
+
+看 `health_replica.lua` 第 90-98 行的 `GetPercent` 是同款写法（6.2.6 节讲过）。
+
+**为什么服务端不直接读 net 变量？** —— 网络变量经过四舍五入有精度损失（`current = 65.7` 在 net 里是 66）。服务端有真值就用真值，更精确。
+
+#### 第六步：让服务端组件主动同步给 Replica
+
+光有 `_replica.lua` 还不够——服务端的 `psionic` 组件**得主动调用 Replica 的 setter**，否则 net 变量永远是 0。
+
+修改 `psionic.lua` 的 `oncurrent` 和 `onmax`：
+
+```lua
+local function oncurrent(self, current)
+    if current >= self.max then
+        self.inst:AddTag("psionic_full")
+    else
+        self.inst:RemoveTag("psionic_full")
+    end
+    if current <= 0 then
+        self.inst:AddTag("psionic_empty")
+    else
+        self.inst:RemoveTag("psionic_empty")
+    end
+
+    if self.inst.replica.psionic ~= nil then
+        self.inst.replica.psionic:SetCurrent(current)
+    end
+end
+
+local function onmax(self, max)
+    if self.current > max then
+        self.current = max
+    end
+    oncurrent(self, self.current)
+
+    if self.inst.replica.psionic ~= nil then
+        self.inst.replica.psionic:SetMax(max)
+    end
+end
+```
+
+**关键改动**：onset 回调最后调用 `replica:SetCurrent` / `:SetMax` —— **每次字段变化都同步给客户端**。
+
+**为什么用 onset 而不是在 `DoDelta` 末尾？** —— 因为：
+
+- `DoDelta` 不是改 current 的唯一入口（`SetCurrent`、`OnLoad` 也会改）
+- onset 是**所有路径的汇合点** —— 写一次永远不漏
+
+> **进阶提示**：看 `health.lua` 第 9-16 行的 `onmaxhealth`：
+>
+> ```9:16:scripts/components/health.lua
+> local function onmaxhealth(self, maxhealth)
+>     self.inst.replica.health:SetMax(maxhealth)
+>     ...
+> end
+> ```
+>
+> Klei 用的就是这种 onset 同步模式——和我们一样。
+
+#### 第七步：还需要在 Prefab 里"拉响"初始同步吗？
+
+**通常不用**。因为 `oncurrent` / `onmax` 在**构造函数 `self.max = ...` 时就会触发**——构造函数里 `self.max = TUNING.PSIONIC.DEFAULT_MAX` 这行赋值会立刻调 `onmax`，进而调 `replica:SetMax(100)`——所以客户端从一开始就拿到 100。
+
+**但有一种情况要注意**：如果 `inst.replica.psionic` **在构造函数执行时还没创建好**——onset 里的 `if self.inst.replica.psionic ~= nil` 检查会跳过。这时候同步就没发生，客户端拿到的是 net 变量默认值 0。
+
+**解决方案**：在 Prefab 工厂函数里 `AddComponent("psionic")` 之后，手动 sync 一次：
+
+```lua
+inst:AddComponent("psionic")
+inst.components.psionic:StartCharging()
+
+if inst.replica.psionic ~= nil then
+    inst.replica.psionic:SetMax(inst.components.psionic.max)
+    inst.replica.psionic:SetCurrent(inst.components.psionic.current)
+end
+```
+
+**实际上**，回看 `entityscript.lua` 第 624-633 行的 `AddComponent`：
+
+```624:633:scripts/entityscript.lua
+self:ReplicateComponent(name)
+
+local loadedcmp = cmp(self)
+self.components[name] = loadedcmp
+self.lower_components_shadow[lower_name] = true
+```
+
+**`ReplicateComponent` 在 `cmp(self)` **之前**调用**——也就是说**先创建 Replica，再创建真组件**。所以构造函数里 `self.inst.replica.psionic` 已经存在，onset 同步是有效的。
+
+**这两段代码（手动 sync）虽然不是必须，但是"防御式"写法**——避免某些边角情况下的同步漏。建议加上。
+
+#### 第八步：进游戏验证 Replica
+
+```
+1. 在专用服务器上测试（或者主机模式）
+2. 客户端进游戏
+3. 等晶簇充能到 50 左右
+4. 客户端控制台：c_sel().replica.psionic:GetPercent()
+   → 应该返回 0.5 ✅
+5. 客户端：c_sel().components.psionic
+   → 应该是 nil（客户端没有真组件）✅
+6. 客户端再换一个：c_sel().replica.psionic.GetCurrent
+   → 应该是函数（不是 nil） ✅
+```
+
+> **新手记忆**：**Replica 的核心心法**：服务端有真值，replica 是影子。**onset → replica:SetXxx** 是 Klei 的标准同步模式。所有读字段的代码都通过 `inst.replica.psionic:GetXxx()`，**不要直接访问 `replica.psionic._current:value()`**——这违反了封装。
+
+---
+
+### 6.7.7 老手进阶：充能率多来源叠加 —— SourceModifierList 实战
+
+#### 第一步：先想清楚为什么需要"多来源"
+
+我们当前的 `rate` 是一个**裸字段**：
+
+```lua
+self.rate = 1
+```
+
+**问题**来了：
+
+- 如果想做"**附近有罂粟花，充能率 ×1.5**"——你要 `cmp:SetRate(1.5)`
+- 然后玩家又**穿了一件法袍 ×1.2**——你要 `cmp:SetRate(1.5 * 1.2 = 1.8)`
+- 然后罂粟花被踩死了——你要 `cmp:SetRate(1.0 * 1.2 = 1.2)`
+- ......
+
+**每次叠加 / 解除一个 buff，都要重新算总 rate**。代码到处是 `1.5 * 1.2 / 1.5 * 0.8`，一个 bug 就把基准值搞乱。
+
+这就是回顾 6.5.1 节我们讲的"**多来源叠加问题**"——不应该让外部调用方算总和，**应该让组件自己管理一张"修正源表"**。
+
+回顾 6.5 节的 `SourceModifierList` API：
+
+```lua
+self.rate_modifiers = SourceModifierList(self.inst)
+self.rate_modifiers:SetModifier(source, multiplier, key)
+self.rate_modifiers:RemoveModifier(source, key)
+local total = self.rate_modifiers:Get()  -- 默认乘法叠加
+```
+
+**关键好处**：
+
+- 每个 source 独立——一个 source 来了 SetModifier、走了 RemoveModifier，**不需要知道其他 source 的存在**
+- 如果 source 是**实体引用**，实体被销毁时自动从 modifier 列表里移除（自动清理）
+- 一个 source 可以挂多个 key 的 modifier（比如同一个法袍既给 +1.5 充能率又给 +20 灵能上限）
+
+#### 第二步：改造 `psionic.lua` 加上 modifier 支持
+
+在 `psionic.lua` 顶部加 `require`：
+
+```lua
+local SourceModifierList = require("util/sourcemodifierlist")
+```
+
+修改构造函数：
+
+```lua
+local Psionic = Class(function(self, inst)
+    self.inst = inst
+
+    self.max = TUNING.PSIONIC.DEFAULT_MAX
+    self.current = 0
+    self.rate = TUNING.PSIONIC.DEFAULT_RATE
+    self.rate_modifiers = SourceModifierList(self.inst, 1, SourceModifierList.multiply)
+    self.period = TUNING.PSIONIC.PERIOD
+
+    self.task = nil
+end,
+nil,
+{
+    current = oncurrent,
+    max = onmax,
+})
+```
+
+**注意构造函数第二、三参数**：
+
+- 第一个 `1` —— 默认值。`SourceModifierList:Get()` 在没有任何 source 时返回 1（中性的乘法元素）。如果是加法叠加就传 `0`。
+- 第二个 `SourceModifierList.multiply` —— 叠加方式。**乘法叠加**：所有 source 的值连乘起来。
+
+回顾 6.5.3 节：
+
+| 叠加方式 | 用途 | 默认值 |
+|---------|------|------|
+| `SourceModifierList.multiply` | 乘法（速率倍率、伤害倍率） | 1 |
+| `SourceModifierList.additive` | 加法（生命上限加成、属性加成） | 0 |
+| `SourceModifierList.highest` | 取最大（多源伤害减免，取最强的） | 0 |
+
+我们的 `rate` 用乘法叠加：`实际 rate = 基础 rate × 所有 modifier 之积`。
+
+**修改 `OnTick` 用 modifier 之后的实际值**：
+
+```lua
+local function OnTick(inst, self)
+    self:DoDelta(self.rate * self.rate_modifiers:Get() * self.period)
+end
+```
+
+**修改 `LongUpdate` 同步**：
+
+```lua
+function Psionic:LongUpdate(dt)
+    local effective_rate = self.rate * self.rate_modifiers:Get()
+    if effective_rate ~= 0 and dt > 0 then
+        self:DoDelta(effective_rate * dt)
+    end
+end
+```
+
+**新增两个对外接口**：
+
+```lua
+function Psionic:AddRateModifier(source, mult, key)
+    self.rate_modifiers:SetModifier(source, mult, key)
+end
+
+function Psionic:RemoveRateModifier(source, key)
+    self.rate_modifiers:RemoveModifier(source, key)
+end
+```
+
+**改进 `GetDebugString` 显示更多信息**：
+
+```lua
+function Psionic:GetDebugString()
+    return string.format("%2.1f / %2.1f (rate=%2.2f x%2.2f = %2.2f/s, %s)",
+        self.current, self.max,
+        self.rate, self.rate_modifiers:Get(), self.rate * self.rate_modifiers:Get(),
+        self.task and "ON" or "OFF")
+end
+```
+
+#### 第三步：在 Prefab 里"侦测周围花卉"自动加 modifier
+
+修改 `psionic_crystal.lua` 的工厂函数。先在文件顶部加几个常量：
+
+```lua
+local SCAN_RANGE = 6
+local SCAN_PERIOD = 3
+local POPPY_BONUS = 1.5
+local FLOWER_EVIL_PENALTY = 0.5
+```
+
+然后增加一个扫描函数（写在 `fn` 之外）：
+
+```lua
+local function ScanFlowers(inst)
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local poppy = TheSim:FindEntities(x, y, z, SCAN_RANGE, {"flower"}, {"flower_evil", "INLIMBO"})
+    local evil  = TheSim:FindEntities(x, y, z, SCAN_RANGE, {"flower_evil"}, {"INLIMBO"})
+
+    local cmp = inst.components.psionic
+    if cmp == nil then return end
+
+    if #poppy > 0 then
+        cmp:AddRateModifier(inst, POPPY_BONUS, "poppy_aura")
+    else
+        cmp:RemoveRateModifier(inst, "poppy_aura")
+    end
+
+    if #evil > 0 then
+        cmp:AddRateModifier(inst, FLOWER_EVIL_PENALTY, "evil_aura")
+    else
+        cmp:RemoveRateModifier(inst, "evil_aura")
+    end
+end
+```
+
+最后在工厂函数的服务端段加上启动扫描：
+
+```lua
+inst:AddComponent("psionic")
+inst.components.psionic:StartCharging()
+
+inst:DoPeriodicTask(SCAN_PERIOD, ScanFlowers, math.random() * SCAN_PERIOD)
+
+inst:ListenForEvent("psionic_full", function(inst)
+    inst.components.psionic:Burst()
+end)
+```
+
+#### 第四步：逐段拆解
+
+**(1) 为什么 source 用 `inst`（晶簇自己）而不是花？**
+
+这里有个**重要设计决策**——`AddRateModifier(inst, ...)` 用**晶簇自己**作为 source，而不是"附近的某朵花"。
+
+**对比两种思路**：
+
+| 思路 | 优点 | 缺点 |
+|------|------|------|
+| **A. 把每朵花作为 source** | 自动清理（花死了 modifier 自动移除） | 多朵花就有多个 modifier，叠加效果失控（5 朵花 ×1.5^5 = 7.6 倍） |
+| **B. 用晶簇自己作为 source，用 key 区分类型** | 同类型只有一个 modifier，可控 | 需要主动定时扫描、主动 Remove |
+
+**我们用的是 B**——更可控。如果想做"花越多倍率越高"，可以在 ScanFlowers 里：
+
+```lua
+cmp:AddRateModifier(inst, 1 + 0.1 * math.min(#poppy, 5), "poppy_aura")
+```
+
+——**最多 5 朵生效，每多一朵 +10%**。这种"上限保护"防止失控。
+
+> **进阶提示**：回顾 6.5.4 节我们讨论 source 的设计，**实体引用 vs 字符串标识**——这里我们其实可以用字符串 source（`"poppy"`、`"evil"`）：
+>
+> ```lua
+> cmp:AddRateModifier("poppy", POPPY_BONUS)
+> cmp:AddRateModifier("evil", FLOWER_EVIL_PENALTY)
+> ```
+>
+> 但**字符串 source 没有 onremove 自动清理**——晶簇被销毁时，modifier 会驻留（虽然组件也会被销毁所以无所谓，但语义上不清晰）。**用 `inst` 自己作为 source**：晶簇被销毁时 `OnRemove` 自动触发 modifier 清理（看 `SourceModifierList` 第 38-43 行的实现）。
+
+**(2) 为什么 `DoPeriodicTask` 要 randomize 起始延迟？**
+
+```lua
+inst:DoPeriodicTask(SCAN_PERIOD, ScanFlowers, math.random() * SCAN_PERIOD)
+```
+
+**第 3 个参数是首次延迟**。如果不 random，所有晶簇都会在**同一帧**做扫描——CPU 出现规律性峰值。`math.random() * SCAN_PERIOD` 让每颗晶簇错开起跑时间，**CPU 负载平摊**。
+
+看 `inventoryitemmoisture.lua` 第 110 行的同款手法：
+
+```110:110:scripts/components/inventoryitemmoisture.lua
+self.moistureupdatetask = self.inst:DoPeriodicTask(updated and UPDATE_TIME or SLOW_UPDATE_TIME, DoUpdate, math.random() * UPDATE_TIME)
+```
+
+**这是性能优化的"经典手法"** —— 哪怕你的回调每次只跑 0.01ms，**100 个实体同时跑**也是 1ms 的瞬时峰值。错开起跑就能完全消除这种瞬时峰值。
+
+**(3) `FindEntities` 的过滤参数**
+
+```lua
+TheSim:FindEntities(x, y, z, SCAN_RANGE, {"flower"}, {"flower_evil", "INLIMBO"})
+```
+
+**5 个参数**：
+
+- `x, y, z`：搜索中心
+- `SCAN_RANGE`：半径
+- `{"flower"}`：**must_have_one** —— 必须**至少有一个**这些 tag
+- `{"flower_evil", "INLIMBO"}`：**cant_have** —— **任何一个**这些 tag 都排除
+
+**INLIMBO 是关键**——回顾 5.5 节，`INLIMBO` 表示"实体在 limbo 状态"（被装进容器、被装进背包后）。**搜索时必须排除 limbo**——否则你会把附近某个玩家背包里的花也当成"周围"。
+
+**两个 tag 互斥**——`flower` 和 `flower_evil` 是分开的两类 tag，所以"普通花"用 `{"flower"}` + 排除 `{"flower_evil"}`；"恶魔花"用 `{"flower_evil"}`。
+
+**(4) Modifier 用 `key` 区分类型**
+
+```lua
+cmp:AddRateModifier(inst, POPPY_BONUS, "poppy_aura")
+cmp:AddRateModifier(inst, FLOWER_EVIL_PENALTY, "evil_aura")
+```
+
+**同一个 source（晶簇本身）下挂多个 key**——这是 6.5.5 节讲的"key 多重 modifier"机制。每个 key 是独立的 modifier，可以独立 Remove。
+
+**最终总倍率 = `1 × poppy_aura × evil_aura`**——比如同时附近有罂粟花和恶魔花：`1 × 1.5 × 0.5 = 0.75`。
+
+#### 第五步：进游戏验证多源叠加
+
+```
+1. c_give("psionic_crystal")，扔到地上
+2. c_sel().components.psionic:GetDebugString()
+   → "5.0 / 100.0 (rate=1.00 x1.00 = 1.00/s, ON)"
+3. c_spawn("flower")，让花落在晶簇 6 tile 范围内，等 3 秒
+4. c_sel().components.psionic:GetDebugString()
+   → "8.0 / 100.0 (rate=1.00 x1.50 = 1.50/s, ON)"  ✅
+5. c_spawn("flower_evil") 同样附近
+6. c_sel().components.psionic:GetDebugString()
+   → "10.0 / 100.0 (rate=1.00 x0.75 = 0.75/s, ON)"  ✅ (1.5 * 0.5)
+7. 把恶魔花 c_select()/Pick 移走，等 3 秒
+8. → "12.0 / 100.0 (rate=1.00 x1.50 = 1.50/s, ON)"  ✅
+```
+
+> **老手记忆**：**SourceModifierList 是组件作者的瑞士军刀**——但凡你的字段会被多个 buff 同时改，就用它。`health.regen_modifiers`、`fueled.rate_modifiers`、`combat.damagemodifiers`、`hunger.hungerrate_modifiers`——Klei 的核心组件几乎全部用了它。**学会它，你的组件就有了"工业级"的可扩展性**。
+
+---
+
+### 6.7.8 老手进阶：调试技巧、五个常见陷阱与扩展方向
+
+#### 第一步：实战调试技巧
+
+**(1) 用 `GetDebugString` 实时看状态**
+
+我们已经在组件里写了 `GetDebugString`。在游戏里：
+
+```lua
+c_select(c_findnext("psionic_crystal"))   -- 选中最近的晶簇
+-- 然后在游戏里按 Ctrl+Tab，左上角会持续显示 GetDebugString 的输出
+```
+
+**这是 Klei 内置的 "DebugEntity" 功能**——只要你的组件实现了 `GetDebugString`，按 Ctrl+Tab 就能看到。`fueled`、`health`、`combat` 都实现了，看着实时变化的数字调试 BUG **比 print 强 10 倍**。
+
+**(2) 用 c_select + 字段访问探索状态**
+
+```lua
+local c = c_select(c_findnext("psionic_crystal"))
+
+-- 看完整字段
+for k, v in pairs(c.components.psionic) do
+    print(k, "=", type(v) == "table" and "<table>" or tostring(v))
+end
+
+-- 看 rate_modifiers 内部
+for src, kv in pairs(c.components.psionic.rate_modifiers.modifiers) do
+    print("source", src)
+    if type(kv) == "table" then
+        for k, v in pairs(kv) do print("  ", k, "=", v) end
+    end
+end
+```
+
+**(3) 用临时 hook 加 print 抓事件流**
+
+```lua
+local p = c_sel().components.psionic
+local old_DoDelta = p.DoDelta
+p.DoDelta = function(self, amount, source)
+    print(string.format("[psionic] DoDelta(%s, %s) src=%s",
+        tostring(amount), tostring(self.current), tostring(source)))
+    return old_DoDelta(self, amount, source)
+end
+```
+
+——**回顾 6.6.6 节的实时探索手法**。打完 print 想恢复就 `p.DoDelta = old_DoDelta`，或者直接退游戏（变量是临时 hook）。
+
+**(4) 看完整生命周期**
+
+把所有钩子 hook 一遍：
+
+```lua
+local p = c_sel().components.psionic
+for _, name in ipairs({"OnSave", "OnLoad", "OnEntitySleep", "OnEntityWake", "OnRemoveFromEntity"}) do
+    local old = p[name]
+    p[name] = function(self, ...)
+        print("[psionic] "..name.." called")
+        if old then return old(self, ...) end
+    end
+end
+
+-- 然后你 c_save() / 走远 / 走近 / c_remove()，控制台会打印每个钩子的触发时机
+```
+
+**这是验证 6.7.5 节休眠补偿是否真的工作的最快方法**。
+
+#### 第二步：五个最容易踩的陷阱
+
+**陷阱 1：`AddReplicableComponent` 写错位置**
+
+```lua
+-- ❌ 错：写在某个事件回调里
+AddPrefabPostInit("world", function(inst)
+    AddReplicableComponent("psionic")
+end)
+
+-- ✅ 对：直接写在 modmain.lua 顶层
+AddReplicableComponent("psionic")
+```
+
+**原因**：`AddReplicableComponent` 改的是全局 `REPLICATABLE_COMPONENTS` 表——这张表在**实体被首次创建时**就会被读取（看 `entityreplica.lua` 第 35-37 行的 `if not REPLICATABLE_COMPONENTS[name] then return end`）。如果你写在 `AddPrefabPostInit` 里，注册时机太晚，**第一个被生成的灵能晶簇 replica 失败，后面的才行**——这种"半死不活"的 bug 极难调试。
+
+**陷阱 2：构造函数赋值触发 onset，但 replica 还没建好**
+
+```lua
+-- ❌ 错：构造函数里直接用 onset 同步 replica
+local function oncurrent(self, current)
+    self.inst.replica.psionic:SetCurrent(current)   -- 可能 nil!
+end
+
+-- ✅ 对：加 nil 检查
+local function oncurrent(self, current)
+    if self.inst.replica.psionic ~= nil then
+        self.inst.replica.psionic:SetCurrent(current)
+    end
+end
+```
+
+**原因**：虽然 `entityscript.lua` 第 624 行的 `ReplicateComponent` 在 `cmp(self)` 之前调用——但**理论上 `AddReplicableComponent` 没生效时 `ReplicateComponent` 会跳过**，这时 `inst.replica.psionic == nil`。**onset 永远先 nil 检查**。
+
+**陷阱 3：`DoPeriodicTask` 在 `OnEntitySleep` 时没取消**
+
+```lua
+-- ❌ 错：OnEntitySleep 没取消花卉扫描任务
+function Psionic:OnEntitySleep()
+    self:StopCharging()
+    self._sleeptime = GetTime()
+    -- 忘了取消 ScanFlowers task!
+end
+```
+
+**问题**：`ScanFlowers` 的 task 是在 **prefab 工厂函数**里启动的（`inst:DoPeriodicTask(SCAN_PERIOD, ScanFlowers, ...)`），它**不在 psionic 组件里**——组件的 `OnEntitySleep` 取消不了。
+
+**正解**：要么把扫描任务也搬进组件、用 `OnEntitySleep/Wake` 管理；要么在**实体级**（Prefab）的 `OnEntitySleep` 里取消。
+
+**Prefab 级的休眠钩子**写法：
+
+```lua
+local function ScanFlowers(inst) ... end
+
+local function StartScanning(inst)
+    if inst._scantask == nil then
+        inst._scantask = inst:DoPeriodicTask(SCAN_PERIOD, ScanFlowers, math.random() * SCAN_PERIOD)
+    end
+end
+
+local function StopScanning(inst)
+    if inst._scantask ~= nil then
+        inst._scantask:Cancel()
+        inst._scantask = nil
+    end
+end
+
+local function OnEntitySleep(inst)
+    StopScanning(inst)
+end
+
+local function OnEntityWake(inst)
+    StartScanning(inst)
+    ScanFlowers(inst)   -- 醒来立刻扫一次（更新一下倍率）
+end
+
+-- 工厂函数里：
+inst.OnEntitySleep = OnEntitySleep
+inst.OnEntityWake  = OnEntityWake
+StartScanning(inst)
+```
+
+**回顾 5.2.4 节**——`OnEntitySleep` 也是实体级钩子，可以挂在 inst 上而不是组件上。**Prefab 启动的 task 由 Prefab 自己负责清理**——这是责任划分的原则。
+
+**陷阱 4：`OnSave` 里把 task 也存了**
+
+```lua
+-- ❌ 错：连 task 引用都存了（会崩）
+function Psionic:OnSave()
+    return {
+        current = self.current,
+        task = self.task,    -- task 是函数引用，serialize 会爆炸
+    }
+end
+```
+
+**原因**：Lua 的 task 对象包含 C++ 函数指针，**无法序列化**。引擎在写 JSON 时会要么忽略它（如果是函数），要么报错。**OnSave 只存"纯数据"**——number、string、bool、table 嵌套，仅此而已。
+
+**陷阱 5：客户端调用 `replica:SetCurrent`**
+
+```lua
+-- ❌ 错：客户端代码（如 UI）调用 SetCurrent 想要"改充能值"
+inst.replica.psionic:SetCurrent(50)
+```
+
+**原因**：`net_xxx:set` 在客户端调用是**没用的**——网络变量永远是"服务端写、客户端读"。客户端想改服务端状态必须用 **RPC**（章节 7.5 会讲）。
+
+**正确做法**：客户端只用 Replica 来**读取**（`GetCurrent` / `GetPercent`），写操作通过 RPC 发到服务端、由服务端调 `inst.components.psionic:SetCurrent(50)`。
+
+> **新手记忆**：**Replica 是"只读的影子"**——除非你写 classified + Serialize/Deserialize 模式（6.3.6 节），否则客户端永远不应该 `:set` net 变量。
+
+#### 第三步：扩展方向
+
+写完了一个"工业级"的 `psionic` 组件——你可以做哪些更好玩的事？
+
+**(1) 把 `psionic` 挂到玩家身上**
+
+在 `modmain.lua` 加：
+
+```lua
+AddPlayerPostInit(function(inst)
+    if not GLOBAL.TheWorld.ismastersim then return end
+    inst:AddComponent("psionic")
+    inst.components.psionic:SetMax(100)
+    inst.components.psionic:SetRate(0)   -- 玩家不自动充能
+end)
+```
+
+——**所有玩家都自带 100 灵能**！默认 `rate=0` 不会自动充能，但可以通过别的方式获取（吃灵能水晶？击杀阴影？）。
+
+**(2) 让灵能短剑优先消耗灵能**
+
+修改 5.7 节的 `psionic_shortsword.lua` 的 `onattack`：
+
+```lua
+local function onattack(inst, attacker, target)
+    local p = attacker.components.psionic
+    if p ~= nil and p:GetCurrent() >= TUNING.PSIONIC_SHORTSWORD_SANITY_COST then
+        p:DoDelta(-TUNING.PSIONIC_SHORTSWORD_SANITY_COST)
+    elseif attacker.components.sanity ~= nil then
+        attacker.components.sanity:DoDelta(-TUNING.PSIONIC_SHORTSWORD_SANITY_COST)
+    end
+end
+```
+
+**逻辑**：有灵能优先扣灵能、没灵能才扣理智。**故事完美闭环**——5.7 + 6.7 = 一个完整的"灵能武器系统"。
+
+**(3) 写一个 HUD 灵能进度条**
+
+写一个 `widgets/psionicbadge.lua`，参考游戏自带的 `widgets/sanitybadge.lua`。在 PlayerHUD 里 `AddChild` 这个 widget，每帧通过 `inst.replica.psionic:GetPercent()` 更新进度。
+
+**这是 7.6 节会讲的内容**——HUD/UI 系统。
+
+**(4) 把"满了 Burst"改成"玩家可以主动激活"**
+
+加一个 RPC：
+
+```lua
+-- modmain.lua
+AddModRPCHandler("psionic", "burst", function(player, target_guid)
+    local target = Ents[target_guid]
+    if target ~= nil and target.components.psionic ~= nil then
+        target.components.psionic:Burst()
+    end
+end)
+
+-- 客户端 widget 上某个按钮：
+SendModRPCToServer(MOD_RPC.psionic.burst, target.GUID)
+```
+
+**这就把"自动 Burst"变成"玩家自主控制"**——更有 gameplay 价值。
+
+**(5) 多个晶簇互相加成**
+
+让一颗晶簇靠近另一颗时，互相提供 `+0.5` 充能率——做出"晶簇阵列"效果：
+
+```lua
+local function ScanCrystals(inst)
+    local x, y, z = inst.Transform:GetWorldPosition()
+    local crystals = TheSim:FindEntities(x, y, z, 4, {"psionic_crystal"}, nil, nil)
+    -- 排除自己
+    for _, c in ipairs(crystals) do
+        if c ~= inst and c.components.psionic ~= nil then
+            inst.components.psionic:AddRateModifier(c, 1.5, "crystal_array")
+        end
+    end
+end
+```
+
+**这能引导玩家做"基地建造"——把多颗晶簇排在一起做成"灵能矩阵"**。
+
+> **老手记忆**：**一个组件的好坏，不在于它写得多复杂，而在于"它能跟其他组件、其他实体如何组合"**。`psionic` 单独看只是"管理一个数值"，但**配合 SourceModifierList、配合 inventoryitem、配合 RPC、配合 widget**——就能玩出无数花样。**这就是 ECS 思想的力量**。
+
+---
+
+### 6.7.9 小结
+
+**实战收官**——这一节我们从一个空目录开始，做出了一个**真正可用的、覆盖 6.1-6.6 全部知识点的自定义组件**。
+
+#### 第一步：6.1-6.6 的知识点 → 6.7 的代码 对照表
+
+写完这一节，我们建议你回头**逐行看自己写的 `psionic.lua` / `psionic_replica.lua` / `psionic_crystal.lua`**，把它和前 6 节的知识点对照一遍：
+
+| 章节 | 学到的概念 | 在 `psionic` 系列里的对应实现 |
+|------|----------|---------------------------|
+| **6.1.1-6.1.2** | 组件是 Class、`AddComponent` 的六步流程 | `local Psionic = Class(...)`、Prefab 里 `inst:AddComponent("psionic")` |
+| **6.1.3** | 五个核心生命周期钩子 | OnSave / OnLoad / OnEntitySleep / OnEntityWake / OnRemoveFromEntity 全都写了 |
+| **6.1.4** | OnSave 三铁律：默认值不存、nil 检查、不存可推断字段 | `OnSave` 用 `current > 0 and self.current or nil`、`OnLoad` 每个字段 nil 检查 |
+| **6.1.4** | `add_component_if_missing` 兼容机制 | OnSave 返回的 table 里加了这个标记 |
+| **6.1.5** | OnEntitySleep 取消 task、记时间戳；OnEntityWake 补偿 | `self._sleeptime = GetTime()` + `LongUpdate(elapsed)` |
+| **6.1.6** | OnRemoveFromEntity 三件套：停 task、移 tag、置 nil | 完整实现了三件套 |
+| **6.1.8** | onset 回调机制 | `oncurrent` / `onmax` 自动加移 tag、自动同步 replica |
+| **6.2.3** | Replica 骨架 | `psionic_replica.lua` 标准结构 |
+| **6.2.4** | `AddReplicableComponent` | `modmain.lua` 顶层调用 |
+| **6.2.5** | `_health` 这种 tag 标记 | `ReplicateComponent` 自动加 `_psionic` tag |
+| **6.2.6** | Replica 三种数据来源 | 这里只用了 net_xxx（最轻量） |
+| **6.3.3** | net 变量类型选择（small/byte/short/int） | 用 `net_ushortint` 平衡精度和带宽 |
+| **6.3.6** | net 变量+dirty event 模式 | `psionicchangedirty` event 把 net 变化转抛业务事件 |
+| **6.4.6** | Timer 组件 vs 原生 task | 这里用 `DoPeriodicTask`（简单场景）；如果 rate 经常被 Pause/Resume 应该改用 timer 组件 |
+| **6.5.2-6.5.3** | SourceModifierList API | `self.rate_modifiers` 用乘法叠加 |
+| **6.5.4** | source 实体 vs 字符串选择 | 用 `inst` 自己作为 source（保证 modifier 能被自动清理） |
+| **6.5.5** | key 区分多重 modifier | `"poppy_aura"` / `"evil_aura"` 两个 key 共享一个 source |
+| **6.6.1-6.6.3** | 读组件五步法 | 现在反过来——你写完了组件，可以让别人用五步法读懂它 |
+| **6.6.4** | 反向追踪（`rg AddComponent`） | 写完后用 `rg "components.psionic"` 看自己组件被哪些代码用了 |
+
+——**整章 6.1 到 6.6 的知识点，在 6.7 几乎全部用了一次**。这就是为什么实战是最好的复习。
+
+#### 第二步：组件作者的"上线检查清单"
+
+写完一个组件，**上线前**用这张清单逐项打勾：
+
+```
+□ 1. Class 构造函数：所有字段都有默认值（不留 nil 字段）
+□ 2. onset 回调：能影响 tag/replica/外部状态的字段都用 onset 同步
+□ 3. Setter 方法：所有"对外修改"通过 SetXxx 进行，不允许直接赋值
+□ 4. DoDelta 模式：变化量类型的字段用 DoDelta 而不是 SetCurrent，方便监听
+□ 5. 事件设计：状态变化抛事件、边界变化（满/空/死）单独抛
+□ 6. OnSave：默认值不存、返回 nil 不存、加 add_component_if_missing
+□ 7. OnLoad：每个字段 nil 检查、用 setter 而不是直接赋值
+□ 8. OnEntitySleep：所有 DoPeriodicTask 都取消、所有 ListenForEvent 视情况解除
+□ 9. OnEntityWake：根据当前状态决定是否重启 task；如有时间补偿调 LongUpdate(elapsed)
+□ 10. LongUpdate：实现，让 c_longupdate 也能正确推进
+□ 11. OnRemoveFromEntity：清理"组件加上去的所有东西"——task / tag / 监听 / 引用
+□ 12. SourceModifierList：凡是会被多 buff 同时改的字段，用 modifier 而不是裸字段
+□ 13. modmain.lua AddReplicableComponent: 写在顶层，不写在回调里
+□ 14. _replica.lua：net 变量两端都声明、Get 优先读真组件、Set 只服务端
+□ 15. GetDebugString：实现，方便 Ctrl+Tab 实时调试
+```
+
+**符合 80% 以上**——你的组件就是"工业级"的，能放心用在自己的 Mod、甚至上传到创意工坊。
+
+#### 第三步：实战经验六条
+
+最后是我（以及很多 Mod 老手）从无数次踩坑中提炼的经验：
+
+1. **先做 Walking Skeleton 再加血肉**——5 个空文件先跑起来，再一点点填代码。任何时刻都让你的代码处于"可运行"状态，bug 永远在 5 行之内。
+2. **读官方组件比读教程更有效**——本节的所有写法都对照了 `health.lua` / `fueled.lua` / `perishable.lua` / `inventoryitemmoisture.lua`。Klei 的源码就是最好的教科书。
+3. **遇到不懂就 Ctrl+Tab + c_sel + print**——回顾 6.6.6 节的"运行时侦探"手法，比静态读代码快 10 倍。
+4. **永远走"正门"**——SetXxx / DoDelta / AddRateModifier 这些是组件的"接口"。**自己写的代码也要走正门**，避免漏掉同步、漏掉事件。
+5. **思考"几年后的自己"和"未来的协作者"**——你的组件可能被另一个 Mod 拓展、被 PostInit 修改、被 RPC 调用。每一行代码都问自己：**"如果别人改了这里，会不会引入 bug？"** 防御式编程不是啰嗦，是负责任。
+6. **不是所有组件都需要 Replica**——只有客户端真正需要"看到"这个数据时才同步。比如 `fueled` 没有 replica（只通过 section 间接同步），是因为客户端不需要精确的剩余秒数。**节省网络带宽就是节省玩家延迟**。
+
+#### 第四步：本章总结
+
+**第 6 章的主线**：
+
+- **6.1 拆开了组件的生命周期**——从 `AddComponent` 的六步流程到五个核心钩子，让你看懂任何组件的骨架。
+- **6.2 揭开了 Replica 的面纱**——客户端"影子组件"是怎么和服务端真组件协作的，让多人游戏的状态同步成为可能。
+- **6.3 深入了 Classified 实体**——`player_classified` 这种"超级桥梁"是怎么把上百个字段打包同步的。
+- **6.4 拆解了 Timer 组件**——比 `DoPeriodicTask` 更"持久化"的计时管理。
+- **6.5 引入了 SourceModifierList**——让"多 buff 叠加"这种业界难题变得简单。
+- **6.6 教了你如何阅读源码**——五步法、反向追踪、运行时探索，让你成为组件世界的"侦探"。
+- **6.7 让你亲手做了一个组件**——把前面所有知识点串起来，做出一颗会自动充能、能存档、会休眠、有客户端 UI 数据、能被多源 buff 影响、能释放范围效果的"灵能晶簇"。
+
+**完成第 6 章后，你已经是"半个组件作者"了**。你能做到：
+
+- ✅ 看懂任何官方组件的源码（哪怕是 1000+ 行的复杂组件）
+- ✅ 写出符合 Klei 风格的自定义组件（其他 Mod 作者会觉得你写的代码"很 Klei"）
+- ✅ 处理多人同步问题（不再有"客户端为什么看不到"的困惑）
+- ✅ 用 `c_sel` / `Ctrl+Tab` / `print hook` 在游戏里实时调试
+
+> **下一章预告**：第 7 章我们将进入"**事件、StateGraph、Brain**"的世界——组件之间是怎么"对话"的？为什么巨牛会自己求偶、会自己睡觉、会自己挑食？怎么让 NPC 看到玩家就跑？这些"行为决策"的代码 Klei 是用一套**事件驱动 + 状态机 + AI 决策树**的三层架构实现的——而我们会把它一层层剥开来看。
+
+> **再下一章预告**（第 8 章）：写完了行为，还需要给行为加"特效"——粒子系统、动画、声音、屏幕震动……第 8 章是"**视听层 (Audio-Visual Layer)**"的全套——让你的 Mod 不光"能玩"，还要"好看、好听、有手感"。
