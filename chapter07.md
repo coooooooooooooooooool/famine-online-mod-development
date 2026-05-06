@@ -6049,7 +6049,1223 @@ end)
 
 ## 7.6 动作的优先级与冲突解决
 
-（待编写）
+### 本节导读
+
+前面 5 节我们把 Action 系统的 5 个支柱讲完了——**ACTIONS 表（动作的"字典"）→ ComponentAction（组件如何声明动作）→ ActionHandler（StateGraph 如何响应）→ BufferedAction（动作的"快递包"）→ PlayerController（玩家输入如何变成动作）**。但其中一个**关键问题**还没回答：
+
+> **当多个动作同时可执行时——引擎到底怎么挑？**
+
+这不是抽象的问题。**任何稍微复杂一点的世界——一棵树、一只食人花、一头牛——都同时挂着多个组件**。每个组件 collector 都把自己的动作 `push` 进候选列表——**最终列表里可能有 5、6、甚至十多个动作**——但玩家**只点了一次鼠标**——**只有一个**会被执行。
+
+本节就是把这个"动作冲突解决"机制**完整拆开**——从你最熟悉的 `priority` 字段，到隐藏在 PlayerActionPicker 内部的"栈式过滤器"，到状态切换时整个 collector 流程被 `leftclickoverride` 一刀切掉的"暴力覆盖"——**4 大冲突解决层、3 处隐藏路由分支、6 个真实陷阱**。
+
+读完本节，你将彻底理解：
+
+- 装备斧头**右键树**为什么是 CHOP 而不是 ATTACK——而**左键怪物**为什么是 ATTACK
+- 玩家**变成鬼魂**后所有右键菜单为什么都消失了——而 HAUNT 又是怎么活下来的
+- 玩家**骑着牛**为什么不能往背包里放东西，而 STORE 又怎么"破例"
+- Mod 加了一个新动作但**始终轮不到它执行**——是 priority 写小了？还是 actionfilter 挡了？还是 collector 没 push？
+- 自定义角色**变身后想完全替换右键菜单**——是 hook collector 还是用 override？
+
+按惯例本节分**新手 / 进阶 / 老手**三档：
+
+- **快速入门**（7.6.1～7.6.3）：从游戏内现象切入，看清"冲突"长什么样，认识 4 大解决层
+- **进阶**（7.6.4～7.6.6）：深挖 `SortActionList`、`actionfilter` 栈、左右键路由的源码细节
+- **老手进阶**（7.6.7～7.6.8）：override 三件套 + 6 个常见陷阱与设计经验
+- **小结**（7.6.9）
+
+---
+
+### 7.6.1 快速入门：从"装备斧头右键一棵树"看动作冲突
+
+我们先来看一个最简单的场景——**玩家装备斧头，右键一棵树**——直觉上应该是"砍树"。但你停下来想一下：**斧头不是武器吗？怎么不去打树？而且树本身不是 inspectable 吗？怎么不去 LOOKAT？**
+
+这就是"动作冲突解决"问题的入口。
+
+#### 第一步：在游戏里观察"冲突"
+
+打开控制台（`~`），定位到一棵 `evergreen`（普通常青树），打印它的 collector 在 SCENE 类型下能 push 出来的所有动作：
+
+```lua
+-- 在树前面右键时，候选动作其实有这些：
+-- 1. CHOP（来自 workable + tool 的联合判定）
+-- 2. LOOKAT（来自 inspectable）
+-- 3. WALKTO（兜底：所有可走点都能 push）
+```
+
+如果你拿着斧头**左键**树（不是右键），**weapon collector 还会 push 一个 ATTACK**——但**最终选择的依旧是 CHOP**。
+
+为什么？答案就在两个地方：**`priority` 数值** + **collector 内部的 `right` 分支**。
+
+#### 第二步：拆开"右键斧头树"的代码路径
+
+完整链路（左键）：
+
+```
+左键鼠标
+  → PlayerController:OnLeftClick
+  → PlayerActionPicker:GetLeftClickActions(position, target=树)
+  → 因 useitem == nil（斧头在 hands 不在 cursor）→ equipitem != nil
+  → GetEquippedItemActions(target=树, useitem=斧头, right=false)
+  → useitem:CollectActions("EQUIPPED", self.inst, target, actions, right=false)
+       ├─ tool collector       → push ACTIONS.CHOP    （priority=0）
+       ├─ weapon collector     → push ACTIONS.ATTACK  （priority=2，仅 left 时）
+  → SortActionList(actions, target, useitem)
+       → table.sort(actions, OrderByPriority) ← 按 priority 降序
+       → 第一个：ATTACK（priority=2）
+  → 返回 actions[1] = ATTACK
+```
+
+**所以左键斧头树的结果其实是 ATTACK——但树没有 `combat` replica，weapon collector 的 `doer.replica.combat:CanTarget(target)` 会返回 false——`ATTACK` 根本不会被 push 进 actions——最终只剩 `CHOP`。**
+
+> **新手记忆**：**优先级**不是"我设了 priority=99 就一定能赢"——它**只是排序的最后一步**。collector 不 push 进去，再高的 priority 也没用。
+
+#### 第三步：看 `weapon` collector 在 EQUIPPED 类型里的 `right` 分支
+
+源码在 `componentactions.lua` 第 2452-2479 行：
+
+```2452:2479:scripts/componentactions.lua
+        weapon = function(inst, doer, target, actions, right)
+            if  doer.replica.combat ~= nil
+                and (inst:HasTag("projectile") or inst:HasTag("rangedweapon") or not (doer.replica.rider ~= nil and doer.replica.rider:IsRiding()))
+				and not inst:HasTag("outofammo")
+            then
+                if doer.replica.combat:CanExtinguishTarget(target, inst) or
+                    (right and doer.replica.combat:CanLightTarget(target, inst))
+                then
+                    table.insert(actions, ACTIONS.ATTACK)
+
+                elseif not right
+                    and not (target:HasTag("wall") or target:HasTag("mustforceattack"))
+					and not (doer.TargetForceAttackOnly ~= nil and doer:TargetForceAttackOnly(target))
+                    and target.replica.combat ~= nil
+                    and doer.replica.combat:CanTarget(target)
+                    and target.replica.combat:CanBeAttacked(doer)
+                    and not doer.replica.combat:IsAlly(target)
+                then
+                    if target:HasTag("mole") and inst:HasTag("hammer") then
+                        table.insert(actions, ACTIONS.ATTACK)
+                    elseif not (doer:HasTag("player") and target:HasTag("player"))
+                        and not (inst:HasTag("tranquilizer") and not target:HasTag("sleeper"))
+                    then
+                        table.insert(actions, ACTIONS.ATTACK)
+                    end
+                end
+            end
+        end,
+```
+
+注意第 2462 行的 `elseif not right`——**右键时这一支不会 push ATTACK**（除非是"灭火/点火"两种特殊情况）。
+
+这就解释了"装备斧头右键树 = CHOP"的根本原因：**右键根本不会有 ATTACK 候选**。
+
+> **进阶提示**：**Klei 通过 collector 内部的 `right` 分支提前剔除冲突——而不是等到 SortActionList 排序后再处理**。这是个非常重要的设计哲学：**冲突在最早的阶段解决最便宜**。
+
+#### 第四步：用控制台亲眼看排序结果
+
+让玩家面前有一棵树，开启 debug 模式：
+
+```lua
+-- 假设光标在树上
+local target = TheInput:GetWorldEntityUnderMouse()
+local picker = ThePlayer.components.playeractionpicker
+
+-- 看左键候选
+local lmb = picker:GetLeftClickActions(target:GetPosition(), target)
+for i, act in ipairs(lmb) do
+    print(i, act.action.id, "priority=" .. (act.action.priority or 0))
+end
+-- 输出：1   CHOP    priority=0
+
+-- 看右键候选
+local rmb = picker:GetRightClickActions(target:GetPosition(), target)
+for i, act in ipairs(rmb) do
+    print(i, act.action.id, "priority=" .. (act.action.priority or 0))
+end
+-- 输出：1   CHOP    priority=0
+```
+
+**两边都只有 CHOP**——证明了之前的推理：**weapon collector 没 push ATTACK，工程上"冲突"根本就没产生**。
+
+把树换成一只**蜘蛛**再试一次：
+
+```lua
+-- 光标在蜘蛛上
+local target = TheInput:GetWorldEntityUnderMouse()
+local lmb = ThePlayer.components.playeractionpicker:GetLeftClickActions(target:GetPosition(), target)
+for i, act in ipairs(lmb) do print(i, act.action.id) end
+-- 输出：1   ATTACK   （priority=2）
+--      2   LOOKAT   （priority=-3，作为后备）
+
+local rmb = ThePlayer.components.playeractionpicker:GetRightClickActions(target:GetPosition(), target)
+for i, act in ipairs(rmb) do print(i, act.action.id) end
+-- 输出：（如果蜘蛛不可工作，可能就只是 LOOKAT，或为空）
+```
+
+蜘蛛**有 combat replica + 是 hostile**——left 触发 ATTACK；right 没有 work tag，也不是 weapon 的特殊场景（灭火/点火），返回空。
+
+> **新手记忆**：**这就是"动作冲突"的真实模样——多个候选 → priority 排序 → 取第一个**。但很多冲突在 collector 内部的 `if right` / `if not right` 分支里就被剔除了——**排序拿到手的列表往往只剩 1-2 项**。
+
+---
+
+### 7.6.2 快速入门：四类"冲突解决器"一览
+
+看完上面的例子，你可能会觉得"哦原来 priority 排序就完了"——**远远不止**。整个 Action 系统里**至少有 4 个层次**在同时影响"最终选哪个动作"：
+
+#### 第一层：数值优先级（`priority` 字段）
+
+**最直接、最常用、最容易理解**——每个 Action 在 `actions.lua` 里被定义时，可以带一个 `priority` 数值（默认 0）。`SortActionList` 排序时按降序排列——**数值大的赢**。
+
+适用场景：**对**"哪个动作更重要"**有明确数值排名**——比如 `OCEAN_FISHING_CATCH`(priority=6) > `OCEAN_FISHING_REEL`(5) > `ATTACK`(2) > `CHOP`(0) > `LOOKAT`(-3) > `WALKTO`(-4)。
+
+#### 第二层：动作过滤器（`actionfilter` 栈）
+
+**全局闸门**——`PlayerActionPicker` 内部维护一个 `actionfilterstack`，每个 filter 是一个 `function(inst, action) -> boolean`。**返回 false 的 action 直接被丢弃**——不进候选列表。
+
+**栈不是"全部生效"——而是"只有最高 priority 的 filter 生效"**——这点是反直觉的，需要重点记。
+
+适用场景：**按玩家状态批量屏蔽一类动作**——比如：
+
+- 玩家是鬼魂 → 只允许 `ghost_valid=true` 的动作
+- 游戏暂停 → 只允许 `paused_valid=true` 的动作
+- 玩家在重负状态 → 只允许 `encumbered_valid=true` 的动作
+
+#### 第三层：左右键路由（`GetLeftClickActions` vs `GetRightClickActions`）
+
+**入口分流**——`PlayerActionPicker` 提供两个独立方法分别处理左键和右键。它们的内部分支顺序是不同的——意味着**同一个 target、同一个 useitem，左右键产生的候选列表往往不一样**。
+
+这不是"过滤"——这是**两条独立的代码路径**。一些动作只在左键里生成（如普通 ATTACK），另一些只在右键里生成（如 STOP_STEERING_BOAT、CASTAOE）。
+
+适用场景：**动作天然分"主操作"和"次操作"**——左键是"主交互"（攻击、捡起、砍树），右键是"次交互"（容器、特殊功能、AOE 瞄准）。
+
+#### 第四层：完全覆盖（`leftclickoverride` / `rightclickoverride` / `pointspecialactionsfn`）
+
+**最暴力的一层**——直接替换整个 `GetLeftClickActions` / `GetRightClickActions` / `GetPointSpecialActions` 的逻辑。给 picker 设了 override 后，**默认的 collector 流程要么被完全跳过、要么需要 override 主动声明 `usedefault=true` 才会执行**。
+
+适用场景：**形态变化导致动作集整体改变**——比如 Woodie 变身海狸/驼鹿/猴子时，右键斧头不再砍树（因为他根本没手），而是变成完全不同的动作集。
+
+#### 总览：4 层从上到下的执行顺序
+
+```
+玩家点击鼠标
+  ↓
+[第 4 层] override 检查：有 leftclickoverride？
+  ├─ 有 → 走 override，可能直接返回（usedefault=false）
+  └─ 无 → 继续
+  ↓
+[第 3 层] 左/右键路由：选 GetLeftClickActions 还是 GetRightClickActions？
+  ↓
+路由内部按 useitem / equipitem / target / position 分支
+  ↓
+最终调到 GetXXXActions（GetSceneActions / GetUseItemActions / ...）
+  ↓
+useitem:CollectActions(actiontype, ...) ← 各 collector 各自 push
+  ↓
+[第 2 层] SortActionList 内的 actionfilter 过滤
+  ↓
+[第 1 层] priority 排序 + 包装成 BufferedAction
+  ↓
+取 [1] 作为最终选择
+```
+
+> **新手记忆**：**"优先级冲突解决"不是单一机制——而是 4 层叠加**。**遇到"为什么这个动作没被选中"的问题时**，**从最下层往上排查**：collector push 了吗？→ priority 数值多少？→ actionfilter 在生效吗？→ 是不是被 override 了？
+
+---
+
+### 7.6.3 快速入门：priority 数值的"标尺"
+
+`priority` 是个普通的 Lua 数字——**没有上限也没有下限**——但是 Klei **整套游戏的所有 Action 都遵循一个隐含的数值梯度**。理解这个梯度，能让你给自定义动作设一个**不打架的 priority**。
+
+#### 第一步：默认值与"高优先级"宏
+
+```287:287:scripts/actions.lua
+    self.priority = data.priority or 0
+```
+
+**没显式设 priority 的 Action 默认是 0**。
+
+```332:334:scripts/actions.lua
+-- NOTE: High priority is intended to be a shortcut flag for actions that we expect to always dominate if they are available.
+-- We also expect that no two HIGH_ACTION_PRIORITY actions overlap with each other.
+local HIGH_ACTION_PRIORITY = 10
+```
+
+**`HIGH_ACTION_PRIORITY = 10`** 是个**保留宏**——给"必定赢"的动作用——并且 Klei 自己保证**不会有两个 HIGH_ACTION_PRIORITY 动作同时出现**——这是一个**约定**而不是代码强制。
+
+#### 第二步：原版 ACTIONS 的 priority 分布
+
+我们把 `actions.lua` 里所有显式设了 priority 的动作整理成一个对照表（最完整版）：
+
+| priority | 动作（举例）                                         | 含义                                                |
+| :------: | ---------------------------------------------------- | --------------------------------------------------- |
+|  **10**  | `CASTAOE` `BLINK` `BLINK_MAP` `JUMPIN_MAP` `TOSS_MAP` `TOGGLE_DEPLOY_MODE` `COMPARE_WEIGHABLE` `PLANTREGISTRY_RESEARCH` `CAST_NET` | "霸主"——AOE 瞄准 / 闪烁 / 地图传送 等几乎不允许被打断 |
+|   **6**  | `OCEAN_FISHING_CATCH`                                | 钓鱼"中鱼瞬间"——必须立刻打断其它操作                 |
+|   **5**  | `OCEAN_FISHING_REEL`                                 | 钓鱼"收线"                                           |
+|   **4**  | `ABANDON_SHIP` `MAKEMOLEHILL`                        | 跳船 / 鼹鼠造洞                                       |
+|   **3**  | `ATTACK` 之上的强力动作：`HAMMER` `TALKTO` `GIVETOPLAYER` `FEEDPLAYER` `NET` `CATCH` `CASTSUMMON` `BRUSH` `UNSADDLE` `WATER_TOSS` `ROW` `RESETMINE` `BOAT_MAGNET_BEACON_TURN_ON/OFF` | 比攻击更"主动"的工具 / 社交 / 高优先级特殊操作      |
+|   **2**  | `ATTACK` `CHECKTRAP` `STARTCHANNELING` `ACTIVATE` `OPEN_CRAFTING` `TURNON` `TURNOFF` `BUNDLE` `UNWRAP` `BREAK` `CYCLE` `MUTATE_SPIDER` `LIFT_DUMBBELL` | 主战斗 / 启动型操作                                 |
+|   **1**  | `PICKUP` `COOK` `MURDER` `FERTILIZE` `SMOTHER` `MANUALEXTINGUISH` `USEITEM` `USEITEMON` `STOPUSINGITEM` `USEEQUIPPEDITEM` `CONSTRUCT` `STOPCONSTRUCTION` `APPLYCONSTRUCTION` `FEED` `UPGRADE` `MOUNT` `DISMOUNT` `SADDLE` `TOSS` `WINTERSFEAST_FEAST` `TAPTREE` `USE_HEAVY_OBSTACLE` `ROTATE_BOAT_*` `YOTB_SEW` | 常规"操作型"动作                                    |
+|   **0**  | `CHOP` `MINE` `DIG` `EAT` `EQUIP` `BUILD` `HARVEST` `PICK` `READ` `REPAIR` `EXTINGUISH` `CHANGEIN` 等几十个 | **最大群体**——日常采集 / 消耗 / 装备型动作         |
+|  **-1**  | `DROP` `HITCHUP` `MARK` `UNHITCH` `HITCH` `RUMMAGE` `LIGHT` `CASTSPELL` `CAST_POCKETWATCH` `START_CHANNELCAST` `STOP_CHANNELCAST` `HALLOWEENMOONMUTATE` `PLANTREGISTRY_RESEARCH_FAIL` | 后备型 / 翻箱倒柜 / 易被覆盖                        |
+|  **-2**  | `UNEQUIP`                                            | 比装备低一档（避免误触发卸下）                      |
+|  **-3**  | `LOOKAT`                                             | "兜底候选"——什么都做不了时还能查看                  |
+|  **-4**  | `WALKTO` `LIGHT`                                     | **最低**——纯走过去 / 点火（被几乎所有真实动作压过） |
+
+> **新手快速记忆**：**默认是 0、`ATTACK` 是 2、`HIGH_ACTION_PRIORITY` 是 10、`WALKTO` 是 -4**——这 4 个数字记住，90% 的 priority 直觉都对。
+
+#### 第三步：自定义 Action 的 priority 该怎么选？
+
+按"动作的语义"对号入座：
+
+- **"我这个动作是 AOE / 传送 / 强制打断 类型的"** → 直接用 `HIGH_ACTION_PRIORITY`：`Action({ priority = HIGH_ACTION_PRIORITY })`
+- **"我这个动作是 攻击型 / 启动型 / 容器型"** → 用 1～3
+- **"我这个动作是 普通采集 / 消耗 / 装备型"** → 用 0（不设也行）
+- **"我这个动作是 后备型 / 容易让位 类型的"** → 用 -1～-3
+
+**绝对不要写 100、999、9999** ——它会破坏 `HIGH_ACTION_PRIORITY` 的隐含约定，导致玩家发现"我最强的瞬移动作（priority=10）居然被 mod 的某个动作（priority=99）压住"——是非常糟糕的体验。
+
+> **进阶提示**：**Mod 之间的 priority 战争**——多个 mod 都给同一个 Action 提了 priority，会引起非常隐蔽的 bug。**最佳做法是 mod 注册新 action 而不是改原版 action**——保持原版数值不动。
+
+---
+
+### 7.6.4 进阶：`SortActionList` 完整流程拆解
+
+7.6.1～7.6.3 我们建立了直觉——这一节我们**深挖 `SortActionList` 这 25 行的源码**——它是整个"优先级排序"的真正实现。
+
+#### 第一步：完整源码（再贴一次）
+
+```78:107:scripts/components/playeractionpicker.lua
+local function OrderByPriority(l, r)
+    return l.priority > r.priority
+end
+
+-- All the action picker functions that do the heavy lifting run their resulting table through the SortActionList function
+-- so we can just do the ghost action selection here, rather than littering it throughout the component.
+function PlayerActionPicker:SortActionList(actions, target, useitem)
+    if #actions == 0 then
+        return actions
+    end
+
+    table.sort(actions, OrderByPriority)
+
+    local ret = {}
+
+    for i, v in ipairs(actions) do
+        if self.actionfilter == nil or self.actionfilter(self.inst, v) then
+            local distance = v == ACTIONS.CASTAOE and useitem ~= nil and useitem.components.aoetargeting ~= nil and useitem.components.aoetargeting:GetRange() or nil
+            if target == nil then
+                table.insert(ret, BufferedAction(self.inst, nil, v, useitem, nil, nil, distance, nil, nil))
+            elseif target:is_a(EntityScript) then
+                table.insert(ret, BufferedAction(self.inst, target, v, useitem, nil, nil, distance, nil, nil))
+            elseif target:is_a(Vector3) then
+                table.insert(ret, BufferedAction(self.inst, nil, v, useitem, target, nil, distance, nil, nil))
+            end
+        end
+    end
+
+    return ret
+end
+```
+
+短短 30 行，承载了 4 个责任。
+
+#### 第二步：6 步流程拆解
+
+**Step 1：空数组短路**（第 85-87 行）
+
+```lua
+if #actions == 0 then
+    return actions
+end
+```
+
+如果 collector 一个动作都没 push，直接返回空——**省了一次 sort 和一次循环**。`PlayerActionPicker` 调用很频繁（每帧 OnUpdate 都会刷新），这个 early return 是性能考量。
+
+**Step 2：按 priority 降序排序**（第 89 行）
+
+```lua
+table.sort(actions, OrderByPriority)
+-- OrderByPriority(l, r): return l.priority > r.priority
+```
+
+注意此时 `actions` 是 **Action 对象数组**（不是 BufferedAction）——`l.priority` 直接读 Action 类的字段。
+
+**为什么用稳定的 sort？** Lua 的 `table.sort` **不保证稳定性**——这意味着两个相同 priority 的动作排序后顺序是**未定义**的——这是个潜在风险，下面"陷阱 2"会展开讲。
+
+**Step 3：actionfilter 过滤**（第 94 行）
+
+```lua
+if self.actionfilter == nil or self.actionfilter(self.inst, v) then
+```
+
+**只有过滤器允许的动作才进入候选**——这是 7.6.5 的主题，下一节展开。
+
+**Step 4：CASTAOE 的 distance 特殊处理**（第 95 行）
+
+```lua
+local distance = v == ACTIONS.CASTAOE and useitem ~= nil and useitem.components.aoetargeting ~= nil and useitem.components.aoetargeting:GetRange() or nil
+```
+
+**只有 CASTAOE 一个动作走这条特殊路径**——它的 distance 不写死在 `actions.lua` 里，而是从 `aoetargeting:GetRange()` 动态读取——因为不同的 AOE 法术（火球、龙卷风、暴风雪）距离都不一样。
+
+> **进阶提示**：这是 distance 字段的**唯一动态用法**。其它 Action 的 distance 都是常量。
+
+**Step 5：根据 target 类型选 BufferedAction 构造分支**（第 96-102 行）
+
+```lua
+if target == nil then
+    -- 没目标：自己对自己（如 LOOKAT 自己）
+    table.insert(ret, BufferedAction(self.inst, nil, v, useitem, nil, nil, distance, nil, nil))
+elseif target:is_a(EntityScript) then
+    -- 目标是实体：CHOP/ATTACK 等
+    table.insert(ret, BufferedAction(self.inst, target, v, useitem, nil, nil, distance, nil, nil))
+elseif target:is_a(Vector3) then
+    -- 目标是地面位置：DEPLOY/CASTAOE 等
+    table.insert(ret, BufferedAction(self.inst, nil, v, useitem, target, nil, distance, nil, nil))
+end
+```
+
+3 种构造分支对应 BufferedAction 的 3 种"形态"——回顾 7.4.2：BufferedAction 有 `target`（EntityScript）和 `pos`（Vector3）两个字段——**互斥使用**。
+
+**Step 6：返回 ret**
+
+`ret` 是 BufferedAction 数组——**第 [1] 个就是最高优先级的候选**。`OnLeftClick` / `OnRightClick` 上层会取 `[1]` 作为最终选择。
+
+#### 第三步：用控制台亲眼看排序
+
+让玩家手持斧头、面前有一只猪——用控制台直接调 `SortActionList`：
+
+```lua
+local picker = ThePlayer.components.playeractionpicker
+
+-- 手动构造一组"竞争中的"动作
+local acts = {
+    ACTIONS.LOOKAT,    -- priority=-3
+    ACTIONS.ATTACK,    -- priority=2
+    ACTIONS.CHOP,      -- priority=0（默认）
+    ACTIONS.WALKTO,    -- priority=-4
+}
+
+local sorted = picker:SortActionList(acts, c_select())  -- c_select() 选中目标
+for i, ba in ipairs(sorted) do
+    print(i, ba.action.id, "priority=" .. (ba.action.priority or 0))
+end
+
+-- 输出：
+-- 1   ATTACK   priority=2
+-- 2   CHOP     priority=0
+-- 3   LOOKAT   priority=-3
+-- 4   WALKTO   priority=-4
+```
+
+排得整整齐齐。**`OnLeftClick` 取 `[1]` = ATTACK**——这就是为什么"装备斧头左键猪"会攻击。
+
+#### 第四步：disable_right_click 与"左键完成后禁用右键"
+
+注意 7.5.4 里讲过——`PlayerActionPicker` 还有一个 `disable_right_click` 字段：
+
+```lua
+function PlayerActionPicker:GetRightClickActions(position, target, spellbook)
+    if self.disable_right_click then
+        return {}
+    end
+    ...
+end
+```
+
+**它是另一种"冲突解决"的兜底**——当左键已经触发了某种"独占动作"（如船头转向），就把右键彻底禁用，避免玩家两个键同时触发。
+
+虽然源码里这个字段大部分时候是 `false`（注释掉的），但**Klei 留了这个口子给 mod 做"独占输入"用**。
+
+> **进阶提示**：自定义 mod 如果实现了"按住左键拖拽"之类的连续输入——可以临时把 `disable_right_click` 拨到 true，避免拖拽中右键打断；松开时再恢复。
+
+---
+
+### 7.6.5 进阶：`ACTION_FILTER_PRIORITIES` 与 actionfilter 栈机制深挖
+
+7.5.7 里我们简单提过 `ACTION_FILTER_PRIORITIES`——这一节我们**真正讲清"栈式过滤"是怎么工作的**——以及为什么"栈不是叠加而是择优"是这套设计的精髓。
+
+#### 第一步：ACTION_FILTER_PRIORITIES 的 6 个档位
+
+```1:9:scripts/components/playeractionpicker.lua
+ACTION_FILTER_PRIORITIES =
+{
+	paused = 999,
+	ghost = 99,
+	mounted = 20,
+	floaterheld = 15,
+	heavylifting = 10,
+	default = -99,
+}
+```
+
+| priority | 名称           | 触发条件                       | 通过条件                                |
+| :------: | -------------- | ------------------------------ | --------------------------------------- |
+|   999    | `paused`       | 服务器暂停（多人房间所有人按 P） | `action.paused_valid == true`           |
+|    99    | `ghost`        | 玩家死后变成鬼魂              | `action.ghost_valid == true`            |
+|    20    | `mounted`      | 玩家骑着牛 / 恐鸟              | `action.mount_valid == true`            |
+|    15    | `floaterheld`  | 拿着浮力大件（如船桨、原木）   | `action.floating_valid == true`         |
+|    10    | `heavylifting` | 拿着大件物品（雕像、巨豆）     | `action.encumbered_valid == true`       |
+|   -99    | `default`      | 玩家活着且正常                 | `not action.ghost_exclusive`（仅排除幽灵专属） |
+
+**注意每个 filter 都和 Action 类的某个 `_valid` / `_exclusive` 字段一一对应**——这就是 7.1.3 里那些"看起来用不上的字段"的真正用途。
+
+#### 第二步：栈是"择优生效"而不是"叠加生效"
+
+源码在第 42-56 行：
+
+```42:56:scripts/components/playeractionpicker.lua
+function PlayerActionPicker:OnUpdateActionFilterStack()
+    local num = #self.actionfilterstack
+    if num > 0 then
+        local topfilter = self.actionfilterstack[num]
+        for i = num - 1, 1, -1 do
+            local filter = self.actionfilterstack[i]
+            if filter.priority > topfilter.priority then
+                topfilter = filter
+            end
+        end
+        self.actionfilter = topfilter.fn
+    else
+        self.actionfilter = nil
+    end
+end
+```
+
+**逻辑**：
+
+1. 遍历整个栈
+2. 找到 priority 最高的那个 filter
+3. **只有它的 fn 被赋值给 `self.actionfilter`**——其它全部"无视"
+
+**这是反直觉的**——你可能以为"既加了 ghost filter 又加了 mounted filter，会两个一起判断"——**不会**。**最高的赢，其它沉睡**。
+
+#### 第三步：为什么这样设计？
+
+我们用一个最经典的例子来理解——**玩家骑着牛死了变成鬼魂**：
+
+```
+栈状态（玩家活着骑牛时）：
+  [1] PlayerActionFilter   priority = -99  default
+  [2] MountedActionFilter  priority = 20   mounted
+  ↑ 最高优先级的 [2] 生效——只允许 action.mount_valid==true 的动作
+
+玩家被打死、变成鬼魂——push 一个 GhostActionFilter：
+  [1] PlayerActionFilter   priority = -99  default
+  [2] MountedActionFilter  priority = 20   mounted（牛尸还没来得及 pop）
+  [3] GhostActionFilter    priority = 99   ghost
+  ↑ 最高 [3] 生效——只允许 action.ghost_valid==true 的动作
+```
+
+**死亡瞬间**——`MountedActionFilter` 还没来得及 pop（Klei 设计上是骑乘组件被销毁时才 pop）——但 GhostActionFilter 一进来就直接接管了。**玩家立刻变成鬼魂的动作集，而不会卡在"还要满足 mount_valid"的中间状态**——非常稳健。
+
+> **进阶提示**：**这是 Klei 处理"状态切换中间态"的标准模式**。**多个状态可能短暂重叠**——但每个状态都用"高 priority filter"压过去——**最严格的状态自动生效**。
+
+#### 第四步：5 个内置 filter 的来源
+
+| Filter                     | 文件位置                                     | Push 时机                       | Pop 时机                      |
+| -------------------------- | -------------------------------------------- | ------------------------------- | ----------------------------- |
+| `PlayerActionFilter`       | `prefabs/player_common.lua` 第 943-945       | 玩家创建时（默认安装）          | 玩家销毁时                    |
+| `GhostActionFilter`        | `prefabs/player_common_extensions.lua` 56-58 | `ConfigureGhostActions`（死亡） | `ConfigurePlayerActions`（复活） |
+| `PausedActionFilter`       | 同上 72-74                                   | `PausePlayerActions`            | `UnpausePlayerActions`        |
+| `HeavyLiftingActionFilter` | `components/inventory_replica.lua` 71-73     | 拿起大件（heavy lifting）       | 放下大件                      |
+| `FloaterHeldActionFilter`  | 同上 88-90                                   | 拿起浮力大件                    | 放下                          |
+| `MountedActionFilter`      | `components/rider_replica.lua` 144           | 骑上牛                          | 下牛                          |
+
+#### 第五步：用控制台手动操作 filter 栈
+
+这是个**调试 mod 很有用**的技巧——观察实时 filter 栈：
+
+```lua
+local picker = ThePlayer.components.playeractionpicker
+
+-- 看当前栈
+for i, f in ipairs(picker.actionfilterstack) do
+    print(i, f.priority, tostring(f.fn))
+end
+
+-- 看当前生效的 filter
+print("active:", tostring(picker.actionfilter))
+
+-- 手动 push 一个临时 filter
+local function MyFilter(inst, action)
+    print("filter check:", action.id)
+    return action.id == "WALKTO" or action.id == "LOOKAT"
+end
+picker:PushActionFilter(MyFilter, 50)
+
+-- 现在右键任何东西，控制台都会打印 "filter check: XXX"
+-- 而且只有 WALKTO 和 LOOKAT 会通过 → 玩家"暂时只能看和走"
+
+-- 调试完 pop 掉
+picker:PopActionFilter(MyFilter)
+```
+
+> **进阶提示**：这个"临时 push 一个 50 priority 的 filter"是非常实用的**调试武器**——能在游戏运行时**临时屏蔽某类动作**——验证你的 mod 在那些"动作不可用"状态下是否会崩溃。
+
+#### 第六步：Action 类的"\_valid 系列字段"完整对照
+
+这是 actionfilter 工作的"另一半"——Action 类的字段：
+
+```297:299:scripts/actions.lua
+    self.mount_valid = data.mount_valid or false
+    self.encumbered_valid = data.encumbered_valid or false
+	self.floating_valid = data.floating_valid or false
+```
+
+```295:296:scripts/actions.lua
+    self.ghost_exclusive = data.ghost_exclusive or false
+    self.ghost_valid = self.ghost_exclusive or data.ghost_valid or false -- If it's ghost-exclusive, then it must be ghost-valid
+```
+
+```307:307:scripts/actions.lua
+    self.paused_valid = data.paused_valid or false
+```
+
+| 字段                | 默认  | 含义                                           |
+| ------------------- | :---: | ---------------------------------------------- |
+| `mount_valid`       | false | 骑牛时是否可执行                               |
+| `encumbered_valid`  | false | 拿大件时是否可执行                             |
+| `floating_valid`    | false | 拿浮力大件时是否可执行                         |
+| `paused_valid`      | false | 服务器暂停时是否可执行                         |
+| `ghost_valid`       | false | 鬼魂时是否可执行                               |
+| `ghost_exclusive`   | false | **只**鬼魂能执行（自动隐含 `ghost_valid=true`） |
+
+> **新手记忆**：**自定义 Action 默认 6 个字段全是 false**——意味着"骑牛、拿大件、变鬼、暂停 都不让用"——**最严格保险**。**只有你确实希望玩家在这些状态下也能执行**，才显式打开。
+
+---
+
+### 7.6.6 进阶：左/右键路由 + 容器/手物/装备/地面 的优先关系
+
+第 4 层（override）最后讲——这一节我们先把 `GetLeftClickActions` 和 `GetRightClickActions` 内部的**分支优先级**讲清楚。这两个方法是 5800 行 PlayerController 之外**真正决定"谁先来"的入口**——**它们的 if-else 顺序就是优先级**。
+
+#### 第一步：GetLeftClickActions 的 5 段判断
+
+完整源码在 `playeractionpicker.lua` 第 278-358 行——我们抽出关键分支：
+
+```lua
+function PlayerActionPicker:GetLeftClickActions(position, target)
+    -- 【0】leftclickoverride 优先（第 4 层覆盖）
+    if self.leftclickoverride ~= nil then
+        ...
+    end
+
+    -- 【特殊】驾驶船 / 操作船炮（最高优先级路由）
+    local steering_actions = self:GetSteeringActions(self.inst, position, false)
+    if steering_actions ~= nil then return steering_actions end
+    
+    local cannon_aim_actions = self:GetCannonAimActions(self.inst, position, false)
+    if cannon_aim_actions ~= nil then return cannon_aim_actions end
+
+    -- 【1】手中拿着物品（cursor item）→ INVENTORY / USEITEM / POINT
+    if useitem ~= nil then
+        if target == self.inst then
+            -- 1a. 自己拿东西点自己 → INVENTORY collector
+            actions = self:GetInventoryActions(useitem)
+        elseif target ~= nil then
+            -- 1b. 拿东西点目标 → USEITEM collector
+            actions = self:GetUseItemActions(target, useitem)
+            if #actions == 0 and target:HasTag("walkableperipheral") then
+                actions = self:GetPointActions(position, useitem, nil, target)  -- 兜底走 POINT
+            end
+        else
+            -- 1c. 拿东西点空地 → POINT collector
+            actions = self:GetPointActions(position, useitem, nil, target)
+        end
+
+    -- 【2】没拿物品 + 点了实体 → 装备物品 OR 场景动作
+    elseif target ~= nil and target ~= self.inst then
+        if 按住FORCE_INSPECT 且 inspectable then
+            actions = { LOOKAT }
+        elseif 是攻击场景 then
+            actions = { ATTACK }
+        elseif equipitem ~= nil then
+            -- 2c. 用装备的工具 → EQUIPPED collector
+            actions = self:GetEquippedItemActions(target, equipitem)
+        end
+        -- 2d. 兜底 → SCENE collector
+        if actions == nil or #actions == 0 then
+            actions = self:GetSceneActions(target)
+        end
+    end
+
+    -- 【3】点了空地（target=nil）+ 装备物品 → POINT collector
+    if actions == nil and target == nil and self.map:IsPassableAtPoint(position:Get()) then
+        if equipitem ~= nil and equipitem:IsValid() then
+            actions = self:GetPointActions(position, equipitem, nil, target)
+            -- 过滤掉"装备意外丢出去"的尴尬
+            for i, v in ipairs(actions) do
+                if v.action == ACTIONS.DROP then
+                    table.remove(actions, i); break
+                end
+            end
+        end
+        -- 3b. 上面没产生 → 走 pointspecialactionsfn
+        if actions == nil or #actions <= 0 then
+            actions = self:GetPointSpecialActions(position, useitem, false)
+        end
+    end
+
+    return actions or {}
+end
+```
+
+**5 段优先级（从上到下）**：
+
+1. **leftclickoverride（第 4 层覆盖）** —— 最高
+2. **驾驶船 / 操作船炮** —— 独占输入
+3. **cursor 手中物品（useitem）** —— 优先于 hands 装备
+4. **hands 装备物品（equipitem）+ target** —— 优先于 SCENE
+5. **SCENE 兜底** —— 最低
+
+> **新手记忆**：**手中物品 > 装备物品 > 实体本身**——这就是为什么"拿着便便点篝火，是把便便丢进去（USEITEM = ADDFUEL），而不是看篝火（SCENE = LOOKAT）"。
+
+#### 第二步：GetRightClickActions 的 7 段判断
+
+源码 360-463 行——比左键**复杂得多**——多了"容器特例"和"AOE 特例"：
+
+```lua
+function PlayerActionPicker:GetRightClickActions(position, target, spellbook)
+    -- 【0】disable_right_click 兜底（独占输入用）
+    if self.disable_right_click then return {} end
+
+    -- 【1】rightclickoverride
+    if self.rightclickoverride ~= nil then ... end
+
+    -- 【特殊】驾驶 / 船炮
+    if steering_actions ~= nil then return steering_actions end
+    if cannon_aim_actions ~= nil then return cannon_aim_actions end
+
+    -- 【2】容器 widget 特例：右键容器物品 → 走 SCENE 处理（不走默认收拾流程）
+    if target ~= nil and self.containers[target] then
+        local isreadonlycontainer = ...
+        actions = isreadonlycontainer and {} or self:GetSceneActions(target, true)
+
+    -- 【3】手中拿着物品（cursor）→ 类似左键的 INVENTORY/USEITEM/POINT
+    elseif useitem ~= nil then
+        ...
+
+    -- 【4】没拿物品 + 点了实体 → 装备物品 OR 场景动作
+    elseif target ~= nil and not target:HasTag("walkableplatform") then
+        if equipitem ~= nil and equipitem:IsValid() then
+            actions = self:GetEquippedItemActions(target, equipitem, true)
+
+            -- 【4a】AOE 武器右键时，剥离所有非 CASTAOE 动作！
+            if equipitem.components.aoetargeting and self.inst.components.playercontroller:IsAOETargeting() then
+                return (#actions <= 0 or actions[1].action == ACTIONS.CASTAOE) and actions or {}
+            end
+        end
+
+        if actions == nil or #actions == 0 then
+            actions = self:GetSceneActions(target, true)
+            -- 【4b】walkableperipheral 兜底走 POINT
+            if (#actions == 0 or (#actions == 1 and actions[1].action == ACTIONS.LOOKAT)) and target:HasTag("walkableperipheral") then
+                ...
+                actions = self:GetPointActions(position, equipitem, true, target)
+                ...
+            end
+        end
+
+    -- 【5】没目标 + 装备物品 + 法术书 → POINT
+    else
+        local item = spellbook or equipitem
+        ...
+        actions = self:GetPointActions(position, item, true, target)
+    end
+
+    -- 【6】走到这里还没动作 + 是空地或船 → pointspecialactionsfn
+    if (actions == nil or #actions <= 0) and (target == nil or target:HasTag("walkableplatform") or target:HasTag("walkableperipheral")) and ... then
+        actions = self:GetPointSpecialActions(position, useitem, true)
+    end
+
+    return actions or {}
+end
+```
+
+**7 段优先级（从上到下）**：
+
+1. **disable_right_click**
+2. **rightclickoverride**
+3. **驾驶 / 船炮独占**
+4. **容器 widget 特例**（右键自己的箱子）
+5. **cursor 手中物品**（`useitem`）
+6. **hands 装备物品 + target**（含 AOE 特例）
+7. **SCENE 兜底 / walkableperipheral 兜底 / pointspecialactionsfn 兜底**
+
+> **进阶提示**：**右键路由比左键多了 2 个特例：容器 widget 和 AOE**。AOE 特例尤其关键——**当玩家正在用法杖瞄准 AOE 时，所有其它右键动作都被剥离**——只剩 CASTAOE——避免误触。
+
+#### 第三步：DoGetMouseActions 的"左右键去重"
+
+`PlayerActionPicker` 还有最后一个去重处理（第 528-545 行）——避免左右键同时显示同一个动作：
+
+```528:545:scripts/components/playeractionpicker.lua
+	if rmb then
+		if rmb.action == ACTIONS.CLOSESPELLBOOK and rmb.target == rmb.doer then
+			--@V2C: Filtering out local UI actions that we do not really want as explicit actions.
+			--e.g. CLOSESPELLBOOK we can just [Esc] or R.Click anywhere to achieve the same thing,
+			--     so we'd rather not have the player highlighted with an action prompt.
+			--     (NOTE: We still generate these actions so that they block lower priority ones.)
+			rmb = nil
+		elseif lmb and lmb.action == rmb.action then
+			--V2C: Remove duplicate action, unless invobject is different.
+			--     e.g. CHARGE_FROM can be used on self OR on invobject
+			local lmbobj = lmb.invobject ~= lmb.doer and lmb.invobject or nil
+			local rmbobj = rmb.invobject ~= rmb.doer and rmb.invobject or nil
+			if lmbobj == rmbobj then
+				rmb = nil
+			end
+		end
+	end
+```
+
+**两条规则**：
+
+1. **CLOSESPELLBOOK** 不显示——这是个"按 ESC 也能用"的纯 UI 动作，不需要显式提示
+2. **左右键如果是同一个 action + 同一个 invobject** → 右键被清空——避免提示框两边都显示一样的动作
+
+> **新手记忆**：**`(NOTE: We still generate these actions so that they block lower priority ones.)`** ——这条注释非常重要。**Klei 故意保留这些"会被剥离的动作"**——目的是让它们**在 SortActionList 阶段挤掉低优先级的动作**——只是最后一步显示时去掉。**这是"用占位竞争来阻挡其它动作"的设计巧思**。
+
+---
+
+### 7.6.7 老手进阶：override 三件套——`leftclickoverride` / `rightclickoverride` / `pointspecialactionsfn`
+
+第 4 层覆盖现在该上场了。`PlayerActionPicker` 暴露 4 个可选回调：
+
+```lua
+self.leftclickoverride = nil       -- 左键完全覆盖
+self.rightclickoverride = nil      -- 右键完全覆盖
+self.pointspecialactionsfn = nil   -- 空地特殊动作
+self.doubleclickactionsfn = nil    -- 双击动作（不在本节范围）
+```
+
+**这是给"角色变身 / 形态切换"准备的特殊路径**——本节我们以 Woodie 的海狸/驼鹿/猴子 三种变身为案例。
+
+#### 第一步：override 怎么参与判断？
+
+回到 `GetLeftClickActions` 的开头：
+
+```278:285:scripts/components/playeractionpicker.lua
+function PlayerActionPicker:GetLeftClickActions(position, target)
+    if self.leftclickoverride ~= nil then
+        local actions, usedefault = self.leftclickoverride(self.inst, target, position)
+        if not usedefault or (actions ~= nil and #actions > 0) then
+            return actions or {}
+        end
+    end
+    ...
+end
+```
+
+**逻辑**：
+
+1. 如果设了 `leftclickoverride` → 调它，返回 `actions, usedefault` 两个值
+2. **如果 `usedefault == true` 且 `actions` 为空** → **继续走默认流程**
+3. **否则** → **直接返回 override 的结果**（哪怕是空 `{}`）
+
+**返回值的 4 种语义**：
+
+| 返回                           | 行为                            |
+| ------------------------------ | ------------------------------- |
+| `return nil`                   | actions=nil, usedefault=nil → 直接返回 `{}`，**完全屏蔽左键**！ |
+| `return {}`                    | actions={}, usedefault=nil → 直接返回 `{}`，**完全屏蔽左键** |
+| `return { ACTIONS.X }`         | 直接用我返回的，**忽略默认**     |
+| `return nil, true`             | 让默认流程接管                  |
+| `return { ACTIONS.X }, true`   | **追加在前**（实际行为见下面陷阱） |
+
+**这是 override 的最大坑**——`return nil` 和 `return nil, true` 行为完全相反——前者锁死、后者放行。
+
+#### 第二步：实战 Woodie BeaverLeftClickPicker
+
+变成海狸时，左键的动作完全不一样——海狸是个动物，不能用工具：
+
+```213:232:scripts/prefabs/woodie.lua
+local function BeaverLeftClickPicker(inst, target)
+    if target ~= nil and target ~= inst then
+        if inst.replica.combat:CanTarget(target) then
+            return (not target:HasTag("player") or inst.components.playercontroller:IsControlPressed(CONTROL_FORCE_ATTACK))
+                and inst.components.playeractionpicker:SortActionList({ ACTIONS.ATTACK }, target, nil)
+                or nil
+        end
+        if target:HasTag("LunarBuildup") then
+            return inst.components.playeractionpicker:SortActionList({ ACTIONS.REMOVELUNARBUILDUP }, target, nil)
+        end
+        local actions = BeaverGetLMBActions(inst, target)
+        if actions then
+            return actions
+        end
+
+        if target:HasTag("walkingplank") and target:HasTag("interactable") and target:HasTag("plank_extended") then
+            return inst.components.playeractionpicker:SortActionList({ ACTIONS.MOUNT_PLANK }, target, nil)
+        end
+    end
+end
+```
+
+**这就是一段"老手代码"**——**所有逻辑都返回 BufferedAction 数组（已经 SortActionList 过）**——而不是返回 Action + usedefault。
+
+注意：
+
+- 第 218 行 `or nil` —— 不能攻击就返回 nil（**完全屏蔽左键**——海狸点了一个 player，又没按 FORCE_ATTACK，**什么都不会发生**）
+- 第 232 行函数末尾**没显式 return** ——Lua 默认返回 nil——同样**完全屏蔽左键**
+
+**Woodie 的 override 用 nil 来"主动屏蔽"——这是设计上的有意为之**——海狸点空地就是没动作，不该走默认流程把斧头收起来或别的什么。
+
+#### 第三步：BeaverRightClickPicker 同理
+
+```234:261:scripts/prefabs/woodie.lua
+local function BeaverRightClickPicker(inst, target, pos)
+    if target ~= nil and target ~= inst then
+        local actions = (   inst:HasTag("on_walkable_plank") and
+            target:HasTag("walkingplank") and
+            inst.components.playeractionpicker:SortActionList({ ACTIONS.ABANDON_SHIP }, target, nil)
+        ) or
+        (   target:HasTag("HAMMER_workable") and
+            inst.components.playeractionpicker:SortActionList({ ACTIONS.HAMMER }, target, nil)
+        ) or
+        (   target:HasTag("DIG_workable") and
+            target:HasTag("sign") and
+            inst.components.playeractionpicker:SortActionList({ ACTIONS.DIG }, target, nil)
+        ) or nil
+        if actions then
+            return actions
+        end
+        if target:HasTag("LunarBuildup") then
+            actions = BeaverGetLMBActions(inst, target)
+            if actions then
+                return actions
+            end
+        end
+    end
+    return (   not inst.components.playercontroller.isclientcontrollerattached and
+            inst.components.skilltreeupdater:HasSkillTag("beaver_epic") and
+            inst.components.playeractionpicker:SortActionList({ ACTIONS.USE_WEREFORM_SKILL },target or pos, nil)
+        )
+end
+```
+
+注意第 257-260 行——海狸右键空地有可能返回 `USE_WEREFORM_SKILL`（变身专属技能）——这是个**只有海狸形态能触发的右键动作**。
+
+#### 第四步：Woodie 切换形态时 override 的安装与卸载
+
+```370:412:scripts/prefabs/woodie.lua
+            inst.components.playeractionpicker.leftclickoverride = nil
+            inst.components.playeractionpicker.rightclickoverride = nil
+            inst.components.playeractionpicker.pointspecialactionsfn = nil
+        end
+        EnableReticule(inst, false)
+    elseif mode == WEREMODES.BEAVER then
+        inst.ActionStringOverride = BeaverActionString
+        if inst.components.playercontroller ~= nil then
+            inst.components.playercontroller.actionbuttonoverride = BeaverActionButton
+        end
+        if inst.components.playeractionpicker ~= nil then
+            inst.components.playeractionpicker.leftclickoverride = BeaverLeftClickPicker
+            inst.components.playeractionpicker.rightclickoverride = BeaverRightClickPicker
+            inst.components.playeractionpicker.pointspecialactionsfn = BeaverAndGoosePointSpecialActions
+        end
+        EnableReticule(inst, false)
+    elseif mode == WEREMODES.MOOSE then
+        inst.ActionStringOverride = nil
+        if inst.components.playercontroller ~= nil then
+            inst.components.playercontroller.actionbuttonoverride = Empty
+        end
+        if inst.components.playeractionpicker ~= nil then
+            inst.components.playeractionpicker.leftclickoverride = MooseLeftClickPicker
+            inst.components.playeractionpicker.rightclickoverride = MooseRightClickPicker
+            inst.components.playeractionpicker.pointspecialactionsfn = MoosePointSpecialActions
+        end
+        EnableReticule(inst, true)
+```
+
+变身时**直接赋值 / 清零**这 3 个字段——非常简单粗暴。
+
+> **进阶提示**：**override 是字段赋值——不是 push/pop**。**多个 mod 同时给一个 picker 设 leftclickoverride，后面的会覆盖前面的——前面的 mod 的 override 直接消失**——这是 mod 之间的常见冲突来源（参见 7.6.8 陷阱 6）。
+
+#### 第五步：pointspecialactionsfn ——空地的"特殊动作"
+
+`pointspecialactionsfn` 走的是另一条路径——`GetPointSpecialActions`：
+
+```202:211:scripts/components/playeractionpicker.lua
+function PlayerActionPicker:GetPointSpecialActions(pos, useitem, right, usereticulepos)
+	--V2C: usereticulepos is new
+	--     pos2 may be returned (when usereticulepos is true)
+	--     keep support for legacy pointspecialactionsfn, which won't have the pos2 return
+	if self.pointspecialactionsfn then
+		local actions, pos2 = self.pointspecialactionsfn(self.inst, pos, useitem, right, usereticulepos)
+		return self:SortActionList(actions, usereticulepos and pos2 or pos, useitem)
+	end
+	return {}
+end
+```
+
+**`pointspecialactionsfn` 与 leftclickoverride/rightclickoverride 不同——它返回的是 raw Action 数组（不是 BufferedAction），由内部 SortActionList 包装**。
+
+适用场景：**点了空地 + 默认 collector 没产生任何动作时**的兜底——这是最低优先级的兜底。Woodie 的 `BeaverAndGoosePointSpecialActions` 用来给变身角色提供"右键空地放下嘴里咬着的物品"之类的特殊动作。
+
+#### 第六步：override 三件套对照表
+
+| 字段                       | 何时调用                                   | 返回值类型                       | 适用场景                  |
+| -------------------------- | ------------------------------------------ | -------------------------------- | ------------------------- |
+| `leftclickoverride`        | `GetLeftClickActions` 最开头               | `(actions, usedefault)`          | 左键完全替换              |
+| `rightclickoverride`       | `GetRightClickActions` 最开头              | `(actions, usedefault)`          | 右键完全替换              |
+| `pointspecialactionsfn`    | `GetPointSpecialActions`，作为最低兜底     | `(raw_actions[], pos2)` raw 数组 | 点空地的特殊动作          |
+
+---
+
+### 7.6.8 老手进阶：六个常见陷阱与设计经验
+
+到这里冲突解决的全貌已经讲完——下面 6 个陷阱是**真实 mod 开发中最常见的"我的动作怎么不出来"**的根因。
+
+#### 陷阱 1：priority 拍脑袋写 999 / 9999
+
+```lua
+-- ❌ 错误：为了"一定赢"写超大数
+AddAction("MY_AWESOME_ACTION", "我的霸气动作", function(act)
+    return true
+end)
+local act = ACTIONS.MY_AWESOME_ACTION
+act.priority = 9999
+```
+
+**问题**：
+
+- 玩家最强的瞬移技能（`BLINK`，`priority=10`）**也会被你压住**
+- 玩家骑着牛、变身鬼魂时——`paused`(999) 等内部 filter 不会救你（filter 看的是 `_valid` 字段，不是 priority）
+- 但用户体验上是"奇怪的 mod 动作把游戏的瞬移挤掉了"
+
+**正确**：**`HIGH_ACTION_PRIORITY = 10` 已经是天花板**——比它高的应该报警。如果你确实希望**比 BLINK 还高**——**直接用 11**——而不是 9999——并写注释说明你"知道你在做什么"。
+
+```lua
+-- ✅ 正确：明确意图
+local HIGH_ACTION_PRIORITY = 10  -- 来自 actions.lua，引用而不是复制
+act.priority = HIGH_ACTION_PRIORITY  -- 与原版"霸主"同级
+-- 或者
+act.priority = 2  -- 与 ATTACK 同级
+```
+
+#### 陷阱 2：自定义动作没设 priority，被原版动作压住
+
+```lua
+-- 自定义"采矿+捡起"复合动作
+AddAction("MY_MINE_AND_PICKUP", "采矿并捡起", fn)
+-- ↑ 没设 priority，默认 0
+```
+
+如果同时挂在一个有 `inventoryitem` 组件的实体上——`PICKUP` 的 priority=1——**永远 priority 比你高**。**你的动作出不来**。
+
+**正确**：根据动作语义选合适的档位——比如这种"复合采集"应该至少 `priority=1` 与 PICKUP 持平甚至更高。
+
+```lua
+local act = ACTIONS.MY_MINE_AND_PICKUP
+act.priority = 2  -- 比 PICKUP(1) 高一档
+```
+
+> **进阶提示**：`table.sort` **不保证稳定性**——意味着两个相同 priority 的 Action **谁排第一是未定义行为**。**永远不要依赖"我和原版同 priority 但我先 push 进去所以我赢"**——加 1 让自己**严格高于**原版。
+
+#### 陷阱 3：用 actionfilter 屏蔽别的动作，导致连兜底 WALKTO 都被屏蔽
+
+```lua
+-- ❌ 错误：mod 想"暂时禁用所有攻击"
+ThePlayer.components.playeractionpicker:PushActionFilter(function(inst, action)
+    return action ~= ACTIONS.ATTACK
+end, 50)
+```
+
+**问题**：**这个 filter 会被`OnUpdateActionFilterStack` 选为 active**（priority=50 > default=-99）。**它返回 `action ~= ACTIONS.ATTACK`——意思是"除了 ATTACK 都通过"——看起来对**。
+
+**但同时**——它**完全替换**了 `PlayerActionFilter`（默认那个排除 `ghost_exclusive` 的）——意味着：
+
+- 鬼魂专属动作 `HAUNT` 也会被允许（活人也能 HAUNT！）
+- 玩家骑牛时——`mounted` filter（priority=20）被这个 filter 压过去——**变成"骑牛也能用所有动作"**——可能触发 SG 错乱
+
+**正确**：自定义 filter 应该**叠加**而不是替代——保留原 filter 的逻辑：
+
+```lua
+local function MyAttackBlockFilter(inst, action)
+    -- 1. 先模拟 default filter 的逻辑
+    if action.ghost_exclusive then return false end
+    -- 2. 加上自己的限制
+    if action == ACTIONS.ATTACK then return false end
+    return true
+end
+```
+
+或者更稳：**用很低的 priority push**——让原 filter 还在生效：
+
+```lua
+-- ❌ 这并不会"叠加"——只有最高的 filter 生效
+-- ✅ 唯一正确的"叠加"方法是：把原 filter 的逻辑也写到自己里面
+```
+
+> **新手记忆**：**actionfilter 栈是"择优"而不是"叠加"——自定义 filter 必须自己实现完整的过滤逻辑**——否则会把上游 filter "顶掉"。
+
+#### 陷阱 4：自定义 filter 的 priority 没设好，立刻被栈顶踢出
+
+```lua
+-- ❌ 错误
+picker:PushActionFilter(MyFilter, ACTION_FILTER_PRIORITIES.heavylifting)  -- 10
+-- 玩家骑牛时 → mounted(20) > 10，MyFilter 不生效
+```
+
+**正确**：
+
+- 你要"任何状态下都生效" → priority 用 `1000` 以上（但要谨慎，会盖过 paused）
+- 你要"和某个状态绑定" → 与那个状态的 priority 一致或微高
+- 你要"补充式过滤" → 用 `ACTION_FILTER_PRIORITIES.default - 1`（即 -100）——永远在 default 下面，但你又得明白 default 是 -99，你的 -100 永远不会被选中——**结论：根本就不要用低 priority filter**
+
+#### 陷阱 5：在 leftclickoverride 里直接 `return {}` ——锁死了左键
+
+```lua
+-- ❌ 错误：mod 作者本意是"动作集为空时让默认流程接管"
+inst.components.playeractionpicker.leftclickoverride = function(inst, target, pos)
+    if 我的特殊条件 then
+        return { ACTIONS.MY_ACTION }
+    end
+    return {}  -- ← 致命：actions={}, usedefault=nil → 完全屏蔽左键
+end
+```
+
+回看源码：
+
+```lua
+if self.leftclickoverride ~= nil then
+    local actions, usedefault = self.leftclickoverride(self.inst, target, position)
+    if not usedefault or (actions ~= nil and #actions > 0) then
+        return actions or {}
+    end
+end
+```
+
+`return {}` → `actions = {}`, `usedefault = nil` → 进入 `if not usedefault or ...` → `not nil = true` → **返回 `{}` 直接走人——默认流程不执行**。
+
+**正确**：
+
+```lua
+inst.components.playeractionpicker.leftclickoverride = function(inst, target, pos)
+    if 我的特殊条件 then
+        return { ACTIONS.MY_ACTION }
+    end
+    return nil, true  -- ← 显式让默认流程接管
+end
+```
+
+> **进阶提示**：**`return nil, true` 是"放行"的标准写法**——在所有要"让默认流程接管"的分支都这么写——避免边界情况。
+
+#### 陷阱 6：两个 Mod 同时设 leftclickoverride——后装的覆盖前装的
+
+```lua
+-- Mod A 在 master_postinit 里
+inst.components.playeractionpicker.leftclickoverride = ModA_LeftClick
+
+-- Mod B 在 master_postinit 里（晚于 A 加载）
+inst.components.playeractionpicker.leftclickoverride = ModB_LeftClick
+-- ↑ A 的 override 直接消失
+```
+
+这是 mod 之间**最严重的兼容问题**之一——**字段赋值不可叠加**。
+
+**对症下药**——3 种方法：
+
+1. **链式调用**（最稳）：
+
+```lua
+local oldLeftClick = inst.components.playeractionpicker.leftclickoverride
+inst.components.playeractionpicker.leftclickoverride = function(inst, target, pos)
+    -- 我先尝试
+    local actions, usedefault = ModB_LeftClick(inst, target, pos)
+    if actions then return actions, usedefault end
+    -- 不行就让前面的 mod 处理
+    if oldLeftClick then
+        return oldLeftClick(inst, target, pos)
+    end
+    return nil, true  -- 都没有 → 让默认流程接管
+end
+```
+
+2. **用 actionfilter** 而不是 override（如果只是"屏蔽某些动作"的需求——这才是 actionfilter 的本职工作）
+
+3. **专属角色 prefab 而不是全局 hook**（如果你的功能只针对某个新角色）
+
+> **设计经验**：**override 是个"独占资源"——非必须不要用——能用 actionfilter 解决的不要用 override，能用 actioncomponent 解决的不要用 actionfilter**——**优先级越高的工具，对其它 mod 的破坏力越大**。
+
+#### 设计经验三条
+
+**经验 1：分层设计——不同冲突用不同层解决**
+
+| 问题                                   | 推荐工具                              | 不推荐工具                              |
+| -------------------------------------- | ------------------------------------- | --------------------------------------- |
+| "我加了一个新动作，希望它在普通采集时被选" | 注册 ComponentAction + 设合适 priority | actionfilter / override                 |
+| "玩家进入某种状态后某些动作不能用"      | actionfilter（push/pop）              | 改 priority / override                  |
+| "玩家变身后整个动作集都不一样"          | leftclickoverride / rightclickoverride | actionfilter（filter 完整性差）         |
+| "右键这个特殊物品要走完全不同的流程"    | 自定义 collector + 高 priority Action | override（杀鸡用牛刀）                  |
+
+**经验 2：留 priority 余量——避免和原版肉搏**
+
+**最佳实践**：自定义 Action 的 priority **比原版同语义动作高 1 档**——而不是相同——这样不依赖排序稳定性、调试时能直接看到自己的动作。
+
+```lua
+-- 自定义"加强版砍树" 比 CHOP 高一档
+local act = ACTIONS.MY_BETTER_CHOP
+act.priority = 1  -- CHOP 是 0，留 1 档余量
+```
+
+但**别加太多**——加到 5 就破坏整个游戏体感了。**+1 是黄金法则**。
+
+**经验 3：调试动作冲突的 4 步流程**
+
+写完 mod 发现"我的动作没被选中"——按这 4 步排查：
+
+1. **Step 1**：collector 在 `useitem:CollectActions` 里**push 了吗**？
+
+```lua
+-- 在 collector 函数里加 print
+table.insert(actions, ACTIONS.MY_ACTION)
+print("MY_ACTION pushed")
+```
+
+2. **Step 2**：actionfilter 让它通过了吗？
+
+```lua
+-- 临时清空 filter（仅调试）
+ThePlayer.components.playeractionpicker.actionfilter = nil
+-- 看看动作是否冒出来
+```
+
+3. **Step 3**：priority 排序排第几？
+
+```lua
+local picker = ThePlayer.components.playeractionpicker
+local lmb = picker:GetLeftClickActions(target:GetPosition(), target)
+for i, ba in ipairs(lmb) do
+    print(i, ba.action.id, "priority=" .. (ba.action.priority or 0))
+end
+```
+
+4. **Step 4**：是否被 override 屏蔽？
+
+```lua
+print("leftclickoverride:", tostring(ThePlayer.components.playeractionpicker.leftclickoverride))
+print("rightclickoverride:", tostring(ThePlayer.components.playeractionpicker.rightclickoverride))
+```
+
+> **新手记忆**：**冲突调试 = 从下往上排**——先看 push，再看 filter，再看 priority，最后看 override。**90% 的"动作不出来"是 collector 没 push**。
+
+---
+
+### 7.6.9 小结
+
+- **动作冲突解决 = 4 层叠加**：① priority 数值 ② actionfilter 栈 ③ 左/右键路由 ④ override 三件套。**遇到冲突问题先定位"在哪一层"**——再用对应工具解决。
+- **priority 数值标尺**：**HIGH_ACTION_PRIORITY = 10（霸主）→ 6/5（钓鱼瞬间）→ 3（HAMMER/TALKTO）→ 2（ATTACK）→ 1（PICKUP/COOK）→ 0（CHOP/MINE/EAT 默认）→ -3（LOOKAT）→ -4（WALKTO 兜底）**。
+- **`SortActionList` 6 步**：空数组短路 → table.sort(by priority) → actionfilter 过滤 → CASTAOE 距离特殊处理 → BufferedAction 包装（3 种 target 类型分支）→ 返回。
+- **`actionfilter` 栈是"择优生效"不是"叠加生效"** ——`OnUpdateActionFilterStack` 遍历找最高 priority 的 fn——其它沉睡。**6 个 priority 档**：paused(999) > ghost(99) > mounted(20) > floaterheld(15) > heavylifting(10) > default(-99)。
+- **左/右键路由分支**：**手中物品 > 装备物品 > 实体本身**。右键多 2 个特例（容器 widget / AOE）——左右键最后还有"同动作去重"。
+- **override 三件套**：`leftclickoverride` / `rightclickoverride` / `pointspecialactionsfn`——**完全替换默认流程**——返回 `nil, true` 才能让默认流程接管。**Woodie 海狸/驼鹿/猴子** 是经典案例。
+- **6 个常见陷阱**：① priority 写 9999 ② 自定义动作没设 priority ③ actionfilter 替代了上游 ④ filter priority 设错 ⑤ override return {} 锁死 ⑥ mod 之间 override 互相覆盖。
+- **3 条设计经验**：① 分层设计（用对工具） ② priority +1 黄金法则 ③ 4 步调试流程（push → filter → priority → override）。
+
+> **下一节预告**：7.7 节是**整章的实战收尾**——我们把前 6 节学的所有东西**串起来**——一步一步**添加一个完全自定义的新动作**：从 `AddAction` 注册、`AddComponentAction` 声明、`AddStategraphActionHandler` 响应、自定义动画 + StateGraph state、客户端预测、priority 设定、actionfilter 兼容性、错误处理、本地化字符串——**8 步走完整流程**。读完 7.7，你将真正具备**独立设计 + 实现 + 调试**自定义动作的能力。
+
+---
 
 ## 7.7 实战：添加一个完全自定义的新动作
 
