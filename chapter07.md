@@ -7269,4 +7269,858 @@ print("rightclickoverride:", tostring(ThePlayer.components.playeractionpicker.ri
 
 ## 7.7 实战：添加一个完全自定义的新动作
 
-（待编写）
+### 本节导读
+
+前 6 节我们把 Action 系统**拆开来一块块讲**——`ACTIONS` 总表、`COMPONENT_ACTIONS` 声明表、`StateGraph` 响应表、`BufferedAction` 运行时、`PlayerController` 输入入口、优先级与冲突解决。**每一块都很清楚**，但放到一起能不能跑——这是新手最大的疑问，也是老手在写联机 mod 时**最容易翻车的地方**。
+
+这一节我们**把所有模块拼起来**——从零开始**实现一个完整的自定义动作 `PET`（抚摸友好动物）**：右键一只猪人/兔子/牛，玩家走过去，蹲下，抚摸 1 秒，目标会"哼哼"一声并掉一根毛。**整条链路涉及**：`AddAction` 注册、自定义组件 + `AddComponentAction` 声明、`AddStategraphActionHandler` 响应、`STRINGS.ACTIONS` 本地化、`priority` 与 `actionfilter` 兼容性、客户端预测（`wilson_client` + `actionreplica`）、自定义 SG state（高阶可选）、控制台调试。
+
+> **新手**从 7.7.1-7.7.4 起步——把"实战目标"和"六件套"看清楚，再跟着 1、2、3 步把最小可运行版本搭起来；**进阶读者**继续看 7.7.5-7.7.7，把客户端预测、自定义 SG state、本地化与冲突解决补齐；**老手**跳到 7.7.8-7.7.9，看完整 `modmain.lua` 整合、调试流程，以及 6 个典型陷阱与设计经验。
+
+---
+
+### 7.7.1 快速入门：实战目标 —— 我们要做的"PET"动作长什么样
+
+#### 第一步：先描述清楚最终效果
+
+我们要实现这样一个**自定义动作**：
+
+> **PET（抚摸）**：玩家右键点击一只**有 `petable` 组件的友好动物**——
+> - 玩家走到动物身边（距离 ≤ 1.5）
+> - 进入"长动作"动画 1 秒
+> - 动作完成时，**动物 PushEvent("petted")**、并掉一个 prefab（猪人 → `pigskin`、兔子 → `manrabbit_tail`、牛 → `beefalowool`）
+> - 同一个动物 30 秒内不能重复抚摸（冷却）
+
+**为什么选"抚摸"做范例？**
+
+| 维度 | 设计意图 |
+| --- | --- |
+| **有 doer + target** | 完整覆盖 `BufferedAction` 的核心字段——比"按按钮"那种点位置动作更通用 |
+| **目标有组件** | 必须用 `AddComponentAction("SCENE", ...)`——讲清"组件如何声明动作" |
+| **要走近** | 用上 `Action.distance`——讲清动作距离参数 |
+| **绑右键** | 必须考虑**与 ATTACK/INSPECT 的冲突**——讲清 `priority` 和 `actionfilter` |
+| **动画 1 秒** | 用现成的 `dolongaction` 状态——新手不写自定义 SG 也能跑通 |
+| **要联机** | 涉及 `actionreplica` + `wilson_client`——讲清客户端预测 |
+| **目标可冷却** | 自然引入"动作合法性二次校验"和 `validfn` |
+
+#### 第二步：先看一眼"做完之后玩家在游戏里的体验"
+
+游戏里**右键一只猪人**：
+
+```
+[1] 鼠标移到猪人身上 → 右下角动作图标显示 "Pet"
+[2] 右键点击 → 玩家自动走过去
+[3] 到达后蹲下，播放 "build_pre / build_loop" 动画 1 秒
+[4] 动作结束 → 猪人头顶冒一团爱心粒子，掉 1 根 pigskin
+[5] 玩家恢复 idle，30 秒内右键这只猪人就只剩 INSPECT 选项
+```
+
+控制台验证：
+
+```lua
+print(ThePlayer.bufferedaction)
+-- BufferedAction PET - pigman[110234]
+```
+
+#### 第三步：本节会**真正动手写**的文件清单
+
+按照 7.1~7.6 介绍的"动作六件套"，我们要新建/修改这些文件：
+
+```
+mymod/
+├── modmain.lua                       -- 入口：AddAction / AddComponentAction / AddStategraphActionHandler / 字符串 / priority
+├── modinfo.lua                       -- 略，常规 mod 头
+├── scripts/
+│   ├── components/
+│   │   ├── petable.lua               -- 服务端组件：冷却 + 动作执行
+│   │   └── petable_replica.lua       -- 客户端 replica：让客户端能在 collector 里读 cooldown
+│   └── stategraphs/
+│       └── (可选) SGactions_pet.lua  -- 自定义 state（7.7.6 进阶才用）
+└── strings.lua                       -- (可选) 本地化字符串
+```
+
+> **核心结论**：自定义动作 = **1 个 Action 注册 + 1 个 Component + 1 个 ComponentAction collector + 1 个 ActionHandler + 1 行 STRINGS**。能写出这五样，最简版就跑通了——其余的（自定义 SG、客户端预测细节、override）都是**优化**，不是必需。
+
+---
+
+### 7.7.2 快速入门：自定义动作"六件套"清单
+
+> **本小节是后面 7.7.3 ~ 7.7.7 的"地图"**——先把每一步的**为什么**讲透，写代码就不会迷路。
+
+| 步骤 | 工具 | 解决什么问题 | 哪一节讲过 |
+| --- | --- | --- | --- |
+| ① 注册 Action | `AddAction(id, str, fn)` | 在 `ACTIONS` 表里塞进新条目；填入 `fn` 决定执行时调什么 | 7.1 |
+| ② 让目标"声明"自己支持这个动作 | `AddComponentAction("SCENE", "petable", collector)` | 当玩家**靠近/右键**目标时，PlayerActionPicker 会调 collector，决定要不要 `push ACTIONS.PET` | 7.2 |
+| ③ 让 SG 接住这个动作 | `AddStategraphActionHandler("wilson", ActionHandler(ACTIONS.PET, "dolongaction"))` | `BufferedAction:Do()` 触发后，玩家 SG 应该切到哪个 state 来播动画 | 7.3 |
+| ④ 客户端预测 | `AddStategraphActionHandler("wilson_client", ...)` + replica | 联机模式下，**客户端先动**，再让服务端校验 | 7.5 |
+| ⑤ 字符串本地化 | `STRINGS.ACTIONS.PET = "Pet"` | 鼠标悬停时显示什么；多语言时按子键 | 7.1.8 陷阱 5 |
+| ⑥ 优先级 / 冲突 | `Action.priority` + 必要时 `actionfilter` | 比如玩家手里拿斧头，我们要确保**右键友好猪人**还是 PET 而不是 ATTACK | 7.6 |
+
+> **三档读者的分工**：
+> - **新手**：写 ① ② ③ ⑤——能跑就行（约 60 行代码）
+> - **进阶**：补 ④ ⑥——上联机服务器不报错（再加约 80 行）
+> - **老手**：写自定义 SG state（动画/音效/timeline 自定义）+ 调试流程 + 反陷阱（再加约 100 行）
+
+---
+
+### 7.7.3 快速入门：步骤 1 + 2 —— `AddAction` 注册 + `petable` 组件 + `AddComponentAction`
+
+#### 第一步：在 `modmain.lua` 顶部声明 `AddAction`
+
+打开你的 mod 项目，新建/编辑 `modmain.lua`，加入：
+
+```lua
+-- 把全局符号引到 mod 沙盒环境
+local Action = GLOBAL.Action
+local ACTIONS = GLOBAL.ACTIONS
+local STRINGS = GLOBAL.STRINGS
+local ActionHandler = GLOBAL.ActionHandler
+
+-- 步骤 ①：注册 PET 动作
+AddAction("PET", "Pet", function(act)
+    if act.target ~= nil and act.target.components.petable ~= nil then
+        return act.target.components.petable:Pet(act.doer)
+    end
+end)
+
+-- 配置距离（必须靠近 1.5 格才能抚摸）
+ACTIONS.PET.distance = 1.5
+ACTIONS.PET.priority = 1            -- 见 7.7.7 节解释为什么是 1
+-- ACTIONS.PET.mount_valid = false  -- 默认就是 false，骑着牛不能抚摸别的
+```
+
+**关键点逐条对应 7.1 节**：
+
+- `AddAction(id, str, fn)` 是 7.1.7 节讲的"简洁模式"——内部 `Action()` 实例只有默认配置，注册完后再追加 `distance` 和 `priority`。
+- `act.target.components.petable:Pet(...)` 这一行是 7.1.6 讲的 **`fn` 必填回调**——它就是动作的"执行入口"，**不要在 fn 里写具体业务**（"减冷却时间"、"掉毛"那是组件的事）。
+- 等价的**完整模式**写法（如果你需要 `strfn`/`canforce` 等更多回调，用这种）：
+
+```lua
+local PET = Action({ distance = 1.5, priority = 1 })
+PET.id  = "PET"
+PET.str = "Pet"
+PET.fn  = function(act) ... end
+AddAction(PET)
+```
+
+> **STRINGS.ACTIONS.PET 是被 `AddAction` 自动写入的**。看 7.1 节的 `AddAction` 源码：
+
+```473:475:scripts/modutil.lua
+		STRINGS.ACTIONS[action.id] = action.str
+
+		return ACTIONS[action.id]
+```
+
+> 所以你**不需要**手动 `STRINGS.ACTIONS.PET = ...`，除非你要做多语言子键（见 7.7.7）。
+
+#### 第二步：写 `scripts/components/petable.lua`
+
+```lua
+-- mymod/scripts/components/petable.lua
+local Petable = Class(function(self, inst)
+    self.inst = inst
+    self.cooldown = 30
+    self._next_pet_time = 0
+    self.onpetfn = nil          -- (inst, doer) -> bool/物品名
+end)
+
+function Petable:CanBePettedBy(doer)
+    if GetTime() < self._next_pet_time then
+        return false, "ON_COOLDOWN"
+    end
+    -- 守护性检查（7.4.5 IsValid 之外的二次校验）
+    if self.inst.components.health and self.inst.components.health:IsDead() then
+        return false
+    end
+    return true
+end
+
+function Petable:Pet(doer)
+    local ok, reason = self:CanBePettedBy(doer)
+    if not ok then
+        return false, reason
+    end
+    self._next_pet_time = GetTime() + self.cooldown
+    if self.onpetfn ~= nil then
+        self.onpetfn(self.inst, doer)
+    end
+    self.inst:PushEvent("petted", { doer = doer })
+    return true
+end
+
+function Petable:OnSave()
+    return { next_pet_time = self._next_pet_time }
+end
+
+function Petable:OnLoad(data)
+    if data and data.next_pet_time then
+        self._next_pet_time = data.next_pet_time
+    end
+end
+
+return Petable
+```
+
+> **业务逻辑全部留在组件里**——`Pet` 函数只对外暴露 `(成功 boolean, 失败原因 string)` 两个返回值。**这是 7.1.8 陷阱 4 的"返回值规范"在实战中的体现**：和 `ACTIONS.PET.fn` 的签名一致，能让 `STRINGS.ACTIONS.PET.ON_COOLDOWN` 类失败提示自动显示。
+
+#### 第三步：用 `AddComponentAction` 声明"动作来自这个组件"
+
+继续在 `modmain.lua` 里加：
+
+```lua
+-- 让组件文件被 mod 加载
+modimport("scripts/components/petable.lua")  -- 实际推荐用下面这种方式
+-- (或) PrefabFiles 里隐式加载，参考 7.7.8 整合
+
+-- 步骤 ②：声明"凡是带 petable 组件的实体，玩家在 SCENE 中右键它，就给个 PET 选项"
+AddComponentAction("SCENE", "petable", function(inst, doer, actions, right)
+    if right and not inst:HasTag("playerghost") then
+        if inst.replica.petable ~= nil and inst.replica.petable:CanBePettedBy(doer) then
+            table.insert(actions, ACTIONS.PET)
+        end
+    end
+end)
+```
+
+**几条关键说明**（每条都和 7.2 节对应）：
+
+- **第一个参数 `"SCENE"`**：因为目标是**世界里站着的实体**（猪人、兔子、牛），不是物品栏里的物品（那种用 `"INVENTORY"`），也不是手持装备（那种用 `"EQUIPPED"`）。6 种 ActionType 见 7.2.3。
+- **第二个参数 `"petable"`**：组件名，**必须小写** —— 7.2.8 陷阱 2 那个老坑。
+- **第三个参数 collector 的签名**：`function(inst, doer, actions, right)`——`SCENE` 类型的签名见 7.2.4 第一步。
+- **`right` 判断**：只在右键菜单里显示——左键留给 ATTACK/WALKTO（见 7.6.6）。
+- **用 `inst.replica.petable:CanBePettedBy(doer)`** 而不是 `inst.components.petable`：**因为 collector 在客户端也会跑**！7.2.8 陷阱 5 的经典翻车场景——客户端没有 `components.petable`，只有 `replica.petable`。下一节 7.7.5 会专门处理这个。
+
+> **新手 MVP 检查点**：到这里，**最小可运行版本**已经接近完成。还差**第三步——让玩家 SG 接住 ACTIONS.PET**，否则玩家走到目标前就卡住不动了（动画播不起来、`fn` 也不会被调用）。
+
+---
+
+### 7.7.4 快速入门：步骤 3 —— `AddStategraphActionHandler` 接住动作
+
+#### 第一步：注册到玩家 SG
+
+继续在 `modmain.lua` 加：
+
+```lua
+-- 步骤 ③：玩家 SG 收到 ACTIONS.PET 时，进入 dolongaction 状态
+AddStategraphActionHandler("wilson", ActionHandler(ACTIONS.PET, "dolongaction"))
+```
+
+**为什么是 `"dolongaction"`？**
+
+直接抄前一节 6 中已经讲过的"通用长动作"状态——**它在 `SGwilson.lua` 里现成存在**：
+
+```8216:8283:scripts/stategraphs/SGwilson.lua
+    State{
+        name = "dolongaction",
+		tags = { "doing", "busy", "nodangle", "keep_pocket_rummage" },
+
+        onenter = function(inst, timeout)
+            if timeout == nil then
+                timeout = 1
+            elseif timeout > 1 then
+                inst.sg:AddStateTag("slowaction")
+            end
+            inst.sg:SetTimeout(timeout)
+            inst.components.locomotor:Stop()
+            inst.SoundEmitter:PlaySound("dontstarve/wilson/make_trap", "make")
+            inst.AnimState:PlayAnimation("build_pre")
+            inst.AnimState:PushAnimation("build_loop", true)
+            ...
+        end,
+
+        ontimeout = function(inst)
+            inst.SoundEmitter:KillSound("make")
+            inst.AnimState:PlayAnimation("build_pst")
+            ...
+            inst:PerformBufferedAction()
+        end,
+        ...
+    },
+```
+
+> **关键观察**：`dolongaction` 在 `ontimeout` 里调 `inst:PerformBufferedAction()`——也就是 7.4.5 节讲的"中点"。**这就是动作的"接触帧"**——你的 `ACTIONS.PET.fn` 在这里被调用。
+
+**完全等价、但带运行时分支的写法**：
+
+```lua
+-- 高阶用法：根据 doer/target 动态选择 state
+AddStategraphActionHandler("wilson", ActionHandler(ACTIONS.PET, function(inst, action)
+    if action.target and action.target:HasTag("largecreature") then
+        return "dolongaction_slow"  -- 假设你为大型动物准备了慢动作版本
+    end
+    return "dolongaction"
+end))
+```
+
+> 这种**函数式 deststate** 在 7.3.2 第二步讲过，多见于"一个 Action 复用多个 state"的场景。
+
+#### 第二步：在游戏里测一下（不带客户端预测）
+
+如果你**只在主机端**或**单机**测，写到这里就能跑了。但**联机服务器**会出现两个症状——
+
+> **症状 1**：客户端右键时**根本不显示 PET 选项**——因为 `inst.replica.petable` 是 `nil`！  
+> **症状 2**：客户端预测层卡住——`bufferedaction` 在客户端 push 后没有对应的 SG state。
+
+这两个问题分别在 7.7.5 和 7.7.6 解决。
+
+#### 第三步：用控制台亲眼看一遍"链路打通"
+
+在主机端控制台，先**刷一只猪人**：`c_spawn("pigman")`。靠近站着，按 `~` 打开控制台：
+
+```lua
+-- 给它装上 petable
+local ent = c_select()
+ent:AddComponent("petable")
+
+-- 再次右键它，UI 应该出现 "Pet"
+-- 抚摸它一次
+print(ThePlayer.bufferedaction)
+-- => BufferedAction PET - pigman[xxx]
+
+-- 30 秒内再右键它
+-- => UI 中 "Pet" 消失（因为 collector 里 CanBePettedBy 返回 false）
+```
+
+> **新手到这里，已经独立完成了一个完整自定义动作**——包括"为目标贴组件"、"声明动作"、"接住动作"。下面进阶部分把"联机服务器"和"自定义动画"两个进阶能力补齐。
+
+---
+
+### 7.7.5 进阶：步骤 4 —— 客户端预测：`wilson_client` + `actionreplica`
+
+#### 第一步：先理解联机的"两个 PlayerController"
+
+7.5.6 讲过：联机里**客户端的 PlayerController 也会执行一遍动作流程**——这叫"客户端预测"。它的目的是**让玩家看到"按下右键 → 角色立刻动起来"**，而不是等服务端往返一次再动（典型 200ms 延迟）。
+
+客户端预测的"模拟版 SG"是 `wilson_client`：
+
+```lua
+AddStategraphActionHandler("wilson_client", ActionHandler(ACTIONS.PET, "dolongaction"))
+```
+
+**注意**：`wilson_client` 里的 `dolongaction` **是另一个 state**——位置在 `scripts/stategraphs/SGwilson_client.lua:3133`。它**不会调** `PerformBufferedAction`（客户端动作是预测，最终执行在服务端），但会**播动画**让玩家看到反馈。
+
+#### 第二步：写 `petable_replica`，让客户端 collector 能查冷却
+
+7.7.3 的 collector 里我们写了 `inst.replica.petable:CanBePettedBy(doer)`。但 `replica.petable` 哪来的？**自己写**。
+
+```lua
+-- mymod/scripts/components/petable_replica.lua
+local PetableReplica = Class(function(self, inst)
+    self.inst = inst
+    self._cooldown_until = net_float(inst.GUID, "petable._cooldown_until")
+end)
+
+function PetableReplica:SetCooldownUntil(t)
+    if TheWorld.ismastersim then
+        self._cooldown_until:set(t)
+    end
+end
+
+function PetableReplica:CanBePettedBy(doer)
+    return GetTime() >= (self._cooldown_until:value() or 0)
+end
+
+return PetableReplica
+```
+
+然后**让组件本体在 `_next_pet_time` 变化时同步给 replica**——回到 `petable.lua` 的 `Pet` 函数末尾加：
+
+```lua
+function Petable:Pet(doer)
+    -- ... 前略
+    self._next_pet_time = GetTime() + self.cooldown
+    if self.inst.replica.petable then
+        self.inst.replica.petable:SetCooldownUntil(self._next_pet_time)
+    end
+    -- ... 后略
+end
+```
+
+最后在 `modmain.lua` 注册 replica 类：
+
+```lua
+AddReplicableComponent("petable")
+```
+
+> **效果**：客户端连进服务器后，`inst.replica.petable._cooldown_until` 是个真实**网络变量**，集体读到一致的冷却时间。**collector 里的判断从此在主机/客户端两侧得出相同结论**——避免出现"主机看到 Pet 选项、客户端看不到"或反过来。
+
+#### 第三步：用 `c_select():HasReplicaComponent("petable")` 验证
+
+控制台：
+
+```lua
+c_select():HasReplicaComponent("petable")  -- 期望 true
+c_select().replica.petable:CanBePettedBy(ThePlayer)  -- 期望随冷却动态变化
+```
+
+> **如果第一行返回 false**，99% 是 `AddReplicableComponent("petable")` 没注册，或者注册时机晚于 prefab 创建——见 7.7.9 陷阱 3。
+
+#### 第四步：确认服务端会调你的 `fn`
+
+在 `petable.lua` 的 `Pet` 第一行加 `print("PET:", doer, "->", self.inst)` 调试一次。控制台 `c_spawn("pigman"); c_select():AddComponent("petable")`，然后在游戏里右键。**主机控制台应该打印一次**。
+
+> 没打印 = `dolongaction.ontimeout` 没被触发 = SG 没接到动作。回头检查 7.7.4 的 `AddStategraphActionHandler("wilson", ...)` 是否拼写正确。
+
+---
+
+### 7.7.6 进阶：步骤 5 —— 自定义 SG state（动画 + TimeEvent）
+
+> 这一节**完全可选**——如果你满意 `dolongaction` 那套"叮叮当当造东西"的动画+音效，跳过；如果你要用**专属抚摸动画**或者**特殊 timeline 命中点**，看下去。
+
+#### 第一步：自定义 state 的最小骨架
+
+回顾 7.3.4，State 由 5 个核心字段组成。我们仿写一个 `pet_action`：
+
+```lua
+-- mymod/scripts/stategraphs/SGactions_pet.lua
+local FRAMES = GLOBAL.FRAMES
+local TimeEvent = GLOBAL.TimeEvent
+local State = GLOBAL.State
+
+local states = {
+    State{
+        name = "pet_action",
+        tags = { "doing", "busy", "nodangle" },
+
+        onenter = function(inst)
+            inst.components.locomotor:Stop()
+            inst.AnimState:PlayAnimation("research_pre")
+            inst.AnimState:PushAnimation("research_loop", false)
+            inst.AnimState:PushAnimation("research_pst", false)
+            inst.SoundEmitter:PlaySound("dontstarve/characters/willow/lighter")
+        end,
+
+        timeline = {
+            -- 第 30 帧（约 1 秒）触发"接触"——执行动作
+            TimeEvent(30 * FRAMES, function(inst)
+                inst:PerformBufferedAction()
+            end),
+            TimeEvent(40 * FRAMES, function(inst)
+                inst.sg:RemoveStateTag("busy")
+            end),
+        },
+
+        events = {
+            EventHandler("animqueueover", function(inst)
+                if inst.AnimState:AnimDone() then
+                    inst.sg:GoToState("idle")
+                end
+            end),
+        },
+
+        onexit = function(inst)
+            -- 守护：如果用户中途取消，确保清理预读 BufferedAction
+            if inst.bufferedaction == inst.sg.statemem.action then
+                inst:ClearBufferedAction()
+            end
+        end,
+    },
+}
+
+return states
+```
+
+**对照 7.3 节**：
+- `tags = { "doing", "busy" }` 让玩家无法在动作中再走、再点别的——这是 7.3.6 讲的 StateTag。
+- `TimeEvent(30*FRAMES, ...)` 是 7.3.5 讲的"动画帧 → 业务回调"。**`PerformBufferedAction` 必须放在 timeline**——不能放 `onenter`，否则**还没等动画播玩家就掉毛了**（7.3.8 陷阱 4 同款问题）。
+
+#### 第二步：把 state 注入到 SG
+
+```lua
+-- modmain.lua
+local pet_states = require("stategraphs/SGactions_pet")
+for _, state in ipairs(pet_states) do
+    AddStategraphState("wilson", state)
+    AddStategraphState("wilson_client", state)  -- 客户端也得有，预测才不卡
+end
+
+-- 然后改 Handler 注册：
+AddStategraphActionHandler("wilson",        ActionHandler(ACTIONS.PET, "pet_action"))
+AddStategraphActionHandler("wilson_client", ActionHandler(ACTIONS.PET, "pet_action"))
+```
+
+**配套的"客户端预测版" pet_action 应当移除 `PerformBufferedAction`**（客户端不能真的执行）：
+
+```lua
+-- 客户端版只播动画
+State{
+    name = "pet_action",
+    tags = { "doing", "busy", "nodangle" },
+    onenter = function(inst)
+        inst.components.locomotor:Stop()
+        inst.AnimState:PlayAnimation("research_pre")
+        inst.AnimState:PushAnimation("research_loop", false)
+    end,
+    -- 注意：客户端版没有 PerformBufferedAction，
+    -- 等服务端的 SetBufferedAction nil 通知后，会被 idle 顶掉
+    events = {
+        EventHandler("idle", function(inst)
+            inst.sg:GoToState("idle")
+        end),
+    },
+}
+```
+
+> **这里有个新手永远会犯的错**：客户端 SG 里**也调** `PerformBufferedAction`——结果**动作在客户端被执行了一次、服务端再执行一次**，掉毛掉两份。详见 7.7.9 陷阱 4。
+
+#### 第三步：抚摸动物的"被动反馈"
+
+抚摸是**双向交互**——动物本身也可以播个动画/音效。在 `petable:Pet` 末尾推个事件：
+
+```lua
+self.inst:PushEvent("petted", { doer = doer })
+```
+
+然后给目标 prefab 自己处理：
+
+```lua
+-- mymod/main.lua 或 prefab 的 postinit
+AddPrefabPostInit("pigman", function(inst)
+    inst:ListenForEvent("petted", function(inst, data)
+        inst.AnimState:PlayAnimation("emoteXL_happycheer")
+        inst.AnimState:PushAnimation("idle_loop", true)
+        inst.SoundEmitter:PlaySound("dontstarve/pig/grunt")
+    end)
+end)
+```
+
+> **设计哲学**：**动作只负责把"事件"推下去**，具体的"开心动画"由目标自己监听—— 7.3.5 第五步的"动画驱动业务"在反方向也成立：**业务驱动动画**。
+
+---
+
+### 7.7.7 进阶：步骤 6 —— 字符串本地化 + `priority` / `actionfilter` 处理冲突
+
+#### 第一步：多语言子键
+
+`AddAction("PET", "Pet", fn)` 已经把 `STRINGS.ACTIONS.PET = "Pet"` 自动写好了——但这是**单字符串**。**如果你的动作要根据 target 显示不同文字**，比如：
+
+- 抚摸**猪人**显示 "Pet pigman"
+- 抚摸**兔子**显示 "Cuddle bunny"
+
+这就要换成**子键 + strfn** 模式：
+
+```lua
+ACTIONS.PET.strfn = function(act)
+    if act.target and act.target.prefab == "rabbit" then
+        return "RABBIT"
+    end
+    return "GENERIC"
+end
+
+STRINGS.ACTIONS.PET = {
+    GENERIC = "Pet",
+    RABBIT  = "Cuddle",
+}
+```
+
+`strfn` 的工作机制见 7.1.6 第二步。**核心原理**：`STRINGS.ACTIONS.PET` 此时是个 table，`strfn` 返回的字符串作为 key 取值。**这种结构和 Klei 原生的 `ACTIONS.GIVE`、`ACTIONS.USEITEM` 完全一样**——见 `actions.lua` 中的 GIVE 配置。
+
+> 注意一旦改成 table，**所有想要的子键都得手动写全**——否则 UI 会显示 `MISSING_STR`，对应 7.1.8 陷阱 5。
+
+#### 第二步：`priority` 该怎么定？
+
+7.6.3 的"标尺"—— 我们的 PET：
+
+| 候选 priority | 后果 |
+| --- | --- |
+| `0`（默认） | 与 `INSPECT`(0) 平级——可能被 ATTACK 抢走 |
+| `1` | 比 `WALKTO`(0)、`INSPECT`(0) 高，但低于 ATTACK 的特定路由 |
+| `2` 或 `3` | 已经盖过原版大部分 SCENE 动作，**不必要的高** |
+| `9999` | 7.6.8 陷阱 1 的反面教材 —— **永远不要这么写** |
+
+**推荐用 1**：**右键友好动物时压住 INSPECT，但不会盖过攻击敌对生物**——攻击的优先级在 ATTACK 路由分支里另算（见 7.6.6 第二步）。
+
+#### 第三步：用 actionfilter 做"白名单"——可选
+
+如果你发现"装备斧头右键友好猪人时还是变成 ATTACK"——**不是 priority 问题**，是**右键武器路由**问题（7.6.6 第二步）。**正确解法**：
+
+```lua
+-- 装载到客户端 PlayerActionPicker
+local function pet_filter(picker, target, useitem, actions, right)
+    if right and target and target.replica.petable
+            and target.replica.petable:CanBePettedBy(picker.inst) then
+        -- 友好动物 + 右键 → 强制把 PET 排到 ATTACK 前
+        for i, v in ipairs(actions) do
+            if v.action == ACTIONS.PET then
+                table.remove(actions, i)
+                table.insert(actions, 1, v)
+                break
+            end
+        end
+    end
+    return actions
+end
+
+-- modmain.lua 玩家 spawn 时注入
+AddPlayerPostInit(function(player)
+    if player.components.playeractionpicker ~= nil then
+        player.components.playeractionpicker:PushActionFilter(pet_filter,
+            ACTION_FILTER_PRIORITIES.HIGH)  -- 见 7.6.5 第一步
+    end
+end)
+```
+
+**另一种思路**（更简单但侵入性更大）：直接用 `Action.priority` 配合 `ACTION_FILTER_PRIORITIES`（见 7.6.5 第六步），但**不推荐**——会影响**所有**带斧头的右键场景，副作用范围太大。
+
+> **设计经验**：**优先调 priority，filter 只用于"和已有动作有歧义的窄场景"**——和 7.6.8 设计经验 ① 是同一条。
+
+---
+
+### 7.7.8 老手进阶：完整 `modmain.lua` 整合 + 调试流程
+
+#### 第一步：完整的 `modmain.lua`
+
+把前 5 步整合到一起，**这就是一份可以直接 copy 的最小 mod**：
+
+```lua
+-- =============================================================
+-- mymod/modmain.lua
+-- =============================================================
+local Action               = GLOBAL.Action
+local ACTIONS              = GLOBAL.ACTIONS
+local ActionHandler        = GLOBAL.ActionHandler
+local STRINGS              = GLOBAL.STRINGS
+local TheWorld             = GLOBAL.TheWorld
+local GetTime              = GLOBAL.GetTime
+local TimeEvent            = GLOBAL.TimeEvent
+local FRAMES               = GLOBAL.FRAMES
+local State                = GLOBAL.State
+local ACTION_FILTER_PRIORITIES = GLOBAL.ACTION_FILTER_PRIORITIES
+
+-- 1) 文件清单：让 mod 的脚本进入 mod sandbox
+PrefabFiles = {
+    -- 这里只是占位；实际 prefab 不一定有
+}
+
+-- 2) 注册组件 + replica
+modimport("scripts/components/petable.lua")          -- 也可以放 PrefabFiles 间接加载
+modimport("scripts/components/petable_replica.lua")
+AddReplicableComponent("petable")
+
+-- 3) 注册 PET 动作
+AddAction("PET", "Pet", function(act)
+    if act.target ~= nil and act.target.components.petable ~= nil then
+        return act.target.components.petable:Pet(act.doer)
+    end
+end)
+ACTIONS.PET.distance = 1.5
+ACTIONS.PET.priority = 1
+
+-- 4) 让带 petable 组件的实体在 SCENE 右键里出现 PET
+AddComponentAction("SCENE", "petable", function(inst, doer, actions, right)
+    if right and not inst:HasTag("playerghost") then
+        if inst.replica.petable ~= nil and inst.replica.petable:CanBePettedBy(doer) then
+            table.insert(actions, ACTIONS.PET)
+        end
+    end
+end)
+
+-- 5) SG handler（主机 + 客户端）
+AddStategraphActionHandler("wilson",        ActionHandler(ACTIONS.PET, "dolongaction"))
+AddStategraphActionHandler("wilson_client", ActionHandler(ACTIONS.PET, "dolongaction"))
+
+-- 6) 让"猪人/兔子/牛"自带 petable + 抚摸反应
+local FRIENDLY = { "pigman", "rabbit", "beefalo" }
+for _, prefab in ipairs(FRIENDLY) do
+    AddPrefabPostInit(prefab, function(inst)
+        if TheWorld.ismastersim then
+            if not inst.components.petable then
+                inst:AddComponent("petable")
+                if prefab == "pigman"   then inst.components.petable.onpetfn = function(self, doer) self.components.lootdropper:SpawnLootPrefab("pigskin")        end end
+                if prefab == "rabbit"   then inst.components.petable.onpetfn = function(self, doer) self.components.lootdropper:SpawnLootPrefab("manrabbit_tail") end end
+                if prefab == "beefalo"  then inst.components.petable.onpetfn = function(self, doer) self.components.lootdropper:SpawnLootPrefab("beefalowool")    end end
+            end
+        end
+        inst:ListenForEvent("petted", function(inst, data)
+            if inst.SoundEmitter then
+                inst.SoundEmitter:PlaySound("dontstarve/pig/grunt")
+            end
+        end)
+    end)
+end
+
+-- 7) 字符串（如果想多语言再开 strfn）
+STRINGS.ACTIONS.PET = "Pet"
+
+-- 8) 可选：actionfilter 解决"装斧头右键友好猪人变成 ATTACK"
+local function pet_filter(picker, target, useitem, actions, right)
+    if right and target and target.replica.petable
+            and target.replica.petable:CanBePettedBy(picker.inst) then
+        for i, v in ipairs(actions) do
+            if v.action == ACTIONS.PET then
+                table.remove(actions, i)
+                table.insert(actions, 1, v)
+                break
+            end
+        end
+    end
+    return actions
+end
+AddPlayerPostInit(function(player)
+    if player.components.playeractionpicker ~= nil then
+        player.components.playeractionpicker:PushActionFilter(pet_filter,
+            ACTION_FILTER_PRIORITIES.HIGH)
+    end
+end)
+```
+
+> **大约 90 行**——和 7.7.2 的"约 60 行新手 + 80 行进阶"估计一致。
+
+#### 第二步：4 步调试流程
+
+**步骤 1：动作注册了吗？**
+
+```lua
+print(ACTIONS.PET)        -- => Action: 0xXXXX
+print(ACTIONS.PET.fn)     -- => function: 0xXXXX
+print(ACTIONS.PET.code, ACTIONS.PET.mod_name)  -- => 1, "mymod"
+print(STRINGS.ACTIONS.PET)  -- => "Pet"
+```
+
+如果任何一行出错，**就是 `AddAction` 没跑成功**——大概率是 `modmain.lua` 加载顺序问题（看下面陷阱 6）。
+
+**步骤 2：collector 调用了吗？**
+
+在 `AddComponentAction` 的 collector 第一行加 `print("[PET collector]", inst, right)`，然后在游戏里把鼠标移到目标上。**主机 + 客户端各应该打印一次**。如果只有一边打印，就是 7.2.5 节"actioncomponents 网络同步"问题——**通常是 `AddComponentAction` 没在两端同时跑**。
+
+**步骤 3：BufferedAction push 了吗？**
+
+```lua
+print(ThePlayer.bufferedaction)  -- 右键瞬间应该看到 BufferedAction PET ...
+```
+
+**步骤 4：fn 触发了吗？**
+
+`petable:Pet` 第一行 `print("PET fn called!")` —— 主机控制台应当打印。如果没打印 = SG 没接到动作 = 7.7.9 陷阱 1。
+
+---
+
+### 7.7.9 老手进阶：六个常见陷阱与设计经验
+
+#### 陷阱 1：`AddStategraphActionHandler` 只注册了 `"wilson"`，没注册 `"wilson_client"`
+
+**症状**：联机模式下、客户端右键，**玩家走过去就站着不动**——动作既不开始也不取消。  
+**原因**：客户端预测层 `wilson_client` 收到 `bufferedaction` 但**没有对应的 state 接住**。  
+**修复**：始终成对写：
+
+```lua
+AddStategraphActionHandler("wilson",        ActionHandler(ACTIONS.PET, "dolongaction"))
+AddStategraphActionHandler("wilson_client", ActionHandler(ACTIONS.PET, "dolongaction"))
+```
+
+> 这是 7.5.8 陷阱 4 的实战版。
+
+#### 陷阱 2：collector 里写 `inst.components.petable`
+
+**症状**：本地主机一切正常；上服务器，**客户端不显示 PET 选项**。  
+**原因**：客户端没有 `inst.components`，**只有 `inst.replica`**。  
+**修复**：collector 里**永远只用 `inst.replica.xxx`**。把 `Pet` 业务逻辑（写组件本体）和 `CanBePettedBy` 校验（写 replica）分开。
+
+> 这是 7.2.8 陷阱 5、7.5.8 陷阱 2 的复合表现。
+
+#### 陷阱 3：`AddReplicableComponent("petable")` 漏了 / 在 prefab 注册之后才调
+
+**症状**：`c_select():HasReplicaComponent("petable")` 返回 false。  
+**原因**：replica 注册必须**在 prefab 创建之前**——`AddReplicableComponent` 应该在 `modmain.lua` 顶层（**不要包在 `AddPrefabPostInit` 里**）。  
+**修复**：**写在 modmain.lua 顶层、组件 `modimport` 之后**。
+
+#### 陷阱 4：自定义 SG state 在客户端版也写了 `inst:PerformBufferedAction()`
+
+**症状**：动作被执行两次——掉毛掉两份、冷却被服务端覆盖回 0。  
+**原因**：客户端 SG 是预测层，**只播动画**——执行权归服务端。  
+**修复**：客户端版 state 删除 `inst:PerformBufferedAction()`。
+
+> 这是 7.4.8 陷阱 4、7.7.6 第二步的反面例子。
+
+#### 陷阱 5：collector 里没判断 `right`，导致左键也出 PET
+
+**症状**：玩家**左键**目标 → 走过去抚摸——和 ATTACK/INSPECT 的语义错乱。  
+**原因**：SCENE collector 默认会给左右键都 push。  
+**修复**：
+
+```lua
+AddComponentAction("SCENE", "petable", function(inst, doer, actions, right)
+    if right and ... then
+        table.insert(actions, ACTIONS.PET)
+    end
+end)
+```
+
+如果你**需要左键也支持**，那就额外配 `Action.priority` 让它别和 ATTACK 冲突——见 7.6.6 第一步。
+
+#### 陷阱 6：modmain.lua 加载顺序——`AddPrefabPostInit` 在 `AddAction` 之前
+
+**症状**：`AddPrefabPostInit("pigman", ...)` 里访问 `ACTIONS.PET`——nil 报错。  
+**原因**：mod 加载是**顺序执行**的——`AddPrefabPostInit` **本身**只是注册回调，但回调在 prefab 实例化时跑——这时候 `AddAction` 已经跑过了。**真正的坑**是：你在 `modmain.lua` **顶层**写了 `local PET = ACTIONS.PET`，但此时 `AddAction` 还没跑。  
+**修复**：**用全局符号**（`ACTIONS.PET`）而不是缓存到 local；或者**在 PostInit 回调里再读 `ACTIONS.PET`**。
+
+#### 设计经验三条
+
+**经验 ①：把"业务"和"声明"严格分层**
+
+```
+modmain.lua          → 只做"注册"——AddAction/AddComponentAction/AddStategraphActionHandler
+components/*.lua     → 业务逻辑——冷却、校验、效果、保存
+stategraphs/*.lua    → 表现层——动画、音效、TimeEvent
+strings.lua          → 文案
+```
+
+**好处**：定位 bug 时**一眼知道找哪个文件**。
+
+**经验 ②：从"最小可运行"开始，逐步加复杂度**
+
+新手别一上来就写自定义 SG state + actionfilter + strfn 多语言。**先用 `dolongaction` 跑通 MVP**，再决定哪些地方需要专属化。**90% 的自定义动作，不需要自定义 state**——`dolongaction` / `domediumaction` / `doshortaction` / `give` / `castspell` 5 个原版状态够用了。
+
+**经验 ③：`fn` 永远只做"分派"，不要做"执行"**
+
+```lua
+-- 不好（fn 里塞业务）
+ACTIONS.PET.fn = function(act)
+    act.target._next_pet_time = GetTime() + 30
+    act.target.components.lootdropper:SpawnLootPrefab("pigskin")
+    act.target:PushEvent("petted")
+end
+
+-- 好（fn 转给组件方法）
+ACTIONS.PET.fn = function(act)
+    if act.target.components.petable then
+        return act.target.components.petable:Pet(act.doer)
+    end
+end
+```
+
+**理由**：组件方法是**可重用**的（控制台可以直接 `c_select().components.petable:Pet(ThePlayer)`）；写在 `fn` 里就只能绑死动作触发路径。**和 7.1 节"Action 是决策入口、组件才是执行者"的设计哲学一致**。
+
+---
+
+### 7.7.10 小结
+
+**整章收尾·一句话总结**：**自定义动作 = 动作六件套**——`AddAction` + 组件 + `AddComponentAction` + `AddStategraphActionHandler`(×2) + `STRINGS` + `priority`/`filter`。
+
+**速查表（直接照抄）**
+
+| 第几步 | 1 行落地写法 |
+| --- | --- |
+| ① | `AddAction("PET", "Pet", function(act) return act.target.components.petable:Pet(act.doer) end)` |
+| ② | 写 `petable.lua` + `petable_replica.lua` + `AddReplicableComponent("petable")` |
+| ③ | `AddComponentAction("SCENE", "petable", function(inst, doer, actions, right) if right and inst.replica.petable:CanBePettedBy(doer) then table.insert(actions, ACTIONS.PET) end end)` |
+| ④ | `AddStategraphActionHandler("wilson", ActionHandler(ACTIONS.PET, "dolongaction"))` |
+| ⑤ | 同 ④，把 `"wilson"` 换成 `"wilson_client"` |
+| ⑥ | `STRINGS.ACTIONS.PET = "Pet"`（自动写入，可省略） |
+| ⑦ | `ACTIONS.PET.distance = 1.5; ACTIONS.PET.priority = 1` |
+| ⑧ | `AddPrefabPostInit("pigman", ...)` 注入组件 |
+
+**6 个陷阱排雷顺序**
+
+1. 双 SG handler 漏一边 → 联机客户端卡住
+2. collector 用 `components.xxx` → 客户端不显示
+3. `AddReplicableComponent` 漏写 → replica 为 nil
+4. 客户端 state 调 `PerformBufferedAction` → 双触发
+5. collector 没判 `right` → 左键也触发
+6. local 缓存 `ACTIONS.PET` 时机过早 → nil
+
+**3 条设计经验**
+
+- ① **分层**：modmain 注册 / 组件业务 / SG 表现 / 文案分离
+- ② **MVP 优先**：跑通 90% 复用 `dolongaction`，再考虑自定义 state
+- ③ **fn 只分派、组件做执行**：可重用 + 解耦
