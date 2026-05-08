@@ -4472,9 +4472,1824 @@ TheFocalPoint.SoundEmitter:PlaySound("mymod/music/achievement_stinger")
 
 ## 15.4 角色语音系统（speech + 音效）
 
-（待编写）
+### 本节导读
+
+> **一句话定位**：饥荒里每一句"检查台词"、每一声"哎哟"，都经过两条流水线——**文字流水线（speech 文件 → GetString → talker:Say）** 和 **音效流水线（soundsname / talker_path_override → SoundEmitter → FMOD）**——本节讲清楚这两条流水线，以及 mod 角色怎么接入它们。
+
+#### 一段宏观先讲清楚：角色"说话"的全貌
+
+玩家右键检查一棵草，Wilson 说出 `"A tuft of grass."` ——这句话经过了多少层？
+
+```
+【玩家右键检查目标】
+         │
+         ▼
+  LOOKAT action 被执行（scripts/actions.lua）
+         │  targ.components.inspectable:GetDescription(doer)
+         ▼
+  GetString(viewer, "DESCRIBE", prefab)
+         │  查 STRINGS.CHARACTERS[WILSON].DESCRIBE.GRASS
+         │  → fallback → STRINGS.CHARACTERS.GENERIC.DESCRIBE.GRASS
+         ▼
+  inst.components.talker:Say(desc)
+         │  ① 推送 "ontalk" 事件
+         │  ② 在玩家头顶显示 FollowText 气泡
+         ▼
+  SGwilson 收到 "ontalk" → 进入 "talk" state
+         │  DoTalkSound(inst)
+         │  PlaySound("dontstarve/characters/wilson/talk_LP", "talk")
+         ▼
+  FMOD 播放角色嘴巴咕哝音
+```
+
+**两条流水线**：
+| 流水线 | 关键文件 | 关键函数 | 结果 |
+|---|---|---|---|
+| **文字流水线** | `speech_wilson.lua`、`stringutil.lua` | `GetString` → `talker:Say` | 头顶气泡文字 |
+| **音效流水线** | `SGwilson.lua` | `DoTalkSound` → `SoundEmitter:PlaySound` | 嘴型咕哝声 |
+
+#### 15.4 节回答的 5 个核心问题
+
+```
+Q1: ──── 检查台词 "A tuft of grass." 是怎么取出来的？
+         ↓ 答：GetString(inst, "DESCRIBE", prefab) + STRINGS.CHARACTERS 表
+
+Q2: ──── talker:Say 的参数怎么填？何时触发 ontalk？
+         ↓ 答：talker:Say(str, duration, noanim) —— 内部推 ontalk 事件
+
+Q3: ──── 角色咕哝声音路径是怎么拼的？
+         ↓ 答：(talker_path_override / "dontstarve/characters/") .. soundsname .. "/talk_LP"
+
+Q4: ──── wanda 老年/少年声音为什么不一样？Wormwood 说话末尾有额外音效？
+         ↓ 答：talksoundoverride / endtalksound 覆盖机制
+
+Q5: ──── mod 自定义角色怎么接入这套系统？
+         ↓ 答：speech 文件 + STRINGS.CHARACTERS[上大写prefab] + soundsname / talker_path_override
+```
+
+#### 你将看到的核心源码
+
+| 文件 | 角色 | 用途 |
+|---|---|---|
+| `scripts/components/talker.lua` | 311 行 | **talker 组件全文**——Say / ShutUp / Chatter |
+| `scripts/stringutil.lua` | `GetString` 函数 | 台词查找核心 |
+| `scripts/strings.lua` | 第 15335 行起 | `STRINGS.CHARACTERS` 表挂载点 |
+| `scripts/stategraphs/SGwilson.lua` | 多处 | 音效触发：DoHurtSound / DoTalkSound / StopTalkSound |
+| `scripts/prefabs/wormwood.lua` | 第 779 行 | `endtalksound` 实例 |
+| `scripts/prefabs/wanda.lua` | 第 88/125/155 行 | `talksoundoverride` 动态切换 |
+| `scripts/prefabs/waxwell.lua` | 第 306 行 | `soundsname` 实例 |
+| `scripts/fonts.lua` | 第 12-15 行 | `TALKINGFONT` 系列常量 |
+
+#### 本节学习路径
+
+```
+15.4.1 新手 ─── speech 文件的三层结构 —— DESCRIBE / ACTIONFAIL / ANNOUNCE_
+15.4.2 新手 ─── GetString —— 台词查找的核心函数
+15.4.3 新手 ─── talker:Say —— 3 步让角色开口
+                  ↓
+15.4.4 进阶 ─── 语音音效路径系统 —— soundsname + talker_path_override
+15.4.5 进阶 ─── 三大音效覆盖字段 —— talksoundoverride / hurtsoundoverride / endtalksound
+15.4.6 进阶 ─── talker 样式定制 —— font / fontsize / colour
+                  ↓
+15.4.7 老手 ─── speechproxy —— 借用他人台词的代理机制
+15.4.8 老手 ─── Chatter 系统 —— NPC 专用网络台词
+15.4.9 老手 ─── mod 完整自定义角色语音实战
+15.4.10     ─── 小结·速查表 + 5 行起步代码 + 15.5 预告
+```
+
+---
+
+### 15.4.1（新手）speech 文件的三层结构
+
+#### speech 文件是什么？
+
+每个可玩角色都有一个 `speech_<prefab>.lua`，它是一张**巨大的 Lua 表**，描述"这个角色在各种情况下说什么"。
+
+Wilson 的是 `speech_wilson.lua`（同时也是 GENERIC 模板），Waxwell 的是 `speech_waxwell.lua`，以此类推。
+
+`scripts/strings.lua` 第 15335 行把它们全部挂到 `STRINGS.CHARACTERS`：
+
+```15335:15354:scripts/strings.lua
+STRINGS.CHARACTERS =
+{
+    GENERIC = require "speech_wilson",
+    WAXWELL = require "speech_waxwell",
+    WOLFGANG = require "speech_wolfgang",
+    WX78 = require "speech_wx78",
+    WILLOW = require "speech_willow",
+    WENDY = require "speech_wendy",
+    WOODIE = require "speech_woodie",
+    WICKERBOTTOM = require "speech_wickerbottom",
+    WATHGRITHR = require "speech_wathgrithr",
+    WEBBER = require "speech_webber",
+    WINONA = require "speech_winona",
+    WORTOX = require "speech_wortox",
+    WORMWOOD = require "speech_wormwood",
+    WARLY = require "speech_warly",
+    WURT = require "speech_wurt",
+    WALTER = require "speech_walter",
+    WANDA = require "speech_wanda",
+}
+```
+
+**键名规则**：`string.upper(prefab)`——角色 prefab 是 `"wilson"`，键名就是 `"WILSON"`；但 Wilson 同时也是 `GENERIC`（后备表）。
+
+#### speech 文件的三层顶级结构
+
+打开 `speech_wilson.lua`，顶级键大致分为三类：
+
+```
+speech_wilson.lua
+├── DESCRIBE          ← 【检查台词】右键检查物品/生物/角色时说的话
+│     ├── GRASS       = "A tuft of grass."
+│     ├── SPIDER      = { GENERIC="I hate spiders!", DEAD="One down." }
+│     └── ...（约 1500+ 个物品/状态条目）
+│
+├── ACTIONFAIL        ← 【操作失败台词】执行某操作失败时说的话
+│     ├── BUILD       = { MOUNTED="I can't place that from way up here." }
+│     ├── SHAVE       = { AWAKEBEEFALO="I'm not going to try that..." }
+│     └── ...
+│
+└── ANNOUNCE_xxx      ← 【事件公告台词】特殊事件发生时自动播报
+      ├── ANNOUNCE_COLD       = "So cold!"
+      ├── ANNOUNCE_BEES       = "BEEEEEEEEEEEEES!!!!"
+      ├── ANNOUNCE_BOOMERANG  = "Ow! I should try to catch that!"
+      └── ...（40+ 个触发条件）
+```
+
+以及一些特殊顶级键（不属于上面三类）：
+```
+├── BATTLECRY    ← 发起攻击时喊的话（对应 combat.lua battlecrystring）
+├── COMBAT_QUIT  ← 放弃追击时说的话
+└── DESCRIBE_TOODARK  ← 黑暗中无法检查时的话
+```
+
+#### DESCRIBE 的状态修饰符
+
+DESCRIBE 下的条目可以是**字符串**（只有一句话），也可以是**表**（根据状态有不同的话）：
+
+```lua
+-- 单字符串：任何状态都说这句
+GRASS = "A tuft of grass.",
+
+-- 带状态修饰符的表：
+SPIDER =
+{
+    GENERIC  = "I hate spiders!",  -- 默认/活着时
+    DEAD     = "One down.",         -- 死亡状态
+    SLEEPING = "Shh...",            -- 睡眠状态
+},
+```
+
+状态修饰符由 `inspectable.lua` 的 `GetStatus()` 产生——它依次检查 DEAD / SLEEPING / BURNING / DISEASED / WITHERED / BARREN / PICKED / HELD / OCCUPIED / BURNT 等状态。
+
+#### 字符串表的随机选取
+
+如果条目是**无 key 的数组**，系统会随机取其中一条——这是"同一物品说不同话"的机制：
+
+```lua
+CARROT =
+{
+    "A fine, if somewhat bland, vegetable.",
+    "Mmm. Root vegetables.",
+    "Maybe I should plant some more.",
+}
+```
+
+`stringutil.lua` 的 `getmodifiedstring` 函数负责这一逻辑：
+
+```1:22:scripts/stringutil.lua
+local function getmodifiedstring(topic_tab, modifier)
+	if type(modifier) == "table" then
+		local ret = topic_tab
+		for i,v in ipairs(modifier) do
+			if ret == nil then
+				return nil
+			end
+			ret = ret[v]
+		end
+		return ret
+	elseif modifier ~= nil then
+        local ret = topic_tab[modifier]
+        return (type(ret) == "table" and #ret > 0 and ret[math.random(#ret)])
+                or ret
+                or topic_tab.GENERIC
+                or (#topic_tab > 0 and topic_tab[math.random(#topic_tab)])
+                or nil
+    else
+		return topic_tab.GENERIC
+                or (#topic_tab > 0 and topic_tab[math.random(#topic_tab)])
+                or nil
+	end
+end
+```
+
+**规则**：modifier 对应的子表是数组 → 随机；modifier 查不到 → 降级到 `GENERIC`；`GENERIC` 也没有 → 尝试整个表随机取一条。
+
+#### "only_used_by_xxx" 占位符
+
+某些条目写着 `"only_used_by_woodie"` 或 `"only_used_by_waxwell_and_wicker"` 等字符串——这是**开发者占位注释**，意思是"Wilson 不说这句，但这个 key 必须存在（格式对齐要求）"。游戏代码本身不过滤这类字符串，只是实际上该触发条件只会在特定角色身上出现。
+
+---
+
+### 15.4.2（新手）GetString —— 台词查找的核心函数
+
+#### GetString 的签名
+
+```265:298:scripts/stringutil.lua
+function GetString(inst, stringtype, modifier, nil_missing)
+    local character =
+        type(inst) == "string"
+        and inst
+        or (inst ~= nil and inst.prefab or nil)
+
+
+    if type(inst) ~= "string" and inst.components.talker and inst.components.talker.speechproxy then
+        character = inst.components.talker.speechproxy
+    end
+
+    character = character ~= nil and string.upper(character) or nil
+    stringtype = stringtype ~= nil and string.upper(stringtype) or nil
+	if type(modifier) == "table" then
+		for i,v in ipairs(modifier) do
+			v = string.upper(v)
+		end
+	else
+		modifier = modifier ~= nil and string.upper(modifier) or nil
+	end
+
+    local specialcharacter =
+        type(inst) == "table"
+        and ((inst:HasTag("mime") and "mime") or
+        (inst:HasTag("playerghost") and "ghost"))
+        or character
+
+
+	return GetSpecialCharacterString(specialcharacter)
+        or getcharacterstring(STRINGS.CHARACTERS[character], stringtype, modifier)
+        or getcharacterstring(STRINGS.CHARACTERS.GENERIC, stringtype, modifier)
+		or (not nil_missing and ("UNKNOWN STRING: "..(character or "").." "..(stringtype or "").." "..(modifier or "")))
+		or nil
+end
+```
+
+#### 参数说明
+
+| 参数 | 类型 | 含义 |
+|---|---|---|
+| `inst` | entity 或 string | 说话的角色实例（或直接传 prefab 字符串）|
+| `stringtype` | string | speech 表顶级 key，如 `"DESCRIBE"`、`"ANNOUNCE_COLD"` |
+| `modifier` | string / table / nil | 子 key 修饰符，如 `"DEAD"`、`"GENERIC"`，nil 表示取默认 |
+| `nil_missing` | bool/nil | `true` 表示找不到时返回 nil；默认返回 `"UNKNOWN STRING: ..."` |
+
+#### 查找优先级（3 步降级）
+
+```
+Step 1: 特殊角色字符串
+        ─ 幽灵 → "Ooooh..."（随机拼接）
+        ─ 哑剧(mime) → ""（空字符串）
+        ─ 猴子 → 猴语拼接
+        ─ 骸骨(wilton) → 随机名言
+        ↓ 找不到 or 不适用
+Step 2: STRINGS.CHARACTERS[string.upper(inst.prefab)]
+        ─ 例：STRINGS.CHARACTERS.WOODIE.DESCRIBE.GRASS
+        ↓ 找不到
+Step 3: STRINGS.CHARACTERS.GENERIC（即 speech_wilson.lua）
+        ─ 例：STRINGS.CHARACTERS.GENERIC.DESCRIBE.GRASS
+```
+
+**要点**：GENERIC 是保底，如果角色特有 speech 文件没有某个词条，就用 Wilson 的。
+
+#### 常见调用形式
+
+```lua
+-- 检查台词（inspector 自动调，通常不需要手写）
+local str = GetString(inst, "DESCRIBE", target.prefab)
+
+-- 公告台词（组件 / prefab 主动调）
+inst.components.talker:Say(GetString(inst, "ANNOUNCE_COLD"))
+
+-- 带状态修饰的检查台词
+local str = GetString(inst, "DESCRIBE", "FIREPIT")  -- modifier 是 "GENERIC"
+local str = GetString(inst, "DESCRIBE", "FIREPIT", "DEAD")  -- 不存在状态修饰，实际用法
+
+-- 操作失败台词
+inst.components.talker:Say(GetString(inst, "ACTIONFAIL", {"BUILD", "MOUNTED"}))
+```
+
+> **注意**：`stringtype` 本质就是 speech 表的顶级 key——`"DESCRIBE"`、`"ACTIONFAIL"`、`"ANNOUNCE_COLD"` 都是顶级 key，因此只需要一个参数就能定位到 `ANNOUNCE_COLD` 整条字符串（modifier 传 nil 即可）。
+
+---
+
+### 15.4.3（新手）talker:Say —— 3 步让角色开口
+
+#### talker:Say 的签名
+
+```266:295:scripts/components/talker.lua
+function Talker:Say(script, time, noanim, force, nobroadcast, colour, text_filter_context, original_author_netid, onfinishedlinesfn, sgparam)
+
+    if TheWorld.speechdisabled then return nil end
+    if TheWorld.ismastersim then
+
+        if not force
+            and (self.ignoring ~= nil or
+                (self.inst.components.health ~= nil and self.inst.components.health:IsDead() and self.inst.components.revivablecorpse == nil) or
+                (self.inst.components.sleeper ~= nil and self.inst.components.sleeper:IsAsleep())) then
+            return
+        elseif self.ontalk ~= nil then
+            self.ontalk(self.inst, script)
+        end
+    elseif not force then
+        if self.inst:HasTag("ignoretalking") then
+            return
+        elseif self.inst.components.revivablecorpse == nil then
+            local health = self.inst.replica.health
+            if health ~= nil and health:IsDead() then
+                return
+            end
+        end
+    end
+
+    CancelSay(self)
+    local lines = type(script) == "string" and { Line(script, noanim, time) } or script
+    if lines ~= nil then
+        self.task = self.inst:StartThread(function() sayfn(self, lines, nobroadcast, colour, text_filter_context, original_author_netid, onfinishedlinesfn, sgparam) end)
+    end
+end
+```
+
+#### 常用参数速查
+
+| 参数位置 | 参数名 | 类型 | 默认 | 含义 |
+|---|---|---|---|---|
+| 1 | `script` | string 或 Line[] | — | 台词文字，或 Line 对象数组（多段台词）|
+| 2 | `time` | number / nil | nil → `DEFAULT_TALKER_DURATION`(2.5s) | 每段台词显示时长 |
+| 3 | `noanim` | bool / nil | nil | `true` 时不触发说话动画（头顶只显文字）|
+| 4 | `force` | bool / nil | nil | `true` 时忽略 ignoretalking / 死亡 / 睡眠检查，强制说 |
+| 5 | `nobroadcast` | bool / nil | nil | `true` 时不广播到网络（只本地显示）|
+
+> `time` 受 `TUNING.MAX_TALKER_DURATION = 8.0` 上限限制（`scripts/tuning.lua` 第 91 行）。
+
+#### 3 步最简用法
+
+**第 1 步**：确保 entity 有 `talker` 组件
+
+玩家 entity 在 `player_common.lua` 里已经自动添加；NPC 需要手动添加：
+
+```lua
+inst:AddComponent("talker")
+```
+
+**第 2 步**：在服务端调用 talker:Say
+
+```lua
+-- 最简形式
+inst.components.talker:Say("Hello, world!")
+
+-- 带 GetString 的标准形式
+inst.components.talker:Say(GetString(inst, "ANNOUNCE_COLD"))
+
+-- 带时长
+inst.components.talker:Say("This will stay for 5 seconds.", 5)
+```
+
+**第 3 步**：游戏自动处理后续
+
+1. `talker:Say` 内部调用 `sayfn`（在独立线程里执行）
+2. `sayfn` 推送 `"ontalk"` 事件（携带 `{noanim, duration, sgparam}`）
+3. SGwilson 收到 `ontalk` → 进入 `"talk"` state → 播放咕哝音 + 嘴型动画
+4. `duration` 秒后，`sayfn` 推送 `"donetalking"` 事件
+5. SGwilson 收到 `donetalking` → 回到 `"idle"` state → 停止咕哝音
+
+```2068:2093:scripts/stategraphs/SGwilson.lua
+    EventHandler("ontalk", function(inst, data)
+        if inst:IsActing() and not inst.sg:HasStateTag("talking") and (inst.components.rider == nil or not inst.components.rider:IsRiding()) then
+            if not inst.sg.statemem.doing_idle_for_line then
+                if inst:HasTag("mime") then
+                    inst.sg:GoToState("acting_mime")
+                else
+                    inst.sg:GoToState("acting_talk")
+                end
+            end
+        elseif inst.sg:HasStateTag("idle") and not inst.sg:HasStateTag("notalking") then
+			if data.sgparam and data.sgparam.closeinspect and
+				not (	inst.components.rider:IsRiding() or
+						inst.components.inventory:IsHeavyLifting() or
+						inst:IsChannelCasting()
+					)
+			then
+				inst.sg:GoToState("closeinspect")
+			elseif not inst:HasTag("mime") then
+				inst.sg:GoToState("talk", data.noanim)
+			elseif not inst.components.inventory:IsHeavyLifting() then
+				inst.sg:GoToState("mime")
+			end
+		elseif data.duration ~= nil and not data.noanim then
+			inst.sg.mem.queuetalk_timeout = data.duration + GetTime()
+		end
+    end),
+```
+
+#### 多段台词（Line 数组）
+
+如果想让角色说多段话（每段停顿一下），用 `Line` 对象数组：
+
+```lua
+local lines = {
+    Line("First line.", false, 3),   -- message, noanim, duration
+    Line(nil, false, 1),              -- nil message = 短暂停顿（隐藏气泡）
+    Line("Second line.", false, 3),
+}
+inst.components.talker:Say(lines)
+```
+
+`Line` 构造函数（`talker.lua` 第 5-9 行）：
+
+```5:9:scripts/components/talker.lua
+Line = Class(function(self, message, noanim, duration)
+    self.message = message
+    self.noanim = noanim
+	self.duration = duration
+end)
+```
+
+#### ShutUp —— 强制打断当前台词
+
+```297:307:scripts/components/talker.lua
+function Talker:ShutUp()
+    CancelSay(self)
+
+    if self.chatter ~= nil and TheWorld.ismastersim then
+        self.chatter.strtbl:set("")
+        if self.chatter.task ~= nil then
+            self.chatter.task:Cancel()
+            self.chatter.task = nil
+        end
+    end
+end
+```
+
+`ShutUp()` 无参数，立即终止当前台词并推送 `"donetalking"` 事件。
+
+---
+
+### 15.4.4（进阶）语音音效路径系统 —— soundsname + talker_path_override
+
+#### 音效路径是怎么拼的？
+
+打开 `scripts/stategraphs/SGwilson.lua`，`DoTalkSound` 函数展示了核心逻辑：
+
+```175:183:scripts/stategraphs/SGwilson.lua
+local function DoTalkSound(inst)
+    if inst.talksoundoverride ~= nil then
+        inst.SoundEmitter:PlaySound(inst.talksoundoverride, "talk")
+        return true
+    elseif not inst:HasTag("mime") then
+        inst.SoundEmitter:PlaySound((inst.talker_path_override or "dontstarve/characters/")..(inst.soundsname or inst.prefab).."/talk_LP", "talk")
+        return true
+    end
+end
+```
+
+**路径拼接公式**（无覆盖时）：
+
+```
+音效路径 = (talker_path_override 或 "dontstarve/characters/")
+         .. (soundsname 或 inst.prefab)
+         .. "/<音效key>"
+```
+
+举例：
+- Wilson（无特殊设置）：`"dontstarve/characters/"` + `"wilson"` + `"/talk_LP"` = `"dontstarve/characters/wilson/talk_LP"`
+- Waxwell（`soundsname = "maxwell"`）：`"dontstarve/characters/"` + `"maxwell"` + `"/hurt"` = `"dontstarve/characters/maxwell/hurt"`
+- Webber（`talker_path_override = "dontstarve_DLC001/characters/"`）：`"dontstarve_DLC001/characters/"` + `"webber"` + `"/talk_LP"` = `"dontstarve_DLC001/characters/webber/talk_LP"`
+
+#### soundsname 字段
+
+`inst.soundsname` 是一个**可选字符串**，当角色 prefab 名与 FMOD bank 中的角色目录名不一致时使用。
+
+典型例子：
+
+```306:306:scripts/prefabs/waxwell.lua
+    inst.soundsname = "maxwell"
+```
+
+Waxwell 的 prefab 是 `"waxwell"`，但 FMOD bank 里的目录叫 `"maxwell"`（DLC1 时代的遗留命名）——因此需要 `soundsname = "maxwell"` 修正。
+
+**mod 场景**：若你的 mod 角色没有自定义音效 bank，想借用已有角色的音效：
+
+```lua
+-- 借用 Willow 的声音（在 master_postinit 中）
+inst.soundsname = "willow"
+```
+
+#### talker_path_override 字段
+
+`inst.talker_path_override` 指定音效路径前缀，覆盖默认的 `"dontstarve/characters/"`. 目前 vanilla 中使用这个字段的角色有：
+
+| 角色 | talker_path_override | 原因 |
+|---|---|---|
+| Webber | `"dontstarve_DLC001/characters/"` | DLC1 角色，音效在 DLC1 bank |
+| Wathgrithr | `"dontstarve_DLC001/characters/"` | DLC1 角色，音效在 DLC1 bank |
+| Wanda | `"wanda2/characters/"` | Wanda 有独立 bank |
+| Wonkey | `"monkeyisland/characters/"` | 变身猴王时的特殊 bank |
+
+#### 5 种标准音效 key
+
+`SGwilson.lua` 中对角色的标准音效 key（接在路径后面的部分）总结如下：
+
+| 音效 key | 函数 | 触发时机 | 是否 loop |
+|---|---|---|---|
+| `/talk_LP` | `DoTalkSound` | 说话时循环 | 是（name="talk"）|
+| `/hurt` | `DoHurtSound` | 受伤时 | 否 |
+| `/yawn` | `DoYawnSound` | 疲劳/打哈欠 | 否 |
+| `/death_voice` | SGwilson 死亡 state | 角色死亡 | 否 |
+| `/sinking` | SGwilson 沉船 state | 溺水/沉船 | 否 |
+| `/emote` | `DoEmoteSound` | 表情动作 | 否 |
+
+#### DoHurtSound 和 DoYawnSound
+
+对齐 `DoTalkSound` 的设计，`DoHurtSound` 和 `DoYawnSound` 也有相同的路径拼接逻辑：
+
+```159:173:scripts/stategraphs/SGwilson.lua
+local function DoHurtSound(inst)
+    if inst.hurtsoundoverride ~= nil then
+        inst.SoundEmitter:PlaySound(inst.hurtsoundoverride, nil, inst.hurtsoundvolume)
+    elseif not inst:HasTag("mime") then
+        inst.SoundEmitter:PlaySound((inst.talker_path_override or "dontstarve/characters/")..(inst.soundsname or inst.prefab).."/hurt", nil, inst.hurtsoundvolume)
+    end
+end
+
+local function DoYawnSound(inst)
+    if inst.yawnsoundoverride ~= nil then
+        inst.SoundEmitter:PlaySound(inst.yawnsoundoverride)
+    elseif not inst:HasTag("mime") then
+        inst.SoundEmitter:PlaySound((inst.talker_path_override or "dontstarve/characters/")..(inst.soundsname or inst.prefab).."/yawn")
+    end
+end
+```
+
+注意 `DoHurtSound` 还支持 `inst.hurtsoundvolume` 控制受伤音量。
+
+---
+
+### 15.4.5（进阶）三大音效覆盖字段 —— talksoundoverride / hurtsoundoverride / endtalksound
+
+#### 三个字段一览
+
+| 字段名 | 挂在哪里 | 作用 |
+|---|---|---|
+| `inst.talksoundoverride` | entity 实例 | 完全替换说话音效路径（loop，name="talk"）|
+| `inst.hurtsoundoverride` | entity 实例 | 完全替换受伤音效路径 |
+| `inst.endtalksound` | entity 实例 | 说话结束时额外播放一次（非 loop）|
+
+这三个字段都**直接挂在 entity 实例上**（不是组件字段），在 `SGwilson.lua` 中被读取。
+
+#### talksoundoverride —— 动态切换说话音（Wanda 实例）
+
+Wanda 有三个年龄状态（老年 / 正常 / 少年），每个状态说话声音不同：
+
+```88:88:scripts/prefabs/wanda.lua
+    inst.talksoundoverride = "wanda2/characters/wanda/talk_old_LP"
+```
+
+```125:126:scripts/prefabs/wanda.lua
+    inst.talksoundoverride = nil
+    inst.hurtsoundoverride = nil
+```
+
+```155:155:scripts/prefabs/wanda.lua
+    inst.talksoundoverride = "wanda2/characters/wanda/talk_young_LP"
+```
+
+逻辑：进入老年时设 `talksoundoverride = "...talk_old_LP"`，恢复正常时置 `nil`（回到默认拼接路径），进入少年时设 `talksoundoverride = "...talk_young_LP"`。
+
+**对 mod 的启示**：
+- 角色变身（如狼人、精神崩溃形态）时可以用 `talksoundoverride` 切换语音
+- 设 `nil` 会回落到默认路径拼接（`soundsname` + `talker_path_override`）
+
+#### endtalksound —— 说话结束音（Wormwood 实例）
+
+Wormwood 说话结束时有一个特殊的"木质结束音"：
+
+```779:779:scripts/prefabs/wormwood.lua
+    inst.endtalksound = "dontstarve/characters/wormwood/end"
+```
+
+`StopTalkSound` 函数在停止说话循环音之前会检查这个字段：
+
+```185:190:scripts/stategraphs/SGwilson.lua
+local function StopTalkSound(inst, instant)
+    if not instant and inst.endtalksound ~= nil and inst.SoundEmitter:PlayingSound("talk") then
+        inst.SoundEmitter:PlaySound(inst.endtalksound)
+    end
+    inst.SoundEmitter:KillSound("talk")
+end
+```
+
+**逻辑**：`instant=false` + `endtalksound` 存在 + 说话 loop 正在播放 → 先播一次结束音 → 再 KillSound("talk")。
+
+#### hurtsoundoverride —— Woodie 变身实例
+
+Woodie 变鹅形态时替换受伤音：
+
+```1026:1026:scripts/prefabs/woodie.lua
+        inst.hurtsoundoverride = "dontstarve/characters/woodie/goose/hurt"
+```
+
+变回正常形态时清除：
+
+```645:646:scripts/prefabs/wolfgang.lua
+    inst.talksoundoverride = nil
+    inst.hurtsoundoverride = nil
+```
+
+（Wolfgang 也在体型切换时管理这些字段。）
+
+---
+
+### 15.4.6（进阶）talker 样式定制 —— font / fontsize / colour
+
+#### talker 组件的样式字段
+
+`talker` 组件内部有三个视觉样式字段，在 `sayfn` 函数中被消费：
+
+```11:20:scripts/components/talker.lua
+local Talker = Class(function(self, inst)
+    self.inst = inst
+    self.task = nil
+    self.ignoring = nil
+    self.mod_str_fn = nil
+    self.offset = nil
+    self.offset_fn = nil
+    self.disablefollowtext = nil
+    self.resolvechatterfn = nil
+end)
+```
+
+可以在 `master_postinit` 或 `common_postinit` 中直接赋值：
+
+| 字段 | 类型 | 默认 | 作用 |
+|---|---|---|---|
+| `talker.font` | string（FONT 常量）| `TALKINGFONT` | 气泡文字字体 |
+| `talker.fontsize` | number | 35 | 气泡文字大小 |
+| `talker.colour` | Vector3 | white（1,1,1）| 气泡文字颜色（RGB，0~1）|
+
+#### TALKINGFONT 系列常量
+
+`scripts/fonts.lua` 定义了 4 种说话字体：
+
+```12:15:scripts/fonts.lua
+TALKINGFONT = "talkingfont"
+TALKINGFONT_WORMWOOD = "talkingfont_wormwood"
+TALKINGFONT_TRADEIN = "talkingfont_tradein"
+TALKINGFONT_HERMIT = "talkingfont_hermit"
+```
+
+| 字体常量 | 外观特征 | 使用角色/NPC |
+|---|---|---|
+| `TALKINGFONT` | 标准手写风 | 大多数角色 / NPC |
+| `TALKINGFONT_WORMWOOD` | 植物藤蔓风 | Wormwood |
+| `TALKINGFONT_TRADEIN` | 圆润商业风 | 留声机/交易机 |
+| `TALKINGFONT_HERMIT` | 隐士古朴风 | 隐士螃蟹 |
+
+#### 实际使用示例
+
+Wormwood 的字体设置（`scripts/prefabs/wormwood.lua`）：
+
+```765:767:scripts/prefabs/wormwood.lua
+        inst.components.talker.fontsize = 40
+    end
+    inst.components.talker.font = TALKINGFONT_WORMWOOD
+```
+
+颜色设置（例：给 NPC 设置暗红色台词）：
+
+```730:732:scripts/prefabs/shadow_battleaxe.lua
+    inst.components.talker.fontsize = 28
+    inst.components.talker.font = TALKINGFONT
+    inst.components.talker.colour = TALK_COLOUR
+```
+
+mod 中的典型写法：
+
+```lua
+local function master_postinit(inst)
+    -- 字体和颜色（颜色 RGB 值各分量 0~1）
+    inst.components.talker.font = TALKINGFONT
+    inst.components.talker.fontsize = 35
+    inst.components.talker.colour = Vector3(0.8, 0.4, 0.9)  -- 淡紫色
+end
+```
+
+#### lineduration 字段
+
+还有一个不太常用的字段 `talker.lineduration`：如果设置了，每行台词的默认时长改为这个值（而不是 `TUNING.DEFAULT_TALKER_DURATION = 2.5`）。
+
+---
+
+### 15.4.7（老手）speechproxy —— 借用他人台词
+
+#### 什么是 speechproxy？
+
+`talker.speechproxy` 是一个可选字段，设置后 `GetString` 和 `GetLine` 会**把 `inst.prefab` 替换成 `speechproxy`** 来查找台词——即让角色说另一个角色的话。
+
+```272:274:scripts/stringutil.lua
+    if type(inst) ~= "string" and inst.components.talker and inst.components.talker.speechproxy then
+        character = inst.components.talker.speechproxy
+    end
+```
+
+#### 使用场景：无缝换人（SeamlessPlayerSwapper）
+
+`scripts/components/seamlessplayerswapper.lua` 中，玩家换身后台词代理被设为原角色 prefab：
+
+```97:102:scripts/components/seamlessplayerswapper.lua
+function SeamlessPlayerSwapper:PostTransformSetup()
+	if self.main_data.mime then
+	    self.inst:AddTag("mime")
+	end
+	self.inst.components.talker.speechproxy = self.main_data.prefab
+end
+```
+
+**含义**：玩家换到新身体后，新身体的台词依旧来自原来那个角色的 speech 文件。
+
+#### mod 中的应用
+
+如果你的 mod 角色在某些状态下要说另一个角色的话（例如变身后借用 Woodie 的台词）：
+
+```lua
+-- 变身时
+inst.components.talker.speechproxy = "woodie"
+
+-- 变回时
+inst.components.talker.speechproxy = nil
+```
+
+---
+
+### 15.4.8（老手）Chatter 系统 —— NPC 专用网络台词
+
+#### Chatter 是什么？
+
+玩家角色调用 `talker:Say` 只需要在服务端调用，系统会通过 `TheNet:Talker(...)` 广播到客户端。但 **NPC 的 talker** 不一定走同一套流程——它们需要通过 `Chatter` 系统，利用 `net_string` 等网络变量同步。
+
+`Chatter` 系统的核心组成：
+
+```80:95:scripts/components/talker.lua
+function Talker:MakeChatter()
+    if self.chatter == nil then
+        --for npc
+        self.chatter =
+        {
+            strtbl = net_string(self.inst.GUID, "talker.chatter.strtbl", "chatterdirty"),
+            strid = net_smallbyte(self.inst.GUID, "talker.chatter.strid", "chatterdirty"),
+            strtime = net_tinybyte(self.inst.GUID, "talker.chatter.strtime"),
+            forcetext = net_bool(self.inst.GUID, "talker.chatter.forcetext"),
+            echotochatpriority = net_tinybyte(self.inst.GUID, "talker.chatter.echotochatpriority"),
+        }
+        if not TheWorld.ismastersim then
+            self.inst:ListenForEvent("chatterdirty", OnChatterDirty)
+        end
+    end
+end
+```
+
+#### Chatter 的 5 个网络变量
+
+| 变量名 | 类型 | 含义 |
+|---|---|---|
+| `strtbl` | `net_string` | 台词所在的 STRINGS 子表路径（如 `"CHARACTERS.GENERIC.DESCRIBE"`)  |
+| `strid` | `net_smallbyte` | 台词数组索引（0 = 取整个表，正整数 = 具体索引）|
+| `strtime` | `net_tinybyte` | 台词显示时长（秒）|
+| `forcetext` | `net_bool` | 是否 force say（跳过 noanim 检查）|
+| `echotochatpriority` | `net_tinybyte` | 是否回显到聊天框（0=不显，>0=显示）|
+
+#### Talker:Chatter 的调用
+
+```104:123:scripts/components/talker.lua
+function Talker:Chatter(strtbl, strid, time, forcetext, echotochatpriority)
+    if self.chatter ~= nil and TheWorld.ismastersim then
+        self.chatter.strtbl:set(strtbl)
+        --force at least the id dirty, so that it's possible to repeat strings
+        strid = strid or 0
+        self.chatter.strid:set_local(strid)
+        self.chatter.strid:set(strid)
+        self.chatter.strtime:set(time or 0)
+        self.chatter.forcetext:set(forcetext == true)
+        echotochatpriority = (echotochatpriority == true and CHATPRIORITIES.LOW)
+            or ((echotochatpriority == false or echotochatpriority == nil) and CHATPRIORITIES.NOCHAT)
+            or echotochatpriority
+        self.chatter.echotochatpriority:set(echotochatpriority)
+        if self.chatter.task ~= nil then
+            self.chatter.task:Cancel()
+        end
+        self.chatter.task = self.inst:DoTaskInTime(1, OnCancelChatter, self)
+        OnChatterDirty(self.inst)
+    end
+end
+```
+
+#### Chatter 与 Say 的区别
+
+| 维度 | talker:Say | talker:Chatter |
+|---|---|---|
+| 适用对象 | 玩家角色（player entity）| NPC（ChattyNode / 战斗喊话）|
+| 同步方式 | `TheNet:Talker(...)` 实时广播 | `net_string` dirty 事件 |
+| 传参方式 | 直接传字符串 | 传 STRINGS 表路径 + 索引 |
+| 需要 MakeChatter | 否 | 是（需提前调用 `MakeChatter()`）|
+
+**mod 一般不需要直接使用 Chatter**——它主要服务于 vanilla NPC 的战斗喊话（`ChattyNode` 组件）。mod 中的 NPC 直接用 `talker:Say` 即可。
+
+---
+
+### 15.4.9（老手）mod 完整自定义角色语音实战
+
+#### 全流程概览
+
+```
+第 1 步：创建 speech_<myprefab>.lua
+         └── 复制 speech_wilson.lua 框架，修改台词
+         
+第 2 步：在 STRINGS.CHARACTERS 表注册
+         └── STRINGS.CHARACTERS.MYPREFAB = require "speech_myprefab"
+
+第 3 步：在角色 prefab 中配置音效（三选一）
+         ├── A. 无自定义 bank → 借用已有角色音效（设 soundsname）
+         ├── B. 有自定义 bank → 设 talker_path_override 到自己的 bank 目录
+         └── C. 混合 → talker_path_override + 部分 xxxsoundoverride
+
+第 4 步：可选：定制 talker 样式（font / colour）
+第 5 步：可选：为特殊状态动态切换 talksoundoverride
+```
+
+#### 第 1 步：创建 speech 文件
+
+在 mod 的 `scripts/` 目录下创建 `speech_mychar.lua`（以中文角色为例）：
+
+```lua
+-- scripts/speech_mychar.lua
+return {
+    -- 【检查台词】—— 尽量覆盖常用物品
+    DESCRIBE =
+    {
+        GRASS = "这就是草。",
+        SPIDER = {
+            GENERIC = "蜘蛛，不吉利。",
+            DEAD    = "总算安静了。",
+        },
+        RABBIT = "小东西，别跑。",
+        -- ... 更多检查台词 ...
+    },
+
+    -- 【操作失败台词】
+    ACTIONFAIL =
+    {
+        BUILD =
+        {
+            MOUNTED = "骑着马没法放东西。",
+            HASPET  = "已经有宠物了。",
+        },
+    },
+
+    -- 【事件公告台词】
+    ANNOUNCE_COLD      = "好冷啊！",
+    ANNOUNCE_HOT       = "太热了！",
+    ANNOUNCE_DEERCLOPS = "听到了什么巨大的声音……",
+    ANNOUNCE_BEES      = "蜜蜂！到处都是蜜蜂！！",
+
+    -- 【战斗台词】
+    BATTLECRY =
+    {
+        GENERIC = "来吧！",
+        PIG     = "抱歉了，猪先生。",
+    },
+}
+```
+
+> **技巧**：未覆盖的条目会自动降级到 `GENERIC`（Wilson 台词）—— 不必一一填写所有 1500+ 条目。
+
+#### 第 2 步：在 modmain.lua 或 mod strings 文件中注册
+
+```lua
+-- modmain.lua（或单独的 strings 文件，通过 modimport 引入）
+local STRINGS = GLOBAL.STRINGS
+
+STRINGS.CHARACTERS.MYCHAR = require "speech_mychar"
+
+-- 同时设置角色显示名（可选）
+STRINGS.NAMES.MYCHAR       = "我的角色"
+STRINGS.CHARACTER_TITLES.MYCHAR = "The Custom One"
+```
+
+> **注意**：键名必须是 `string.upper(prefab)` 的结果。prefab 是 `"mychar"` → 键名是 `"MYCHAR"`。
+
+#### 第 3 步A：借用已有角色音效（最简方案）
+
+在角色 prefab 的 `master_postinit` 中：
+
+```lua
+local function master_postinit(inst)
+    -- 借用 Willow 的所有语音（talk/hurt/yawn/death_voice）
+    inst.soundsname = "willow"
+    -- talker_path_override 不设，保持默认 "dontstarve/characters/"
+end
+```
+
+这样角色说话就用 `"dontstarve/characters/willow/talk_LP"`，受伤用 `"dontstarve/characters/willow/hurt"`。
+
+#### 第 3 步B：使用自定义 FMOD bank（完整方案）
+
+若你制作了自己的 FMOD bank（`mymod_characters_mychar.fev`），bank 中有 `"mymod/characters/mychar/talk_LP"` 等事件：
+
+```lua
+local function common_postinit(inst)
+    -- 不需要在这里设（音效字段是服务端逻辑）
+end
+
+local function master_postinit(inst)
+    -- 指向自己 bank 的路径前缀
+    inst.talker_path_override = "mymod/characters/"
+    -- soundsname 不设，默认使用 inst.prefab = "mychar"
+    -- 最终拼成：mymod/characters/mychar/talk_LP
+    
+    -- 如果 FMOD 中目录名和 prefab 不一致，额外设 soundsname
+    -- inst.soundsname = "mychar_v2"
+end
+```
+
+在 mod `Assets` 表中声明 bank：
+
+```lua
+Assets =
+{
+    Asset("SOUND", "sound/mymod_characters_mychar.fev"),
+    Asset("SOUND", "sound/mymod_characters_mychar.fsb"),
+}
+```
+
+#### 第 4 步：定制 talker 样式
+
+```lua
+local function master_postinit(inst)
+    -- 字体
+    inst.components.talker.font     = TALKINGFONT      -- 或 TALKINGFONT_WORMWOOD 等
+    inst.components.talker.fontsize = 35               -- 默认 35
+    -- 颜色（Vector3，RGB 各 0~1）
+    inst.components.talker.colour   = Vector3(0.6, 0.9, 1.0)  -- 淡蓝色
+    -- 借用声音
+    inst.soundsname = "willow"
+end
+```
+
+#### 第 5 步：状态切换语音（进阶可选）
+
+```lua
+-- 变身/特殊状态时切换说话音效
+local function OnTransform(inst)
+    inst.talksoundoverride  = "mymod/characters/mychar/talk_transformed_LP"
+    inst.hurtsoundoverride  = "mymod/characters/mychar/hurt_transformed"
+end
+
+local function OnRestoreNormal(inst)
+    inst.talksoundoverride = nil
+    inst.hurtsoundoverride = nil
+end
+```
+
+#### 完整最小 prefab 模板
+
+```lua
+-- scripts/prefabs/mychar.lua
+local MakePlayerCharacter = require "prefabs/player_common"
+
+local assets = { Asset("SCRIPT", "scripts/prefabs/player_common.lua") }
+local prefabs = {}
+
+local function common_postinit(inst)
+    inst.MiniMapEntity:SetIcon("mychar.tex")
+end
+
+local function master_postinit(inst)
+    -- 基础属性
+    inst.components.health:SetMaxHealth(150)
+    inst.components.hunger:SetMax(150)
+    inst.components.sanity:SetMax(200)
+
+    -- 语音系统：借用 Willow 的声音
+    inst.soundsname = "willow"
+
+    -- talker 样式
+    inst.components.talker.fontsize = 35
+    inst.components.talker.font     = TALKINGFONT
+    inst.components.talker.colour   = Vector3(0.8, 0.5, 1.0)
+end
+
+return MakePlayerCharacter("mychar", prefabs, assets, common_postinit, master_postinit)
+```
+
+```lua
+-- modmain.lua（注册 speech）
+GLOBAL.STRINGS.CHARACTERS.MYCHAR = require "speech_mychar"
+GLOBAL.STRINGS.NAMES.MYCHAR      = "My Character"
+```
+
+---
+
+### 15.4.10（小结）速查表 + 5 行起步代码 + 15.5 预告
+
+#### 文字流水线速查
+
+| 步骤 | 函数/字段 | 文件 | 说明 |
+|---|---|---|---|
+| 存台词 | `speech_<prefab>.lua` | mod scripts/ | 三层结构：DESCRIBE / ACTIONFAIL / ANNOUNCE_ |
+| 注册台词 | `STRINGS.CHARACTERS.UPPER_PREFAB` | modmain.lua | `= require "speech_mychar"` |
+| 取台词 | `GetString(inst, type, modifier)` | stringutil.lua | 3 步降级：特殊 → 角色 → GENERIC |
+| 说台词 | `talker:Say(str, time, noanim)` | talker.lua | 推 ontalk 事件，同步到网络 |
+| 停台词 | `talker:ShutUp()` | talker.lua | 立即打断，推 donetalking |
+
+#### 音效流水线速查
+
+| 步骤 | 字段/函数 | 文件 | 说明 |
+|---|---|---|---|
+| 路径前缀 | `inst.talker_path_override` | entity | 默认 `"dontstarve/characters/"` |
+| 路径目录 | `inst.soundsname`（或 prefab）| entity | FMOD bank 中的角色目录名 |
+| 说话音 | `inst.talksoundoverride` | entity | 设非 nil 完全替换默认路径 |
+| 受伤音 | `inst.hurtsoundoverride` | entity | 设非 nil 完全替换默认路径 |
+| 结束音 | `inst.endtalksound` | entity | 说话结束时额外播一次 |
+| 音量 | `inst.hurtsoundvolume` | entity | 受伤音专用音量（0~1）|
+
+#### talker 组件样式速查
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `talker.font` | string | `TALKINGFONT` | 气泡字体 |
+| `talker.fontsize` | number | 35 | 气泡字号 |
+| `talker.colour` | Vector3 | (1,1,1) white | 气泡文字颜色 |
+| `talker.lineduration` | number | nil → 2.5s | 每行默认显示时长 |
+
+#### 角色 speech 注册速查
+
+| 步骤 | 代码 |
+|---|---|
+| 注册 speech 文件 | `STRINGS.CHARACTERS.MYCHAR = require "speech_mychar"` |
+| 借用他人 speech | `inst.components.talker.speechproxy = "willow"` |
+| 注册角色名 | `STRINGS.NAMES.MYCHAR = "My Character"` |
+
+#### 5 行起步代码
+
+##### A：最简 mod 角色语音（借音 + 自定义台词）
+
+```lua
+-- master_postinit 中
+inst.soundsname = "willow"   -- 借用 Willow 声音
+inst.components.talker.colour = Vector3(0.9, 0.5, 1.0)
+-- modmain.lua
+GLOBAL.STRINGS.CHARACTERS.MYCHAR = require "speech_mychar"
+```
+
+##### B：让角色立刻说一句话
+
+```lua
+inst.components.talker:Say(GetString(inst, "ANNOUNCE_COLD"))
+-- 或直接说固定台词
+inst.components.talker:Say("这里太冷了！", 4)
+```
+
+##### C：状态切换语音
+
+```lua
+-- 进入特殊形态
+inst.talksoundoverride = "mymod/characters/mychar/talk_form2_LP"
+-- 恢复正常形态
+inst.talksoundoverride = nil
+```
+
+##### D：为已有 NPC 添加检查台词
+
+```lua
+-- modmain.lua
+GLOBAL.STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYNPC = "It looks friendly."
+-- 若想给特定角色不同的话：
+GLOBAL.STRINGS.CHARACTERS.WENDY.DESCRIBE.MYNPC = "Another soul in these lands."
+```
+
+---
+
+> **下一节预告**：15.5 节我们将进入 **Mod 中添加自定义音效的完整流程** —— 15.4 教会了你如何"对接"已有的语音系统；15.5 会讲**如何从零创建自己的 FMOD bank、打包进 mod、并在代码里正确引用** —— 是自定义声音的最后一公里。
+
+---
+
 
 
 ## 15.5 Mod 中添加自定义音效的完整流程
 
-（待编写）
+### 本节导读
+
+> **一句话定位**：15.1~15.4 教会了你"如何在代码里调用音效"——15.5 教会你**如何准备音效文件本身**，从 `.fev/.fsb` 是什么、到 FMOD Studio 创建 bank、到 mod 目录结构，最后到 `RemapSoundEvent` 替换 vanilla 音效——这是 mod 音效制作的最后一公里。
+
+#### 一段宏观先讲清楚：mod 音效的四条路
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│  四条路                                                                    │
+├──────────────────────────────────────────────────────────────────────────┤
+│  路线 A（最省事）  借用 vanilla bank 已有音效路径                            │
+│                   → inst.soundsname = "willow"                            │
+│                   → 不需要任何额外文件                                       │
+│                                                                            │
+│  路线 B（代码替换）在代码里直接 PlaySound vanilla 路径                        │
+│                   → inst.SoundEmitter:PlaySound("dontstarve/sfx/thunder") │
+│                   → 不需要额外文件，但你只能用 vanilla 的声音                │
+│                                                                            │
+│  路线 C（事件重映射）RemapSoundEvent("vanilla/old", "mymod/new")            │
+│                   → 需要自己的 .fev/.fsb，但只改路径，不改代码               │
+│                   → 可用于全局替换 vanilla 音效（如改角色喊声）              │
+│                                                                            │
+│  路线 D（完全自定义）FMOD Studio 制作 bank → 打包进 mod                     │
+│                   → 需要 FMOD Studio + 音频素材                             │
+│                   → 完全自由，适合有新音效需求的角色/物品 mod                │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 15.5 节回答的 5 个核心问题
+
+```
+Q1: ──── .fev 和 .fsb 分别是什么？二者是什么关系？
+         ↓ 答：.fev = 事件定义文件（路径、参数）；.fsb = 音频数据文件
+
+Q2: ──── vanilla 的 "dontstarve/characters/wilson/talk_LP" 路径是怎么来的？
+         ↓ 答：bank 文件名（dontstarve.fev）就是路径前缀
+
+Q3: ──── 如何让 mod 的声音文件被游戏加载？
+         ↓ 答：Asset("SOUND", "sound/xxx.fev") + Asset("SOUND", "sound/xxx.fsb")
+
+Q4: ──── FMOD Studio 里怎么创建一个能被饥荒识别的事件？
+         ↓ 答：新建 bank，事件名写 "mymod/xxx/yyy"，确保 bank 名是 "mymod"
+
+Q5: ──── mod 怎么全局替换 vanilla 某个音效？
+         ↓ 答：RemapSoundEvent("dontstarve/old/path", "mymod/new/path")
+```
+
+#### 你将看到的核心源码
+
+| 文件 | 行 | 用途 |
+|---|---|---|
+| `scripts/preloadsounds.lua` | 全文 | vanilla 声音文件清单，展示 `.fev`/`.fsb` 命名规律 |
+| `scripts/preloadsounds.lua` | 261-264 | `PreloadSoundList` → `TheSim:PreloadFile("sound/"..v)` |
+| `scripts/modutil.lua` | 842-850 | `RemapSoundEvent` / `RemoveRemapSoundEvent` mod API |
+| `scripts/prefabs/wx78.lua` | 11 | `Asset("SOUND", "sound/wx78.fsb")` 单 bank 声明 |
+| `scripts/prefabs/player_common.lua` | 2074-2075 | 多 bank 声明实例 |
+
+#### 本节学习路径
+
+```
+15.5.1 新手 ─── 饥荒音效文件体系 —— .fev + .fsb 是什么，路径前缀规律
+15.5.2 新手 ─── 路线 A/B：不制作 bank 就能用的方法
+15.5.3 新手 ─── Asset("SOUND") —— 声明声音依赖的正确方式
+                  ↓
+15.5.4 进阶 ─── FMOD Studio 工作流 —— 安装、创建 bank、命名事件
+15.5.5 进阶 ─── 导出 bank 与 mod 目录结构
+15.5.6 进阶 ─── 在代码里使用自定义音效路径
+                  ↓
+15.5.7 老手 ─── RemapSoundEvent —— 全局替换 vanilla 音效
+15.5.8 老手 ─── 完整 mod 音效实战 —— 从 FMOD 到 PlaySound
+15.5.9     ─── 小结·速查表 + 常见错误 + 本章总结
+```
+
+---
+
+### 15.5.1（新手）饥荒音效文件体系 —— .fev + .fsb 是什么
+
+#### 两种文件各司其职
+
+饥荒使用 **FMOD Studio** 音频引擎，其声音文件分两类：
+
+| 扩展名 | 全称 | 内容 | 类比 |
+|---|---|---|---|
+| `.fev` | FMOD Event Bank | 事件定义：事件路径、参数、引用哪些音频样本 | "目录清单" |
+| `.fsb` | FMOD Sample Bank | 压缩后的实际音频数据（PCM/Vorbis/OPUS）| "音频仓库" |
+
+**关键关系**：`.fev` 是"乐谱"，`.fsb` 是"乐手"——`.fev` 告诉引擎"事件 A 在哪里、用哪些音频"，`.fsb` 里装着对应的音频数据。
+
+#### vanilla 的两种打包结构
+
+打开 `scripts/preloadsounds.lua`，可以看到两种模式：
+
+**模式一：主 .fev + 分散 .fsb**（旧格式，基础包）
+
+```23:36:scripts/preloadsounds.lua
+local MainSounds =
+{
+	"bat.fsb",
+	"bee.fsb",
+	"beefalo.fsb",
+	"birds.fsb",
+	"bunnyman.fsb",
+	"cave_AMB.fsb",
+	"cave_mem.fsb",
+	"chess.fsb",
+	"chester.fsb",
+	"common.fsb",
+	"deerclops.fsb",
+	"dontstarve.fev",
+```
+
+`dontstarve.fev` 是主事件定义文件，它把 `wilson.fsb`、`sfx.fsb`、`common.fsb` 等**分散的 .fsb** 作为样本库引用。所有以 `"dontstarve/"` 开头的事件路径（如 `"dontstarve/characters/wilson/talk_LP"`）都定义在这个 `.fev` 里。
+
+**模式二：配对 .fev + .fsb**（新格式，DLC/大更新）
+
+```149:153:scripts/preloadsounds.lua
+	"wanda2.fev",
+    "wanda2.fsb",
+
+    "wanda1.fev",
+    "wanda1.fsb",
+```
+
+`wanda2.fev` + `wanda2.fsb` 是一对自包含的 bank——事件定义和音频数据全在里面。以 `"wanda2/"` 开头的事件路径（如 `"wanda2/characters/wanda/talk_old_LP"`）都定义在 `wanda2.fev` 里。
+
+#### 核心规律：bank 名 = 事件路径前缀
+
+```
+bank 文件名（不含扩展名）= 事件路径的第一段
+
+dontstarve.fev  →  事件路径前缀 "dontstarve/"
+wanda2.fev      →  事件路径前缀 "wanda2/"
+monkeyisland.fev →  事件路径前缀 "monkeyisland/"
+```
+
+**给 mod 的直接推论**：
+- 若你的 mod 声音文件是 `mymod.fev`
+- 那么里面的事件路径必须以 `"mymod/"` 开头
+- 代码里就用 `"mymod/characters/mychar/talk_LP"` 引用
+
+#### 游戏如何加载声音文件
+
+vanilla 的声音文件由 `PreloadSounds()` 统一加载：
+
+```261:264:scripts/preloadsounds.lua
+function PreloadSoundList(list)
+	for i,v in pairs(list) do
+		TheSim:PreloadFile("sound/"..v)
+	end
+end
+```
+
+`TheSim:PreloadFile("sound/"..v)` 是 C++ 绑定——它在游戏启动时把 `.fev`/`.fsb` 加载进 FMOD 引擎。**mod 的声音文件不走这个流程**，而是通过 `Asset("SOUND", ...)` 声明，由引擎在加载 mod 时处理。
+
+---
+
+### 15.5.2（新手）路线 A/B：不制作 bank 就能用的方法
+
+#### 路线 A：借用已有角色音效（推荐给无音效需求的角色 mod）
+
+最简单的方案——直接告诉引擎"我的角色用 XX 的声音"：
+
+```lua
+-- master_postinit 中
+inst.soundsname = "willow"       -- 借用 Willow 的所有标准角色音效
+-- 也可以用其他角色：
+-- inst.soundsname = "wendy"
+-- inst.soundsname = "woodie"
+-- ...
+```
+
+效果：
+- 说话音：`dontstarve/characters/willow/talk_LP`
+- 受伤音：`dontstarve/characters/willow/hurt`
+- 死亡音：`dontstarve/characters/willow/death_voice`
+- 打哈欠：`dontstarve/characters/willow/yawn`
+
+**不需要任何额外文件**，只要你的 mod 加载了包含 Willow 音效的 bank（`willow.fsb` 由游戏主程序预加载，无需 mod 单独声明）。
+
+#### 路线 B：直接播放 vanilla 音效路径
+
+如果你的物品/NPC 需要播放某个 vanilla 音效但不是角色标准音，直接传路径就行：
+
+```lua
+-- 使用篝火的噼啪声
+inst.SoundEmitter:PlaySound("dontstarve/common/fireBurstSmall")
+
+-- 使用环境音
+inst.SoundEmitter:PlaySound("dontstarve/common/rain_splash_LP", "rain")
+
+-- 在 SGwilson.lua 的 TimeEvent 中
+TimeEvent(4*FRAMES, function(inst)
+    inst.SoundEmitter:PlaySound("dontstarve/creatures/spider/walk")
+end)
+```
+
+**不需要额外文件**——vanilla bank 已经由游戏加载，直接引用路径即可。
+
+但这条路线的**限制**是：你只能用已经存在的 vanilla 音效，无法添加新声音。
+
+#### 需要哪些 vanilla 音效路径？
+
+所有 vanilla 音效路径都定义在 `sound/dontstarve.fev`（以及 DLC 的 `.fev`）里。你可以通过：
+1. 翻看 `scripts/stategraphs/SGwilson.lua` 中的 `PlaySound` 调用来找路径
+2. 翻看 `scripts/components/` 中各组件的音效调用
+3. 使用游戏的 `SOUNDDEBUG_ENABLED = true` 模式（仅 dev 分支）
+
+常用 vanilla 音效路径示例：
+
+| 路径 | 描述 |
+|---|---|
+| `"dontstarve/characters/wilson/talk_LP"` | Wilson 说话循环音 |
+| `"dontstarve/common/fireBurstSmall"` | 小型点火音 |
+| `"dontstarve/common/fireOut"` | 熄灭音 |
+| `"dontstarve/creatures/spider/walk"` | 蜘蛛脚步 |
+| `"dontstarve/sanity/sanity"` | 精神低时耳鸣 |
+| `"dontstarve/common/recipe/make"` | 合成成功音 |
+| `"dontstarve/HUD/research_up"` | 科技点获得音 |
+
+---
+
+### 15.5.3（新手）Asset("SOUND") —— 声明声音依赖的正确方式
+
+#### Asset("SOUND") 的作用
+
+`Asset("SOUND", path)` 告诉游戏引擎：**在加载使用这个 asset 的 prefab 时，需要预先加载这个声音文件**。
+
+```lua
+-- 声明一个 .fsb 依赖（样本 bank）
+Asset("SOUND", "sound/wx78.fsb"),
+
+-- 声明 .fev + .fsb 配对（自包含 bank）
+Asset("SOUND", "sound/wanda2.fev"),
+Asset("SOUND", "sound/wanda2.fsb"),
+```
+
+这些声明放在 prefab 文件的 `local assets = { ... }` 表里：
+
+```7:11:scripts/prefabs/wx78.lua
+local assets = JoinArrays({
+    Asset("SCRIPT", "scripts/prefabs/player_common.lua"),
+    Asset("SCRIPT", "scripts/prefabs/wx78_common.lua"),
+
+    Asset("SOUND", "sound/wx78.fsb"),
+```
+
+或者放在 `modmain.lua` 的全局 `Assets` 表里（适合 mod 级别的声明）：
+
+```lua
+-- modmain.lua
+Assets =
+{
+    Asset("SOUND", "sound/mymod.fev"),
+    Asset("SOUND", "sound/mymod.fsb"),
+}
+```
+
+#### 路径的根目录规则
+
+`Asset("SOUND", "sound/xxx")` 中的路径：
+- **vanilla 中**：相对于游戏数据目录（`data/`）
+- **mod 中**：相对于 mod 的根目录
+
+所以 mod 的声音文件应该放在：
+```
+mods/
+└── 你的mod名/
+    ├── modmain.lua
+    ├── sound/
+    │   ├── mymod.fev
+    │   └── mymod.fsb
+    └── scripts/
+        └── ...
+```
+
+#### 什么时候用 prefab 的 assets vs modmain 的 Assets？
+
+| 位置 | 适合场景 |
+|---|---|
+| prefab 的 `local assets = {}` | 音效只被该 prefab 用到；按需加载，节省内存 |
+| `modmain.lua` 的 `Assets = {}` | 音效被多个 prefab 或全局代码共享；mod 启动就加载 |
+
+对于角色 mod（多个状态、多个动作都用同一个 bank），推荐放在 `modmain.lua` 的 `Assets` 里确保启动时就加载完毕。
+
+---
+
+### 15.5.4（进阶）FMOD Studio 工作流 —— 安装、创建 bank、命名事件
+
+> **前提条件**：需要安装 **FMOD Studio 1.x**（饥荒使用 FMOD Studio 1.x，不兼容 FMOD Studio 2.x）。官方推荐 1.10.x 版本。
+
+#### 步骤 1：创建 FMOD Studio 项目
+
+1. 打开 FMOD Studio → **File → New Project**
+2. 项目命名不影响 bank 名，随意命名（如 `MyModSounds`）
+
+#### 步骤 2：创建 Bank 并命名
+
+**Bank 的命名决定了事件路径的前缀**：
+
+1. 在 FMOD Studio 右侧 **Banks** 面板，右键 → **Add Bank**
+2. 将 bank 命名为你的 mod 前缀名（如 `mymod`）
+3. 之后导出时会生成 `mymod.bank`（FMOD 2.x 后缀）或 `mymod.fev`/`mymod.fsb`（FMOD 1.x 格式）
+
+> **注意**：饥荒使用 FMOD Studio 1.x，导出格式是 `.fev` + `.fsb`，而非 FMOD Studio 2.x 的 `.bank` 格式。
+
+#### 步骤 3：创建事件（Events）
+
+1. 左侧 **Events** 面板 → 右键 → **New Event**
+2. 事件的路径命名遵循以下规则：
+
+```
+事件路径 = "<bank名>/<分类>/<具体事件>"
+例：mymod/characters/mychar/talk_LP
+    mymod/items/myitem/pickup
+    mymod/ambience/forest_theme_LP
+```
+
+**角色标准音效的命名约定**（与 SGwilson.lua 中的路径模式对应）：
+
+| 功能 | 推荐事件路径 | 是否循环 |
+|---|---|---|
+| 说话循环音 | `mymod/characters/mychar/talk_LP` | 是（Loop）|
+| 受伤音 | `mymod/characters/mychar/hurt` | 否 |
+| 死亡音 | `mymod/characters/mychar/death_voice` | 否 |
+| 打哈欠 | `mymod/characters/mychar/yawn` | 否 |
+| 说话结束音 | `mymod/characters/mychar/end` | 否 |
+
+> **"_LP" 后缀是约定**——FMOD 中循环事件和非循环事件名一样加，只是便于区分（实际循环由事件属性决定，不由名称后缀决定）。
+
+#### 步骤 4：添加音频素材
+
+1. 将你的 `.wav` / `.ogg` 文件拖入 FMOD Studio 的 **Audio Bin**
+2. 在事件编辑器中，将音频素材添加到对应 Track
+3. 对于循环音，在 Timeline 上右键 → **Loop Region** 设置循环区间
+4. 对于随机音（受伤声多种），使用 **Multi Instrument** 或 **Randomize** 工具
+
+#### 步骤 5：将事件分配到 Bank
+
+1. 右键事件 → **Assign to Bank** → 选择你创建的 `mymod` bank
+2. 未分配到 bank 的事件**不会被导出**
+
+---
+
+### 15.5.5（进阶）导出 bank 与 mod 目录结构
+
+#### 导出设置
+
+在 FMOD Studio 1.x 中：
+
+1. **File → Build** 或 **File → Export GUIDs**
+2. 导出目标格式选择 **Desktop（PC）**
+3. 导出目录设置为 mod 的 `sound/` 目录
+
+导出后会得到：
+```
+sound/
+├── mymod.fev     ← 事件定义文件（文本，可用文本编辑器查看事件路径）
+└── mymod.fsb     ← 音频数据文件（二进制压缩）
+```
+
+#### 完整 mod 目录结构
+
+```
+mods/
+└── workshop-XXXXXXXXX/        ← mod 根目录
+    ├── modinfo.lua
+    ├── modmain.lua
+    ├── sound/
+    │   ├── mymod.fev          ← FMOD 事件定义
+    │   └── mymod.fsb          ← FMOD 音频数据
+    ├── scripts/
+    │   ├── prefabs/
+    │   │   └── mychar.lua
+    │   └── speech_mychar.lua
+    ├── images/
+    │   └── ...
+    └── anim/
+        └── ...
+```
+
+#### modinfo.lua 中的说明（可选）
+
+modinfo.lua 本身不需要特别声明音效文件，但建议在描述中注明：
+
+```lua
+-- modinfo.lua（无需特殊声明，Asset声明在modmain.lua）
+name = "My Character"
+description = "A custom character with custom sounds."
+author = "Your Name"
+version = "1.0"
+```
+
+#### modmain.lua 中的 Asset 声明
+
+```lua
+-- modmain.lua
+Assets =
+{
+    -- 声音文件（必须声明才会被加载）
+    Asset("SOUND", "sound/mymod.fev"),
+    Asset("SOUND", "sound/mymod.fsb"),
+
+    -- 其他资源...
+    Asset("ANIM", "anim/mychar.zip"),
+    Asset("IMAGE", "images/saveslot_portraits/mychar.tex"),
+    Asset("ATLAS", "images/saveslot_portraits/mychar.xml"),
+}
+```
+
+---
+
+### 15.5.6（进阶）在代码里使用自定义音效路径
+
+#### 在 prefab 中配置角色语音
+
+有了自己的 bank 后，在 `master_postinit` 中设置路径覆盖：
+
+```lua
+local function master_postinit(inst)
+    -- 指向自己 bank 的路径前缀
+    inst.talker_path_override = "mymod/characters/"
+    -- soundsname 默认使用 inst.prefab
+    -- 最终拼成：mymod/characters/mychar/talk_LP
+
+    -- 若 prefab 名和事件目录名不一致，用 soundsname 修正
+    -- inst.soundsname = "mychar_v2"
+end
+```
+
+#### 手动调用音效（非标准角色音）
+
+对于不走 SGwilson 模板的音效（物品音、技能音、特效音），直接调用：
+
+```lua
+-- 一次性音效
+inst.SoundEmitter:PlaySound("mymod/items/myitem/pickup")
+
+-- 持续循环音（需要 name handle 来停止）
+inst.SoundEmitter:PlaySound("mymod/ambience/loop_LP", "myambience")
+-- ... 之后停止
+inst.SoundEmitter:KillSound("myambience")
+
+-- 带参数的音效（在 FMOD Studio 中定义了参数的事件）
+inst.SoundEmitter:PlaySoundWithParams("mymod/combat/attack", { charge = 0.8 })
+```
+
+#### 检查 bank 是否被正确加载
+
+如果 bank 未加载就调用 PlaySound，游戏不会崩溃但也不会出声，且控制台会有警告。调试时可以：
+
+1. 在 `modmain.lua` 顶部临时加打印，确认 Asset 声明顺序正确
+2. 检查 mod 目录下 `sound/` 文件夹里文件名是否和 Asset 声明一致（**大小写敏感**）
+3. 使用 `SoundEmitter:PlayingSound(name)` 检查是否在播放
+4. 检查 FMOD Studio 导出时是否选择了正确的 bank 和正确的目标平台
+
+#### 路径大小写问题
+
+Asset 路径和 PlaySound 路径都**大小写敏感**（Windows 开发环境可能不报错，但 Linux 服务器会）。建议统一使用小写字母 + 下划线：
+
+```lua
+-- 推荐（全小写，下划线分隔）
+Asset("SOUND", "sound/mymod.fev")
+PlaySound("mymod/characters/mychar/talk_lp")  -- 注意：vanilla 用 _LP 大写，mod 自定义可以一致
+
+-- 避免（大小写混用）
+Asset("SOUND", "sound/MyMod.fev")  -- 在 Linux 服务器上可能找不到
+```
+
+---
+
+### 15.5.7（老手）RemapSoundEvent —— 全局替换 vanilla 音效
+
+#### RemapSoundEvent 是什么
+
+`RemapSoundEvent` 是 mod API，可以在全局层面把一个 FMOD 事件路径重映射到另一个：
+
+```842:850:scripts/modutil.lua
+	env.RemapSoundEvent = function(name, new_name)
+		initprint("RemapSoundEvent", name, new_name)
+		TheSim:RemapSoundEvent(name, new_name)
+	end
+
+	env.RemoveRemapSoundEvent = function(name) -- Convenience wrapper.
+		initprint("RemoveRemapSoundEvent", name)
+		TheSim:RemapSoundEvent(name) -- Other second parameter values may be nil / the first parameter.
+	end
+```
+
+`TheSim:RemapSoundEvent(old, new)` 是 C++ 绑定——FMOD 引擎收到 `old` 路径的播放请求时，会自动播放 `new` 路径的事件。
+
+#### 典型应用场景
+
+**场景 1：给 mod 角色替换系统角色音**
+
+如果你的 mod 角色用 Wilson 的 prefab 名（不可能），或者你想要替换全局 Wilson 音效（慎用，会影响所有玩 Wilson 的玩家）：
+
+```lua
+-- modmain.lua（极端案例，影响全局）
+RemapSoundEvent("dontstarve/characters/wilson/talk_LP", "mymod/characters/mychar/talk_lp")
+```
+
+**场景 2：替换某个物品的 vanilla 音效**
+
+```lua
+-- 将火堆的小点火音替换为自定义音
+RemapSoundEvent("dontstarve/common/fireBurstSmall", "mymod/sfx/magical_fire_burst")
+```
+
+**场景 3：mod 加载时替换，卸载时恢复**
+
+```lua
+-- modmain.lua
+RemapSoundEvent("dontstarve/sfx/old_path", "mymod/sfx/new_path")
+
+-- 若需要在特定时机恢复：
+-- RemoveRemapSoundEvent("dontstarve/sfx/old_path")
+```
+
+#### 注意事项
+
+1. **全局生效**：`RemapSoundEvent` 影响所有客户端上所有对该路径的调用，包括其他玩家的体验。慎重使用！
+2. **需要目标 bank 已加载**：new_name 指向的 bank 必须已经通过 `Asset("SOUND", ...)` 加载
+3. **不可用于字符级定向替换**：如果只想替换"当玩某个角色时的音效"，请用 `talksoundoverride`/`soundsname` 而不是 `RemapSoundEvent`
+
+---
+
+### 15.5.8（老手）完整 mod 音效实战 —— 从 FMOD 到 PlaySound
+
+#### 目标场景
+
+给一个名为 `"mychar"` 的 mod 角色添加以下自定义音效：
+- 说话循环音（独特的机械嗡嗡声）
+- 受伤音（两种随机选取）
+- 一个特殊技能音效（使用技能时播放）
+
+#### 第 1 步：在 FMOD Studio 创建 bank
+
+1. 新建项目，创建 bank 命名为 `mymod`
+2. 创建以下事件：
+
+```
+事件层级：
+mymod/
+├── characters/
+│   └── mychar/
+│       ├── talk_LP         ← 循环，添加机械嗡嗡素材
+│       ├── hurt            ← 单发，Multi Instrument（2种随机受伤声）
+│       ├── death_voice     ← 单发，死亡音效
+│       └── yawn            ← 单发，疲劳音效
+└── skills/
+    └── mychar/
+        └── special_ability ← 单发，技能释放音效
+```
+
+3. 将所有事件分配到 `mymod` bank
+4. 导出为 `sound/mymod.fev` + `sound/mymod.fsb`
+
+#### 第 2 步：mod 文件结构
+
+```
+mods/workshop-mymod/
+├── modmain.lua
+├── sound/
+│   ├── mymod.fev
+│   └── mymod.fsb
+└── scripts/
+    ├── prefabs/
+    │   └── mychar.lua
+    └── speech_mychar.lua
+```
+
+#### 第 3 步：modmain.lua 声明 Assets
+
+```lua
+-- modmain.lua
+PrefabFiles = { "mychar" }
+
+Assets =
+{
+    Asset("SOUND", "sound/mymod.fev"),
+    Asset("SOUND", "sound/mymod.fsb"),
+    -- 其他 assets...
+}
+
+local STRINGS = GLOBAL.STRINGS
+STRINGS.CHARACTERS.MYCHAR = require "speech_mychar"
+STRINGS.NAMES.MYCHAR = "My Character"
+```
+
+#### 第 4 步：在 prefab 中配置语音音效
+
+```lua
+-- scripts/prefabs/mychar.lua
+local MakePlayerCharacter = require "prefabs/player_common"
+
+local assets =
+{
+    Asset("SCRIPT", "scripts/prefabs/player_common.lua"),
+    -- 角色特有 assets（sound 在 modmain 中声明即可）
+}
+
+local function master_postinit(inst)
+    -- 数值
+    inst.components.health:SetMaxHealth(150)
+    inst.components.hunger:SetMax(150)
+    inst.components.sanity:SetMax(200)
+
+    -- 语音音效：指向自己的 bank
+    inst.talker_path_override = "mymod/characters/"
+    -- soundsname 不设，默认用 "mychar"
+    -- → talk_LP: mymod/characters/mychar/talk_LP
+    -- → hurt:    mymod/characters/mychar/hurt
+    -- → death:   mymod/characters/mychar/death_voice
+
+    -- talker 样式
+    inst.components.talker.fontsize = 35
+    inst.components.talker.font = GLOBAL.TALKINGFONT
+    inst.components.talker.colour = GLOBAL.Vector3(0.5, 0.8, 1.0)
+end
+
+local function common_postinit(inst)
+    inst.MiniMapEntity:SetIcon("mychar.tex")
+end
+
+return MakePlayerCharacter("mychar", {}, assets, common_postinit, master_postinit)
+```
+
+#### 第 5 步：在技能代码中调用特殊音效
+
+```lua
+-- 在某个组件或事件回调中
+local function OnUseSpecialAbility(inst)
+    if inst.SoundEmitter then
+        inst.SoundEmitter:PlaySound("mymod/skills/mychar/special_ability")
+    end
+    -- ... 技能逻辑
+end
+
+inst:ListenForEvent("special_ability", OnUseSpecialAbility)
+```
+
+#### 验证清单
+
+在测试时，依次核查：
+- [ ] `sound/` 目录下 `.fev` 和 `.fsb` 文件名与 `Asset()` 声明完全一致（大小写）
+- [ ] FMOD Studio 中事件路径前缀与 bank 名一致（`mymod/...`）
+- [ ] `talker_path_override` 末尾有 `/`（`"mymod/characters/"` 而非 `"mymod/characters"`）
+- [ ] mod 角色发音时控制台无 `FMOD ERROR` 输出
+- [ ] 多人模式下其他玩家也能听到声音（bank 在客户端侧加载）
+
+---
+
+### 15.5.9（小结）速查表 + 常见错误 + 本章总结
+
+#### 四条路线速查
+
+| 路线 | 所需文件 | 适合场景 | 代码量 |
+|---|---|---|---|
+| **A：借用角色音效** | 无需额外文件 | mod 角色，声音要求不高 | 1 行：`soundsname = "xxx"` |
+| **B：直接引用 vanilla 路径** | 无需额外文件 | 借用物品/环境音效 | `PlaySound("dontstarve/...")` |
+| **C：RemapSoundEvent** | 自己的 .fev/.fsb | 全局替换 vanilla 音效 | modmain 1~2 行 |
+| **D：完全自定义 bank** | 自己的 .fev/.fsb | 全新音效需求 | FMOD Studio + Asset 声明 |
+
+#### Asset 声明速查
+
+| 需求 | 声明方式 |
+|---|---|
+| 仅依赖 vanilla fsb（如 sfx.fsb）| `Asset("SOUND", "sound/sfx.fsb")` |
+| 自定义配对 bank | `Asset("SOUND", "sound/mymod.fev")` + `Asset("SOUND", "sound/mymod.fsb")` |
+| mod 全局音效（多 prefab 共用）| 放在 `modmain.lua` 的 `Assets = {}` 里 |
+| prefab 独占音效 | 放在 prefab 文件的 `local assets = {}` 里 |
+
+#### bank 命名与路径对应速查
+
+| bank 文件名 | 对应事件路径前缀 | vanilla 实例 |
+|---|---|---|
+| `dontstarve.fev` | `dontstarve/` | `dontstarve/characters/wilson/talk_LP` |
+| `wanda2.fev` | `wanda2/` | `wanda2/characters/wanda/talk_old_LP` |
+| `monkeyisland.fev` | `monkeyisland/` | `monkeyisland/characters/wonkey/talk_LP` |
+| `mymod.fev` | `mymod/` | `mymod/characters/mychar/talk_LP` |
+
+#### 常见错误与解决
+
+| 错误现象 | 可能原因 | 解决方案 |
+|---|---|---|
+| 说话时无声，无 FMOD ERROR | bank 路径或事件路径打错 | 检查大小写；用日志打印确认路径 |
+| FMOD ERROR: event not found | bank 未加载 / 事件名拼错 | 确认 Asset() 声明 + 事件命名 |
+| 只有本地有声，联机他人无声 | bank 未在客户端侧加载 | 将 Asset 声明移至 modmain Assets 表，而非仅服务端 prefab |
+| FMOD Studio 导出的 .bank 不识别 | 使用了 FMOD Studio 2.x | 饥荒需要 FMOD Studio 1.x（1.10.x 推荐）|
+| Linux/Mac 服务器找不到文件 | 文件名大小写问题 | 统一全小写文件名 |
+
+#### 本节 & 本章总结
+
+```
+15.1 → SoundEmitter 组件 —— entity 发声的统一接口（PlaySound/KillSound/SetParameter）
+15.2 → PlaySoundWithParams —— FMOD 参数化音效（动态强度、状态切换）
+15.3 → DynamicMusic + AmbientSound —— BGM 与环境音的全局系统
+15.4 → 角色语音系统 —— speech 文件 + GetString + talker:Say + 音效路径
+15.5 → 自定义音效文件 —— .fev/.fsb 体系 + FMOD Studio 工作流 + RemapSoundEvent
+```
+
+**完整音效开发路线（15.5 角度）**：
+1. **需求判断** → 是借音（路线 A/B）还是全新音效（路线 D）？
+2. **路线 A/B**：设 `soundsname`、直接写 vanilla 路径，0 额外文件
+3. **路线 D**：FMOD Studio 1.x → 创建 bank（名与路径前缀一致）→ 导出 `.fev`+`.fsb` → 放 `sound/` → `Asset("SOUND", ...)` 声明 → `talker_path_override` + 代码引用
+4. **RemapSoundEvent**：有已有 bank 且想替换 vanilla 路径时使用
+
+---

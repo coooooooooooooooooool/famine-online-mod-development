@@ -5728,12 +5728,2301 @@ end
 
 ## 16.8 数据收集 UI：Cookbook、PlantRegistry 与 Scrapbook
 
-（待编写）
+### 本节导读
+
+16.1-16.7 我们一直在讲"**主动 UI**"——玩家点击、弹出、交互。本节换一个方向：**被动积累型 UI**——这类界面不需要玩家主动操作，它们在玩家游玩过程中**悄悄积累数据**，等玩家打开时展现"已解锁的知识"。
+
+饥荒联机版有三个这样的系统：
+
+| 系统 | 触发方式 | 记录什么 | 全局变量 |
+|------|----------|----------|---------|
+| **Cookbook（食谱书）** | 用锅煮出食物 / 吃掉食物 | 菜谱配方 + 营养值 | `TheCookbook` |
+| **PlantRegistry（植物图鉴）** | 靠近农作物/杂草 | 各生长阶段 + 肥料效果 | `ThePlantRegistry` |
+| **Scrapbook（剪贴簿）** | 游戏中见过物体 / 角色检查 | 生物/物品的属性与掉落 | `TheScrapbookPartitions` |
+
+三个系统**架构惊人相似**：
+```
+游戏事件 → 更新器组件（CookbookUpdater / PlantRegistryUpdater） → 数据类（*Data）→ 持久化
+```
+UI 打开时**只是"展示"** `*Data` / `TheScrapbookPartitions` 里的内容——不影响游戏逻辑。
+
+> **新手**先看 16.8.1-16.8.4——理解三个系统"积累知识"的触发条件、看懂 `TheCookbook:IsUnlocked` / `ThePlantRegistry:KnowsPlantStage` / `TheScrapbookPartitions:GetLevelFor` 这三个查询入口；**进阶读者**继续看 16.8.5-16.8.7，深入 `CookbookData:AddRecipe` 的排序记忆机制、`PlantRegistry` 的位编码持久化、`ScrapbookPartitions` 的 32 位分桶架构；**老手**跳到 16.8.8-16.8.10，掌握 mod 如何接入 Cookbook（`IsModCookerFood` 豁免机制）、如何让 mod prefab 进 Scrapbook（`scrapbookable` + `scrapbook_proxy`），以及五个常见的"数据写了但 UI 显示不对"的坑。
+
+读完本节，你能**不靠猜**地理解为什么有些 mod 食物进了食谱书有些没进、为什么 Scrapbook 里有两个"见过等级"、以及怎么让自己的 mod 物品出现在这三个展示页里。
+
+---
+
+### 16.8.1 快速入门：三个系统的整体架构——数据层 + 更新器 + UI
+
+在深入每个系统之前，先看**共同骨架**：
+
+#### 第一步："数据层"—— `*Data` 类
+
+每个系统都有一个纯数据类，负责**存储"玩家已知"的知识**和**持久化**：
+
+| 文件 | 全局实例 | 存储键 |
+|------|----------|--------|
+| `scripts/cookbookdata.lua` | `TheCookbook` | `"cookbook"` |
+| `scripts/plantregistrydata.lua` | `ThePlantRegistry` | `"plantregistry"` |
+| `scripts/scrapbookpartitions.lua` | `TheScrapbookPartitions` | 分桶 16 个 key |
+
+持久化全部走 `TheSim:SetPersistentString(key, str, false)` / `TheSim:GetPersistentString`——这是**客户端本地存档**，**不随世界存档保存**（服务器上不调用）。
+
+#### 第二步："更新器组件"—— 挂在玩家上的 Component
+
+每个系统都有一个组件，挂在 **Player** 身上：
+
+```lua
+-- scripts/prefabs/player_common.lua（示意）
+inst:AddComponent("cookbookupdater")      -- Cookbook
+inst:AddComponent("plantregistryupdater") -- PlantRegistry
+```
+
+组件的职责：**捕获游戏事件 → 调用数据层的 Learn/Add 方法 → 可选地向客户端 RPC 同步**。
+
+Scrapbook 稍有不同——它没有独立更新器组件，更新入口直接在 `TheScrapbookPartitions` 的公共方法上。
+
+#### 第三步："UI 层"
+
+| 系统 | 入口 |
+|------|------|
+| Cookbook | 玩家持有 `cookbook` 物品并"阅读"它，或在 HUD 点击食谱按钮 |
+| PlantRegistry | HUD 上的植物图鉴按钮 |
+| Scrapbook | 按 `Tab` → 点击剪贴簿按钮，或游戏内解锁后弹出 Toast |
+
+> **新手记忆**：三层结构——数据层存知识、更新器组件触发学习、UI 层展示。**数据存在客户端本地，不是世界存档的一部分**——服务器上完全不读写这些数据。
+
+---
+
+### 16.8.2 快速入门：Cookbook——吃过才知道怎么做
+
+Cookbook 记录两件事：
+1. **用什么食材做出了这道菜**（`AddRecipe`，烹饪时触发）
+2. **吃过这道菜**（`LearnFoodStats`，进食时触发）
+
+#### 第一步：更新器的两个方法
+
+```9:28:scripts/components/cookbookupdater.lua
+local CookbookUpdater = Class(function(self, inst)
+    self.inst = inst
+
+	self.cookbook = require("cookbookdata")()
+	inst:ListenForEvent("playeractivated", onplayeractivated)
+end)
+
+function CookbookUpdater:LearnRecipe(product, ingredients)
+	if product ~= nil and ingredients ~= nil then
+		local updated = self.cookbook:AddRecipe(product, ingredients)
+		--print("CookbookUpdater:LearnRecipe", product, updated, unppack(ingredients))
+
+		-- Servers will only tell the clients if this is a new recipe in this world
+		-- Since the servers do not know the client's actual cookbook data, this is the best we can do for reducing the amount of data sent
+		if updated and (TheNet:IsDedicated() or (TheWorld.ismastersim and self.inst ~= ThePlayer)) and self.inst.userid then
+			--can't send tables via rpc, so unpack the table before sending.
+			SendRPCToClient(CLIENT_RPC.LearnRecipe, self.inst.userid, product, unpack(ingredients))
+		end
+	end
+end
+```
+
+- **`LearnRecipe(product, ingredients)`** —— product 是食物名，ingredients 是食材名列表。在锅煮完后由 `cookpot.lua` 调用
+- **`LearnFoodStats(product)`** —— product 是食物名。在玩家吃下食物后由 `eater.lua` 调用
+
+#### 第二步：什么食物才能被记录？
+
+`CookbookData:IsValidEntry` 检查食物**是否在 `cooking.cookbook_recipes` 里**——只有"能在锅里做出来"的食物才算有效条目。
+
+```131:138:scripts/cookbookdata.lua
+function CookbookData:IsValidEntry(product)
+	for cooker, recipes in pairs(cooking.cookbook_recipes) do
+		if recipes[product] ~= nil then
+			return true
+		end
+	end
+	return false
+end
+```
+
+原味食物（直接摘的浆果、肉）不在 `cookbook_recipes` 里——**进不了食谱书**。
+
+#### 第三步：两种查询
+
+```lua
+-- 检查这道菜是否已解锁（只要煮过或吃过）
+TheCookbook:IsUnlocked("meatballs")  -- 返回解锁数据 or nil
+
+-- 检查是否吃过（解锁了营养值数据）
+local entry = TheCookbook:IsUnlocked("meatballs")
+if entry and entry.has_eaten then
+    -- 玩家知道营养数值
+end
+```
+
+> **新手记忆**：Cookbook 有两级——**煮过**解锁配方栏（`recipes`）、**吃过**解锁营养值（`has_eaten`）。这两步都需要才能在食谱书里看到完整信息。
+
+---
+
+### 16.8.3 快速入门：PlantRegistry——靠近就能解锁
+
+PlantRegistry 记录**玩家观察到的植物生长阶段**和**使用过的肥料**。
+
+#### 第一步：三个更新器方法
+
+```16:48:scripts/components/plantregistryupdater.lua
+function PlantRegistryUpdater:LearnPlantStage(plant, stage)
+    if plant and stage then
+		local updated = self.plantregistry:LearnPlantStage(plant, stage)
+
+		if updated and TheFocalPoint.entity:GetParent() == self.inst then
+			TheFocalPoint.SoundEmitter:PlaySound("dontstarve/HUD/get_gold")
+		end
+		-- ...
+		if updated and (TheNet:IsDedicated() or ...) and self.inst.userid then
+			SendRPCToClient(CLIENT_RPC.LearnPlantStage, self.inst.userid, plant, stage)
+		end
+	end
+end
+```
+
+- **`LearnPlantStage(plant, stage)`** —— plant 是植物名（如 `"asparagus"`），stage 是整数阶段编号（1 = 第一阶段 seedling，以此类推）。由农田相关代码在玩家靠近时调用
+- **`LearnFertilizer(fertilizer)`** —— 使用肥料时记录
+- **`TakeOversizedPicture(plant, weight, beardskin, beardlength)`** —— 巨型作物摄影时调用（植物图鉴的"照片"功能）
+
+#### 第二步：三种查询
+
+```17:40:scripts/plantregistrydata.lua
+function PlantRegistryData:GetKnownPlants()
+	return self.plants
+end
+
+function PlantRegistryData:GetKnownPlantStages(plant)
+	if self.plants[plant] then
+		return self.plants[plant]
+	end
+	return {}
+end
+
+-- ...
+
+function PlantRegistryData:KnowsPlantStage(plant, stage)
+	if self.plants[plant] then
+		return self.plants[plant][stage] == true
+	end
+	return false
+end
+```
+
+- `ThePlantRegistry:KnowsPlantStage("asparagus", 1)` —— 是否知道芦笋第 1 阶段
+- `ThePlantRegistry:KnowsFertilizer("poop")` —— 是否用过粪便作肥料
+- `ThePlantRegistry:HasOversizedPicture("asparagus")` —— 是否拍过巨型芦笋
+
+#### 第三步：完成度进度
+
+```76:99:scripts/plantregistrydata.lua
+function PlantRegistryData:GetPlantPercent(plant, plantregistryinfo)
+	local totalstages = 0
+	local knownstages = 0
+	-- ...
+	return knownstages / totalstages
+end
+```
+
+这个值是 UI 里那个圆形进度条的来源——只统计 `growing` 和 `fullgrown` 阶段，不包括种子阶段。
+
+> **新手记忆**：PlantRegistry 靠**距离触发**（不需要主动操作）——玩家走到农田附近，游戏自动调 `LearnPlantStage`；只有 `PLANT_DEFS` / `WEED_DEFS` 里定义的植物才会被记录。
+
+---
+
+### 16.8.4 快速入门：Scrapbook——见过就记录，检查解锁详情
+
+Scrapbook（剪贴簿）有**两个解锁等级**：
+
+| 等级 | 触发方式 | 意义 |
+|------|----------|------|
+| **Level 1（见过）** | 游戏中见到该物体（`SetSeenInGame`）| 剪贴簿里有条目，但详情是灰色问号 |
+| **Level 2（检查过）** | 特定角色对其使用"检查"动作（`SetInspectedByCharacter`）| 详情完全解锁，包括属性、掉落 |
+
+#### 第一步：三个核心查询
+
+```304:322:scripts/scrapbookpartitions.lua
+function ScrapbookPartitions:GetLevelFor(thing)
+    thing = self:RedirectThing(thing)
+
+    if type(thing) ~= "string" then
+        return 0
+    end
+
+    local hashed = hash(thing)
+    local data = self.storage[hashed]
+
+    if data == nil then
+        return 0 -- If a thing is unknown it is level 0.
+    end
+
+    if band(data, LOOKUP_LIST_MASK) == 0 then
+        return 1 -- If a thing has been seen but not inspected it is level 1.
+    end
+
+    -- ...
+    return 2 -- If a thing has been seen and inspected once it is level 2.
+end
+```
+
+```lua
+TheScrapbookPartitions:GetLevelFor("evergreen")       -- 0 / 1 / 2
+TheScrapbookPartitions:WasSeenInGame("deerclops")     -- bool
+TheScrapbookPartitions:WasInspectedByCharacter("deerclops", "wilson")  -- bool
+```
+
+#### 第二步：数据来源 —— 自动生成的 `scrapbookdata.lua`
+
+Scrapbook 里每个条目的**显示内容**（血量、伤害、掉落）来自 `scripts/screens/redux/scrapbookdata.lua`：
+
+```2:9:scripts/screens/redux/scrapbookdata.lua
+-- AUTOGENERATED FROM d_createscrapbookdata()   < debugcommands.lua >
+
+return {
+    abigail = {name="abigail", tex="abigail.tex", type="creature", prefab="abigail", speechstatus={"LEVEL1", "1"}, health=150, damage="15-40", build="ghost_abigail_build", bank="ghost", anim="idle"},
+    abigail_flower = {name="abigail_flower", tex="abigail_flower.tex", type="item", prefab="abigail_flower", ...},
+    -- ...
+```
+
+注意文件头的 `AUTOGENERATED FROM d_createscrapbookdata()` ——这个文件**不是手写的**，是由调试命令自动生成。每条记录里的 `type` 字段决定分类（`"creature"`, `"item"`, `"thing"`, `"food"`, `"giant"`, `"POI"` 等）。
+
+#### 第三步：哪些 prefab 进了 Scrapbook？
+
+`scripts/scrapbook_prefabs.lua` 是一份白名单——只有在这里列出的 prefab，才有可能被 `SetSeenInGame` 记录：
+
+```1:10:scripts/scrapbook_prefabs.lua
+local PREFABS =
+{
+    ["statue_marble_muse"] = true,
+    ["statue_marble_pawn"] = true,
+
+    ["abigail"] = true,
+    ["wobybig"] = true,
+    ["chester"] = true,
+    -- ...
+```
+
+`scrapbook_page.lua`（剪贴簿页物品）掉落时会读这张表，随机解锁若干条目（`TryToTeachScrapbookData_Random`）。
+
+> **新手记忆**：Scrapbook 有两级解锁——**Level 1 = 见过**（条目变白）、**Level 2 = 检查过**（完整属性）；条目来自自动生成的 `scrapbookdata.lua`，不是每个 prefab 都在里面。
+
+---
+
+### 16.8.5 进阶：CookbookData 的记忆排序机制与双路持久化
+
+#### 第一步：`AddRecipe` 的配方槽排序
+
+`CookbookData` 为每道菜最多保存 `MAX_RECIPES = 6` 条不同的配方记录，并实现了**"最近使用靠前"**的排序逻辑：
+
+```3:3:scripts/cookbookdata.lua
+local MAX_RECIPES = 6
+```
+
+```191:237:scripts/cookbookdata.lua
+function CookbookData:AddRecipe(product, ingredients)
+	if product == nil or ingredients == nil then
+		print("Invalid cookbook recipe:", product, unpack(ingredients or {"(empty)"}))
+		return
+	elseif not self:IsValidEntry(product) then
+		--silent fail
+		return false
+	end
+
+	ingredients = self:RemoveCookedFromName(ingredients)
+	table.sort(ingredients)
+
+	local updated = false
+
+	local preparedfood = UnlockPreparedFood(self, product)
+	if preparedfood.recipes == nil then
+		preparedfood.recipes = {ingredients}
+
+		self.newfoods[product] = true
+		updated = true
+	else
+		local recipes = preparedfood.recipes
+		local known_index = IsKnownRecipe(recipes, ingredients)
+		if known_index ~= nil then
+			if known_index > 2 then
+				table.remove(recipes, known_index)
+				table.insert(recipes, 1, ingredients)
+				updated = true
+			end
+		else
+			if #recipes >= MAX_RECIPES then
+				table.remove(recipes, #recipes)
+			end
+			table.insert(recipes, 1, ingredients)
+			self.newfoods[product] = true
+			updated = true
+		end
+	end
+
+	if updated and self.save_enabled then
+		if not cooking.IsModCookerFood(product) and not TheNet:IsDedicated() then
+			TheInventory:SetCookBookValue(product, EncodeCookbookEntry(preparedfood))
+		end
+		self:Save(true)
+	end
+
+	return updated
+end
+```
+
+**核心逻辑**：
+1. 食材名先经过 `RemoveCookedFromName` 去掉 `cooked_` / `_cooked` 前后缀 → 再 `table.sort` 字母排序——**防止"肉+浆果"和"浆果+肉"被视为不同配方**
+2. 如果这个配方已知且排名在第 3 位以内（`known_index <= 2`），不触发更新；如果在第 3 位之后，把它**移到最前**（LRU 行为）
+3. 如果是全新配方且槽位满了，踢掉最末尾那条；新配方插到最前
+
+这就是食谱书里"最近使用的配方靠前"背后的实现。
+
+#### 第二步：双路持久化
+
+CookbookData 有两个持久化途径，互为备份：
+
+| 途径 | 函数 | 存储位置 |
+|------|------|----------|
+| **本地** | `TheSim:SetPersistentString("cookbook", ...)` | 本地文件（`persistent_string_num.lua`）|
+| **在线** | `TheInventory:SetCookBookValue(product, encoded)` | Klei 账号服务器 |
+
+`CookbookData:Load` 先读本地文件，失败时调 `ApplyOnlineProfileData` 从账号服务器恢复：
+
+```26:66:scripts/cookbookdata.lua
+function CookbookData:Load()
+	self.preparedfoods = {}
+    self.filters = {}
+    local needs_save = false
+    local really_bad_state = false
+	TheSim:GetPersistentString("cookbook", function(load_success, data)
+		if load_success and data ~= nil then
+			local status, recipe_book = pcall( function() return json.decode(data) end )
+		    if status and recipe_book then
+                -- ...
+			else
+                really_bad_state = true
+				print("Failed to load the cookbook!", status, recipe_book)
+			end
+		end
+	end)
+    if really_bad_state then
+        print("Trying to apply online cache of cookbook data..")
+        if self:ApplyOnlineProfileData() then
+            -- 恢复成功
+        end
+    end
+end
+```
+
+**关键**：`save_enabled` 标志位控制是否真正写入——只有**本机玩家**且**已激活（playeractivated）**后才允许写入：
+
+```1:6:scripts/components/cookbookupdater.lua
+local function onplayeractivated(inst)
+	local self = inst.components.cookbookupdater
+	if not TheNet:IsDedicated() and inst == ThePlayer then
+		self.cookbook = TheCookbook
+		self.cookbook.save_enabled = true
+	end
+end
+```
+
+这个设计**避免了"服务器帮客户端写档"**——服务端只通过 RPC 告知客户端"有新菜谱"，客户端自己写本地存档。
+
+#### 第三步：编码格式
+
+本地存档用 JSON；在线存档用紧凑的字符串编码：
+
+```68:87:scripts/cookbookdata.lua
+local function DecodeCookbookEntry(value)
+	local data = {recipes = {}}
+	local recipes = string.split(value, "|")
+	for i = 1, #recipes-1 do
+		table.insert(data.recipes, string.split(recipes[i], ","))
+	end
+	data.has_eaten = recipes[#recipes] == "true"
+	return data
+end
+
+local function EncodeCookbookEntry(entry)
+	local str = ""
+	if entry.recipes ~= nil then
+		for i = 1, math.min(MAX_RECIPES, #entry.recipes) do
+			local r = entry.recipes[i]
+			str = str .. table.concat(r, ",") .. "|"
+		end
+	end
+	str = str .. (entry.has_eaten and "true" or "false")
+	return str
+end
+```
+
+**格式**：`ingredient1,ingredient2|ingredient3,ingredient4|true`——每条配方用 `,` 分隔食材，配方间用 `|` 分隔，最后一段是 `has_eaten` 标志。
+
+> **进阶记忆**：`AddRecipe` 内部先规范化食材（去 cooked 前缀 + 字母排序），再做 LRU 更新；双路持久化让账号换机器不丢菜谱；`save_enabled` 标志确保只有本机玩家才写档。
+
+---
+
+### 16.8.6 进阶：PlantRegistryData 的阶段追踪与位编码
+
+#### 第一步：`LearnPlantStage` 的完整流程
+
+```213:248:scripts/plantregistrydata.lua
+function PlantRegistryData:LearnPlantStage(plant, stage)
+	if plant == nil or stage == nil then
+		print("Invalid plant or stage", plant, stage)
+		return
+	end
+
+	local def = PLANT_DEFS[plant] or WEED_DEFS[plant]
+
+	local previouspercent = def and def.plantregistryinfo and self:GetPlantPercent(plant, def.plantregistryinfo) or 0
+
+	local stages = UnlockPlant(self, plant)
+	local updated = stages[stage] == nil
+	stages[stage] = true
+
+	if updated and self.save_enabled then
+		if def and not def.modded and not TheNet:IsDedicated() then
+			TheInventory:SetPlantRegistryValue(plant, EncodePlantRegistryStages(stages))
+		end
+		local currentpercent = def and def.plantregistryinfo and self:GetPlantPercent(plant, def.plantregistryinfo) or 0
+
+		if previouspercent < 1 and currentpercent >= 1 and def.plantregistrysummarywidget then
+			self:SetLastSelectedCard(plant, "summary")
+		else
+			local higheststage = 0
+			for k in pairs(stages) do
+				higheststage = math.max(higheststage, k)
+			end
+			if higheststage == stage then
+				self:SetLastSelectedCard(plant, stage)
+			end
+		end
+		self:Save(true)
+	end
+
+	return updated
+end
+```
+
+**关键细节**：
+- `def.modded` 标志——如果是 mod 植物，**不**调用 `TheInventory:SetPlantRegistryValue`，只写本地存档
+- `previouspercent` 和 `currentpercent` 比对——当完成度**从 < 1 升到 ≥ 1（完整解锁）**时，自动把最后选中卡片设为 `"summary"`（植物图鉴里的"总结页"）；否则记住玩家解锁的最高阶段
+- 同样依赖 `save_enabled` 防止服务端写档
+
+#### 第二步：阶段的位编码
+
+在线存档用十六进制字符串保存哪些阶段已知：
+
+```137:154:scripts/plantregistrydata.lua
+local function DecodePlantRegistryStages(value)
+	local bitstages = tonumber(value, 16)
+	local stages = {}
+	for i = 1, 8 do
+		if checkbit(bitstages, 2^(i-1)) then
+			stages[i] = true
+		end
+	end
+	return stages
+end
+
+local function EncodePlantRegistryStages(stages)
+	local bitstages = 0
+	for i in pairs(stages) do
+		bitstages = setbit(bitstages, 2^(i-1))
+	end
+	return string.format("%x", bitstages)
+end
+```
+
+**设计**：8 位 bit，每位对应一个阶段（stage 1~8）。8 种阶段用一个 hex 字符串（最多 2 个字符）存储——极度紧凑，适合写入 Klei 账号服务器。
+
+比如 `stages = {1=true, 3=true}` → `bitstages = 0b00000101 = 0x5` → 存 `"5"`。
+
+#### 第三步：巨型作物照片的特殊持久化
+
+```277:327:scripts/plantregistrydata.lua
+function PlantRegistryData:TakeOversizedPicture(plant, weight, player, beardskin, beardlength)
+	-- ...
+
+	picture.weight = weight
+	picture.player = player.prefab
+	local clienttable = TheNet:GetClientTableForUser(player.userid)
+	picture.clothing = {
+		body = clienttable.body_skin,
+		hand = clienttable.hand_skin,
+		legs = clienttable.legs_skin,
+		feet = clienttable.feet_skin,
+	}
+	picture.base = clienttable.base_skin
+	-- ...
+	if def and not def.modded and not TheNet:IsDedicated() then
+		TheInventory:SetPlantRegistryValue("oversized_"..plant, TheSim:ZipAndEncodeString(DataDumper(picture, nil, true)))
+	end
+```
+
+**照片数据**包含：重量、拍摄角色、当前穿的皮肤（body/hand/legs/feet/base）、胡子数据——这些在 UI 里用来**渲染一张带角色的"纪念照"**。数据用 `ZipAndEncodeString` 压缩再 base64 编码，才写入在线存档。
+
+> **进阶记忆**：PlantRegistry 阶段用 8 bit 编码；mod 植物设 `def.modded = true` 可豁免在线同步；解锁完整图鉴时自动跳到 "summary" 卡片；照片数据里含皮肤信息，渲染时可还原玩家外观。
+
+---
+
+### 16.8.7 进阶：ScrapbookPartitions 的位存储与分桶架构
+
+Scrapbook 的存储设计最为复杂，因为它需要**同时记录"哪些角色检查过哪些物体"**，并且**不能一次把所有数据推给 Klei 后端**（条目太多，大约 1000+ 个 prefab）。
+
+#### 第一步：32 位存储格式
+
+每个 prefab 对应一个 32 位整数：
+
+```16:27:scripts/scrapbookpartitions.lua
+local FLAGS = { -- DO NOT REARRANGE ORDER OR CHANGE VALUES
+    ["VIEWED_IN_SCRAPBOOK"] = 0x00000001, -- bit 0
+}
+
+local LOOKUP_LIST = { -- DO NOT REARRANGE ORDER OR CHANGE VALUES
+    ["wilson"]       = 0x00000100, --  bit 8
+    ["willow"]       = 0x00000200, --  bit 9
+    ["wolfgang"]     = 0x00000400, --  bit 10
+    -- ...（18 个角色，占 bit 8~31）
+    ["wanda"]        = 0x02000000, --  bit 25
+}
+```
+
+**布局**：
+
+```
+Bit 31 ... Bit 8         Bit 7 ... Bit 1   Bit 0
+[角色检查位 × 18]          [保留]            [VIEWED_IN_SCRAPBOOK]
+```
+
+- **Bit 0 = `VIEWED_IN_SCRAPBOOK`**：玩家是否已在剪贴簿界面点击查看过（用于"新条目"红点）
+- **Bit 8~25 = 角色位**：Wilson 检查过→ bit 8 置 1，Willow 检查过→ bit 9 置 1……
+
+只要**任意一个角色位为 1**，`GetLevelFor` 就返回 2（完整解锁）；所有角色位都为 0 但条目在 `storage` 里（即使为 0），就是 Level 1（已见过）。
+
+**mod 角色的特殊处理**：
+
+```244:247:scripts/scrapbookpartitions.lua
+    if table.contains(MODCHARACTERLIST, character) then
+        character = "wilson" -- Modded characters do not save instead use Wilson as a fallback.
+    end
+```
+
+mod 自定义角色**统一归入 Wilson 槽**——避免需要扩展 32 位表。
+
+#### 第二步：分桶存储
+
+为了不一次上传太多数据，`ScrapbookPartitions` 把 hash 空间切成 **16 个桶**：
+
+```70:70:scripts/scrapbookpartitions.lua
+local BUCKETS_MASK = 0xF -- 16 buckets 0 to 15
+```
+
+```88:90:scripts/scrapbookpartitions.lua
+local function GetBucketForHash(hashed)
+    return band(BUCKETS_MASK, hashed)
+end
+```
+
+每个桶独立读写——某个桶 dirty 时，只上传该桶的数据，不需要重传所有记录。
+
+#### 第三步：四个核心方法对比
+
+| 方法 | 作用 | 调用时机 |
+|------|------|---------|
+| `SetSeenInGame(thing)` | 置 Level 1（在游戏中见到） | 实体进入玩家视野时 |
+| `WasSeenInGame(thing)` | 查询是否 Level ≥ 1 | UI 渲染、检查逻辑 |
+| `SetInspectedByCharacter(thing, char)` | 置 Level 2（角色检查） | 玩家执行检查动作时 |
+| `WasInspectedByCharacter(thing, char)` | 查询特定角色是否检查过 | UI 显示角色图标 |
+
+注意 `SetInspectedByCharacter` 还有一个副作用：
+
+```295:295:scripts/scrapbookpartitions.lua
+    self:SetViewedInScrapbook(thing, false) -- Mark as new.
+```
+
+每次角色检查后，`VIEWED_IN_SCRAPBOOK` 位被**清零**——下次打开剪贴簿，这个条目会显示"新"红点，直到玩家在 UI 里点击它（`SetViewedInScrapbook(true)`）才清除。
+
+> **进阶记忆**：每个 prefab 的数据是 1 个 32 位整数：bit 0 是"已看过 UI"、bit 8-25 是各角色检查位；mod 角色合并到 Wilson 位；16 桶分片避免全量上传。
+
+---
+
+### 16.8.8 老手：给 mod 食物接入 Cookbook
+
+#### 第一步：让食物通过 `IsValidEntry` 检查
+
+`IsValidEntry` 检查食物是否在 `cooking.cookbook_recipes` 里，关键是**先用官方 API 注册菜谱**。假设 mod 在自定义锅（`mod_pot`）里做 `mod_dish`：
+
+```lua
+-- modmain.lua / cooking 相关文件
+-- 用 AddCookerRecipe 向自定义锅注册食谱
+AddCookerRecipe("mod_pot", {
+    name = "mod_dish",
+    -- ...
+})
+```
+
+注册成功后 `cooking.cookbook_recipes["mod_pot"]["mod_dish"]` 存在，`IsValidEntry("mod_dish")` 返回 `true`。
+
+#### 第二步：`IsModCookerFood` 豁免机制
+
+```37:39:scripts/cooking.lua
+local function IsModCookerFood(prefab)
+	return not official_foods[prefab] -- note: we cannot test against cookbook_recipes[MOD_COOKBOOK_CATEGORY] because if the mod is unloaded, it would return true
+end
+```
+
+`official_foods` 是在 `cooking.lua` 加载时把所有**内置食物**加进去的表——**mod 食物默认不在里面**，`IsModCookerFood` 返回 `true`。
+
+这个标志在 `AddRecipe` / `LearnFoodStats` 里的含义：
+
+```230:234:scripts/cookbookdata.lua
+	if updated and self.save_enabled then
+		if not cooking.IsModCookerFood(product) and not TheNet:IsDedicated() then
+			TheInventory:SetCookBookValue(product, EncodeCookbookEntry(preparedfood))
+		end
+		self:Save(true)
+	end
+```
+
+mod 食物：**只写本地存档，不上传账号服务器**——避免 mod 卸载后在线数据留垃圾。本地存档照常写，所以玩家在有 mod 的情况下重开游戏，食谱书里的 mod 食物记录不会丢。
+
+#### 第三步：触发时机
+
+mod 锅煮完食物时，需要手动调：
+
+```lua
+-- 在 cookpot 类组件的 DoneStewing 等回调中
+if doer.components.cookbookupdater then
+    doer.components.cookbookupdater:LearnRecipe(product, ingredients)
+end
+
+-- 在 eater 组件的 OnEat 回调中
+if eater.inst.components.cookbookupdater then
+    eater.inst.components.cookbookupdater:LearnFoodStats(product)
+end
+```
+
+官方 `cookpot.lua` 和 `eater.lua` 已经有这些调用。如果 mod 完全复用官方组件，**无需额外操作**；如果实现了自定义烹饪系统，需要自行调用上述方法。
+
+> **老手记忆**：mod 食物只需通过 `AddCookerRecipe` 注册菜谱即可自动进入食谱书；`IsModCookerFood` 豁免在线同步，本地存档正常写；自定义烹饪系统需手动调 `LearnRecipe` / `LearnFoodStats`。
+
+---
+
+### 16.8.9 老手：给 mod 实体加入 Scrapbook（scrapbookable + proxy 模式）
+
+Scrapbook 的数据来源是**自动生成的** `scrapbookdata.lua`，mod 无法直接修改它。但游戏提供了两种途径接入。
+
+#### 途径一：`scrapbookable` 组件（角色检查触发）
+
+为实体添加 `scrapbookable` 组件，当玩家对其执行"检查"动作时，会调用 `Scrapbookable:Teach(doer)`：
+
+```1:16:scripts/components/scrapbookable.lua
+local Scrapbookable = Class(function(self, inst)
+    self.inst = inst
+end)
+
+function Scrapbookable:SetOnTeachFn(fn)
+    self.onteach = fn
+end
+
+function Scrapbookable:Teach(doer)
+    if self.onteach ~= nil then
+        self.onteach(self.inst, doer)
+    end
+
+    return true
+end
+```
+
+`onteach` 回调里调用 `TheScrapbookPartitions:SetInspectedByCharacter(inst.prefab, doer.prefab)` 即可触发等级升为 Level 2。但**前提是** `scrapbookdata.lua` 里有这个 prefab 的条目。
+
+#### 途径二：`scrapbook_proxy`——让 mod 实体重定向到已有条目
+
+```139:144:scripts/scrapbookpartitions.lua
+function ScrapbookPartitions:RedirectThing(thing) -- Use this wrapper function to redirect an object into a string if available.
+    if EntityScript.is_instance(thing) then
+        return thing.scrapbook_proxy or thing.prefab
+    end
+
+    return thing
+end
+```
+
+如果实体身上有 `scrapbook_proxy` 属性，则把它"当作" `scrapbook_proxy` 这个名字去查询——这允许 mod 自定义实体**共享一个官方条目**的 Scrapbook 数据。
+
+例如，mod 新增一种"变种猪人"，可以：
+
+```lua
+-- 在 prefab fn 里：
+inst.scrapbook_proxy = "pigman"   -- 在 Scrapbook 里显示官方猪人的数据
+```
+
+这样玩家检查 mod 猪人，实际解锁的是 `"pigman"` 的 Level 2 数据（内置条目），界面上显示猪人的统计数据。
+
+#### 途径三：让 mod prefab 进 `scrapbookdata`
+
+最彻底的方式是**在 mod 的 modmain.lua 里向 `scrapbookdata` 表插入条目**。由于 `scrapbookdata.lua` 是 require 加载的，在 mod 代码执行时可以直接修改：
+
+```lua
+-- modmain.lua（参考做法，非官方 API）
+local scrapbookdata = require("screens/redux/scrapbookdata")
+scrapbookdata["my_mod_creature"] = {
+    name = "my_mod_creature",
+    tex  = "my_mod_creature.tex",
+    type = "creature",
+    prefab = "my_mod_creature",
+    health = 200,
+    damage = "15-30",
+    build = "my_creature_build",
+    bank  = "my_creature",
+    anim  = "idle",
+}
+```
+
+注意这是**非官方方式**，Klei 没有提供 `AddScrapbookEntry` 这样的 mod API。字段的含义参考 `scrapbookdata.lua` 里其他条目的格式。
+
+> **老手记忆**：mod 接入 Scrapbook 有三条路——① `scrapbookable` 组件响应检查动作；② `scrapbook_proxy` 重定向到内置条目；③ 直接向 `scrapbookdata` 表插入自定义条目（非官方）。前两条稳定，第三条需要配合 scrapbook UI 支持 mod 的 tex/build/bank/anim 格式。
+
+---
+
+### 16.8.10 老手：五个常见坑
+
+#### 坑 1：mod 食物进不了食谱书——`IsValidEntry` 返回 false
+
+**症状**：吃了 mod 食物，食谱书里没有条目。
+
+**原因**：食物没有通过 `AddCookerRecipe` 注册，`cookbook_recipes` 里找不到，`IsValidEntry` 返回 `false`，`AddRecipe` / `LearnFoodStats` 静默失败（`return false`）。
+
+**修复**：确保 mod 用官方方式注册菜谱。如果是完全自定义烹饪系统，可以用 `cooking.cookbook_recipes["MY_COOKER"] = {}` 的方式手动插入，但注意命名不要与官方冲突。
+
+#### 坑 2：Cookbook 本地数据丢失——忘记 `save_enabled`
+
+**症状**：客户端重启后食谱书清空，或在 dedicated server 上食谱书始终为空。
+
+**原因**：`save_enabled` 只在 `playeractivated` 事件后被设为 `true`——如果代码在玩家激活之前就调用 `AddRecipe`，写入会被跳过。
+
+**修复**：确保烹饪/进食回调在玩家激活**之后**触发；dedicated server 完全没有本地存档，这是正常行为——不是 bug。
+
+#### 坑 3：PlantRegistry 阶段解锁触发了但 UI 没变——mod 植物没设定义
+
+**症状**：调了 `LearnPlantStage`，`GetLevelFor` 或 `KnowsPlantStage` 返回正确，但 PlantRegistry UI 里看不到植物。
+
+**原因**：PlantRegistry **UI 只显示 `PLANT_DEFS` / `WEED_DEFS` 里定义的植物**。mod 植物如果没有在这两个表里注册，数据存了但 UI 找不到对应的卡片配置，不渲染。
+
+**修复**：在 `PLANT_DEFS` 里为 mod 植物注册完整的 `plantregistryinfo`（每个阶段的 growing/fullgrown/learnseed 等字段）。
+
+#### 坑 4：Scrapbook 角色检查了但等级是 1 而非 2——角色名写错
+
+**症状**：`SetInspectedByCharacter(thing, "my_char")` 调了，`WasInspectedByCharacter` 返回 `false`。
+
+**原因**：`LOOKUP_LIST` 里没有 `"my_char"`——mod 角色会被重定向到 `"wilson"`，但**只有 `MODCHARACTERLIST` 里明确列出的角色才走 wilson 回退**；如果 mod 角色连 `MODCHARACTERLIST` 都不在，`LOOKUP_LIST[character]` 为 nil，函数直接 `return`，不写任何数据。
+
+**修复**：mod 角色应在注册时正确添加到 `MODCHARACTERLIST`；使用 `TheScrapbookPartitions:SetInspectedByCharacter` 时，检查角色名拼写。
+
+#### 坑 5：`RedirectThing` 没有按预期重定向——`scrapbook_proxy` 赋值时机错
+
+**症状**：mod 实体设了 `inst.scrapbook_proxy = "pigman"` 但 Scrapbook 里没有解锁。
+
+**原因**：`RedirectThing` 接受的是 EntityScript 实例**或**字符串。如果传入的是 **string 类型的 prefab 名**（而非 inst），`scrapbook_proxy` 不会被读取——重定向只在传入实体实例时才生效。
+
+**修复**：在调用 `SetSeenInGame(inst)` / `SetInspectedByCharacter(inst, char)` 时，传入**实体实例本身**，而不是 `inst.prefab`：
+
+```lua
+-- 正确
+TheScrapbookPartitions:SetSeenInGame(inst)
+
+-- 错误（string 路径不读 scrapbook_proxy）
+TheScrapbookPartitions:SetSeenInGame(inst.prefab)
+```
+
+---
+
+### 16.8 小结
+
+```
+Cookbook                    PlantRegistry               Scrapbook
+────────                    ─────────────               ─────────
+CookbookData                PlantRegistryData           ScrapbookPartitions
+  preparedfoods{            plants{                       storage{
+    product: {                plant: {stage:true}           hash(prefab): 32bit
+      recipes:[[]]            fertilizers{fer:true}           bit0: viewed_in_ui
+      has_eaten:bool          pictures{plant:{...}}           bit8-25: char mask
+    }                       }                             }
+  }
+    ↑                          ↑                              ↑
+CookbookUpdater            PlantRegistryUpdater          scrapbookable +
+  LearnRecipe()              LearnPlantStage()            proximity check
+  LearnFoodStats()           LearnFertilizer()
+    ↑(RPC)                     ↑(RPC)
+Server → Client            Server → Client
+(仅 new entry 时)           (仅 new entry 时)
+
+持久化：
+  本地：SetPersistentString  SetPersistentString       分桶 SetPersistentString
+  在线：TheInventory           TheInventory              TheInventory
+       SetCookBookValue        SetPlantRegistryValue      (按桶)
+       (官方食物)               (官方植物)
+       IsModCookerFood → 跳    def.modded → 跳
+```
+
+**新手核心三句**：Cookbook 两级解锁——煮过解锁配方、吃过解锁营养；PlantRegistry 靠近自动触发，看进度用 `GetPlantPercent`；Scrapbook Level 1 = 见过、Level 2 = 角色检查过。
+
+**进阶核心三句**：`AddRecipe` 内部做食材规范化（去 cooked 前缀 + 字母排序）+ LRU 排序，最多 6 条记录；PlantRegistry 阶段用 8 bit 十六进制编码节省在线存储；Scrapbook 每条记录是 1 个 32 位整数，低位是 UI 标志，高位是 18 角色检查位。
+
+**老手核心三句**：mod 食物通过 `AddCookerRecipe` 注册菜谱即可进入食谱书，在线同步被 `IsModCookerFood` 豁免（只写本地）；mod 实体接入 Scrapbook 最稳是 `scrapbook_proxy` 重定向到官方条目；`SetInspectedByCharacter` 传**实体实例**而非 prefab 字符串，否则 proxy 不生效。
+
+下一节（16.9）我们将讨论**控制台命令与调试面板**——如何在游戏内用 `c_` 前缀命令快速验证逻辑、如何为 mod 注册自己的控制台命令、以及 DebugDraw 系统的使用方式。
 
 ## 16.9 控制台命令与调试面板
 
-（待编写）
+### 本节导读
+
+会写组件、会做 UI——但代码写完怎么**快速验证**？靠 print 一行行看日志太慢；靠重开游戏太麻烦。饥荒内置的**控制台（Console）系统**解决了这个问题：它是一个**实时 Lua 执行环境**，允许你在游戏运行时输入任意代码、调用任意函数，立竿见影地观察结果。
+
+本节讲三件事：
+
+1. **控制台界面与执行模式**——按什么键打开、本地/远程执行的区别、历史记录
+2. **`c_` 前缀命令**——Klei 内置的 50+ 个调试快捷函数，从生成物品到传送到控制时间
+3. **mod 扩展控制台**——如何在 modmain.lua 里加全局函数让它在控制台可用、如何用 `customcommands.lua` 持久化个人快捷命令
+
+> **新手**先看 16.9.1-16.9.3——打开控制台、用 `c_spawn` / `c_give` 测试物品、用 `c_sel` 选中实体；**进阶读者**继续看 16.9.4-16.9.6，深入本地/远程执行的差异（什么情况下 `c_spawn` 不生效）、`customcommands.lua` 的加载机制、mod 如何向控制台暴露自己的调试函数；**老手**跳到 16.9.7-16.9.9，了解 `d_` 前缀命令、`debugkeys.lua` 快捷键系统、`DebugMenuScreen`（F1 调试菜单）、以及五个最常见的"命令没有效果"陷阱。
+
+读完本节，你能**在不重启游戏的情况下**快速测试任何 mod 逻辑，并在自己的 mod 里提供标准的控制台调试接口。
+
+---
+
+### 16.9.1 快速入门：控制台界面与执行模式
+
+#### 第一步：打开控制台
+
+| 平台 | 快捷键 |
+|------|--------|
+| PC（默认） | **\` （反引号）** 或 Ctrl+L |
+| 控制台 | 取决于平台绑定 |
+
+控制台打开后，游戏**自动暂停**（`SetConsoleAutopaused(true)`）；关闭时恢复。
+
+```23:24:scripts/screens/consolescreen.lua
+	SetConsoleAutopaused(true)
+end)
+```
+
+#### 第二步：本地执行 vs 远程执行
+
+这是最重要的概念，也是最常踩的坑：
+
+| 模式 | 颜色提示 | 代码运行在 |
+|------|----------|-----------|
+| **远程（Remote）** | 蓝色文字 | **服务器** |
+| **本地（Local）** | 红色文字 | **本机客户端** |
+
+控制台初始化时的默认模式：
+
+```33:33:scripts/screens/consolescreen.lua
+	self:ToggleRemoteExecute(InGamePlay()) -- if we are admin, start in remote mode
+```
+
+- **单人/主机模式**：`InGamePlay()` 为 true → 默认远程（服务器就是本机，无区别）
+- **客户端模式**：同上，如果是管理员则默认远程
+
+在控制台里**按 Ctrl** 切换：
+
+```149:151:scripts/screens/consolescreen.lua
+	elseif (key == KEY_LCTRL or key == KEY_RCTRL) and not self.ctrl_pasting then
+       self:ToggleRemoteExecute()
+	end
+```
+
+#### 第三步：命令执行流程
+
+按回车后走 `ConsoleScreen:Run`：
+
+```160:175:scripts/screens/consolescreen.lua
+function ConsoleScreen:Run()
+	local fnstr = self.console_edit:GetString()
+
+    SuUsedAdd("console_used")
+
+	if fnstr ~= "" then
+		ConsoleScreenSettings:AddLastExecutedCommand(fnstr, self.toggle_remote_execute)
+	end
+
+	if self.toggle_remote_execute and TheNet:GetIsClient() and (TheNet:GetIsServerAdmin() or IsConsole()) then
+        local x, y, z = TheSim:ProjectScreenPos(TheSim:GetPosition())
+		TheNet:SendRemoteExecute(fnstr, x, z)
+	else
+		ExecuteConsoleCommand(fnstr)
+	end
+end
+```
+
+- 远程模式 → 用 `TheNet:SendRemoteExecute(fnstr, x, z)` 把字符串 + 光标世界坐标 发送给服务器
+- 本地模式 → 直接 `ExecuteConsoleCommand(fnstr)` 在本机执行
+
+服务器收到远程命令后，同样调 `ExecuteConsoleCommand`，但会临时把 `ThePlayer` 换成发送者：
+
+```2129:2146:scripts/mainfunctions.lua
+function ExecuteConsoleCommand(fnstr, guid, x, z)
+    local saved_ThePlayer
+    if guid ~= nil then
+        saved_ThePlayer = ThePlayer
+        ThePlayer = guid ~= nil and Ents[guid] or nil
+    end
+    TheInput.overridepos = x ~= nil and z ~= nil and Vector3(x, 0, z) or nil
+
+    local status, r = pcall(loadstring(fnstr))
+    if not status then
+        nolineprint(r)
+    end
+
+    if guid ~= nil then
+        ThePlayer = saved_ThePlayer
+    end
+    TheInput.overridepos = nil
+end
+```
+
+关键：`TheInput.overridepos` 被设为光标的世界坐标——所以 `ConsoleWorldPosition()` 在服务端执行时返回的是**你（客户端）的光标位置**，而不是服务器光标。
+
+#### 第四步：历史记录
+
+按 **↑ / ↓** 翻历史；每条命令执行时调 `AddLastExecutedCommand(fnstr, remote)` 记录。
+
+> **新手记忆**：控制台有**本地（红）/远程（蓝）**两种模式，**Ctrl** 切换。单机测试用远程即可；多人服务器上确认自己是管理员才能发远程命令。
+
+---
+
+### 16.9.2 快速入门：最常用的 c_ 命令速查
+
+`c_` 前缀是 Klei 对所有控制台快捷函数的命名约定——定义在 `scripts/consolecommands.lua`，文件开头明确写道：
+
+```38:40:scripts/consolecommands.lua
+---------------------------------------------------------------------------------------
+-- Console Functions -- These are simple helpers made to be typed at the console.
+---------------------------------------------------------------------------------------
+```
+
+#### 生成 / 给予物品
+
+```lua
+c_spawn("prefab", count)      -- 在光标处生成 count 个 prefab
+c_give("prefab", count)       -- 把 prefab 给当前玩家背包（放不下则掉地上）
+c_equip("prefab")             -- 给玩家并装备第一件
+c_giveingredients("prefab")   -- 给玩家合成 prefab 所需的全部材料
+```
+
+`c_give` 内部实现：
+
+```486:507:scripts/consolecommands.lua
+function c_give(prefab, count, dontselect)
+    local MainCharacter = ConsoleCommandPlayer()
+
+    prefab = string.lower(prefab)
+
+    if MainCharacter ~= nil then
+        local first_inst = nil
+        for i = 1, count or 1 do
+            local inst = DebugSpawn(prefab)
+            if inst ~= nil then
+                if first_inst == nil then first_inst = inst end
+                print("giving ", inst)
+                MainCharacter.components.inventory:GiveItem(inst)
+                -- ...
+            end
+        end
+        return first_inst
+    end
+end
+```
+
+`MainCharacter` = `ConsoleCommandPlayer()`——优先用**当前选中的实体（c_sel）中的玩家**，没有则用 `ThePlayer`（服务端执行时临时换成发送命令的玩家）。
+
+#### 玩家状态
+
+```lua
+c_sethealth(1)           -- 设血量为满（n 是 0~1 的比例）
+c_setsanity(0.5)         -- 设精神值为 50%
+c_sethunger(0)           -- 设饥饿值为 0%
+c_settemperature(25)     -- 设体温为 25°C
+c_setmoisture(0)         -- 设湿度为 0
+c_godmode()              -- 切换无敌模式
+c_freecrafting()         -- 获得所有配方（自由合成）
+```
+
+`c_godmode` 的核心逻辑：
+
+```793:817:scripts/consolecommands.lua
+function c_godmode(player)
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+        c_remote("c_godmode()")
+        return
+    end
+
+    player = ListingOrConsolePlayer(player)
+    if player ~= nil then
+        -- ...
+        elseif player.components.health ~= nil then
+            local godmode = player.components.health.invincible
+            player.components.health:SetInvincible(not godmode)
+            print("God mode: "..tostring(not godmode))
+        end
+    end
+end
+```
+
+注意 `c_godmode` 如果不在主机端（`not TheWorld.ismastersim`），会**自动把命令转发给服务器**（`c_remote("c_godmode()")`）——这是"安全写法"的标准模式，很多 c_ 命令都这样写。
+
+#### 查找 / 统计
+
+```lua
+c_list("prefab")           -- 列出世界里所有该 prefab 的位置
+c_listtag("tag")           -- 列出所有带该 tag 的实体
+c_countprefabs("prefab")   -- 统计数量
+c_find("prefab", radius)   -- 找最近的该 prefab 并跳过去
+c_gonext("prefab")         -- 依次跳到每个同名 prefab（反复调用循环）
+```
+
+#### 移动 / 位置
+
+```lua
+c_teleport()               -- 传送玩家到光标处
+c_teleport(x, y, z)        -- 传送玩家到指定坐标
+c_goto(otherplayer)        -- 传送到某玩家旁边
+c_move(inst)               -- 把选中的实体移到光标处
+```
+
+#### 服务器控制（需要主机权限）
+
+```lua
+c_save()                   -- 手动保存
+c_reset()                  -- 重新加载上一个存档
+c_regenerateworld()        -- 重新生成整个世界
+c_announce("msg")          -- 全服公告
+c_skip(num)                -- 跳过 num 天
+```
+
+> **新手记忆**：最常用的 5 个命令——`c_spawn`（生成）、`c_give`（给物）、`c_godmode`（无敌）、`c_freecrafting`（自由合成）、`c_teleport`（传送）。全部需要**远程模式**才能在联机服务器上生效。
+
+---
+
+### 16.9.3 快速入门：实体选中（c_sel）与实体操作
+
+`c_sel` 和 `c_select` 是控制台调试里的"选择工具"：
+
+```297:310:scripts/consolecommands.lua
+-- Get the currently selected entity, so it can be modified etc.
+-- Has a gimpy short name so it's easier to type from the console
+function c_sel()
+    return GetDebugEntity()
+end
+
+function c_select(inst)
+    if not inst then
+        inst = ConsoleWorldEntityUnderMouse()
+    end
+    print("Selected "..tostring(inst or "<nil>") )
+    SetDebugEntity(inst)
+    return inst
+end
+```
+
+- `c_select()` —— 不传参时选中**鼠标下的实体**（`ConsoleWorldEntityUnderMouse`）
+- `c_sel()` —— 返回当前选中的实体，结果可赋给变量继续操作
+
+典型工作流：
+
+```lua
+-- 选中鼠标下的猪人
+c_select()
+
+-- 查看它的血量组件
+c_sel().components.health.currenthealth
+
+-- 直接设置它的血量为 1
+c_sel().components.health:SetPercent(0.5)
+
+-- 把它删掉
+c_sel():Remove()
+
+-- 查看所有 tags
+for k, v in pairs(c_sel().pendingtags) do print(k, v) end
+```
+
+`c_sel()` 在很多命令里被当作默认目标——比如 `c_move()`（不传参则移动选中实体）、`c_doscenario`（对选中实体应用场景脚本）。
+
+**调试输出**：两个常用工具函数（来自 `debughelpers.lua`）：
+
+```5:42:scripts/debughelpers.lua
+function DumpComponent( comp )
+    for name,value in pairs(comp) do
+        if type(value) == "function" then
+            local info = debug.getinfo(value,"LnS")
+            print(string.format("      %s = function - %s", name, info.source..":"..tostring(info.linedefined)))
+        else
+            -- ...
+            print(string.format("      %s = %s", name, tostring(value)))
+        end
+    end
+end
+
+function DumpEntity(ent)
+    print("============================================ Dumping entity ",ent)
+    print(ent.entity:GetDebugString())
+    -- ...
+    for i,v in pairs(ent.components) do
+        print("   Dumping component",i)
+        DumpComponent(v)
+    end
+end
+```
+
+- `DumpEntity(c_sel())` —— 打印选中实体的全部字段 + 所有组件的所有成员
+- `DumpComponent(c_sel().components.health)` —— 只打印指定组件
+
+> **新手记忆**：`c_select()` 选中鼠标下的物体，`c_sel()` 返回它的引用。选中后可以直接 `.components.xxx` 查看或修改任何数据。`DumpEntity(c_sel())` 是"啥都不懂时看一眼"的万能命令。
+
+---
+
+### 16.9.4 进阶：c_remote 与本地/远程的双重执行路径
+
+#### 第一步：`c_remote` 函数
+
+```200:204:scripts/consolecommands.lua
+-- Remotely execute a lua string
+function c_remote( fnstr )
+    local x, y, z = TheSim:ProjectScreenPos(TheSim:GetPosition())
+    TheNet:SendRemoteExecute(fnstr, x, z)
+end
+```
+
+**用途**：在本地执行代码时**手动发远程命令**。很多 c_ 命令内部用它实现"从客户端也能正常工作"：
+
+```123:134:scripts/consolecommands.lua
+function c_reset()
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+        c_remote("c_reset()")
+        return
+    end
+
+    if not InGamePlay() then
+        StartNextInstance()
+    elseif TheWorld ~= nil and TheWorld.ismastersim then
+        TheNet:SendWorldRollbackRequestToServer(0)
+    end
+end
+```
+
+这个模式意思是：如果当前代码运行在**客户端**（不是主机），就把命令字符串发给服务器，让服务器执行；否则本地执行。
+
+#### 第二步：mod 写调试命令的安全模板
+
+当你为 mod 写调试命令时，如果命令需要修改服务器数据（实体状态、世界状态），必须在客户端时转发给服务器：
+
+```lua
+-- 安全写法模板
+function c_my_debug_cmd(arg)
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+        c_remote(string.format('c_my_debug_cmd(%q)', tostring(arg)))
+        return
+    end
+    -- 真正的逻辑（只在服务端执行）
+    local inst = c_sel() or ThePlayer
+    -- ...
+end
+```
+
+#### 第三步：`ConsoleCommandPlayer()` 的优先级
+
+```2:4:scripts/consolecommands.lua
+function ConsoleCommandPlayer()
+    return (c_sel() ~= nil and c_sel():HasTag("player") and c_sel()) or ThePlayer or AllPlayers[1]
+end
+```
+
+优先级：**选中的玩家实体 > `ThePlayer`（命令发送者）> `AllPlayers[1]`（第一个玩家）**。
+
+**在联机 dedicated server 上**：`ThePlayer` 会被替换成命令发送者（见 `ExecuteConsoleCommand` 的 `guid` 参数），因此 `ConsoleCommandPlayer()` 正确地返回发送命令的那个玩家。如果你想操作**其他玩家**，先 `c_select(target)` 再调命令。
+
+#### 第四步：`ConsoleWorldPosition()` 与 `overridepos`
+
+```6:8:scripts/consolecommands.lua
+function ConsoleWorldPosition()
+    return TheInput.overridepos or TheInput:GetWorldPosition()
+end
+```
+
+远程命令发送时，服务器会设置 `TheInput.overridepos = Vector3(x, 0, z)`（客户端光标坐标）——所以即使在服务端执行，`ConsoleWorldPosition()` 也能拿到正确的**客户端光标位置**。`c_spawn` 靠这个在光标处生成实体。
+
+> **进阶记忆**：mod 调试命令的标准写法是"检查 `ismastersim`，不是则 `c_remote` 转发"；`ConsoleCommandPlayer()` 自动解析正确的目标玩家；`ConsoleWorldPosition()` 在服务端也能拿到客户端光标位置。
+
+---
+
+### 16.9.5 进阶：customcommands.lua——持久化个人快捷命令
+
+#### 第一步：文件位置与加载机制
+
+游戏启动时，从**客户端配置目录的上一级**加载 `customcommands.lua`：
+
+```1425:1432:scripts/mainfunctions.lua
+    TheSim:GetPersistentString("../customcommands.lua",
+        function(load_success, str)
+            if load_success then
+                local fn = loadstring(str)
+                known_assert(fn ~= nil, "CUSTOM_COMMANDS_ERROR")
+                xpcall(fn, debug.traceback)
+            end
+        end)
+```
+
+路径 `"../customcommands.lua"` 是相对于 Klei 存档目录（如 `Documents/Klei/DoNotStarveTogether/`）的上一级——实际路径因系统而异，通常是：
+
+- Windows: `%USERPROFILE%\Documents\Klei\customcommands.lua`
+- macOS: `~/Documents/Klei/customcommands.lua`
+
+**注意**：
+- 这个文件**随游戏启动加载**，修改后需要**重启游戏**才生效
+- 加载失败（语法错误）会触发 `known_assert`，但不会崩溃游戏
+- 控制台文档里有提示：`ConsoleScreenSettings:AddLastExecutedCommand('c_give("batbat"', true)` 可以预置历史记录
+
+#### 第二步：示例内容
+
+```lua
+-- customcommands.lua 示例
+-- 快速测试：给玩家全套装备并无敌
+function c_fullsetup()
+    c_godmode()
+    c_freecrafting()
+    c_sethealth(1)
+    c_setsanity(1)
+    c_sethunger(1)
+end
+
+-- 快速传送到指定坐标
+function c_home()
+    c_teleport(0, 0, 0)
+end
+
+-- 打印选中实体的 prefab 名
+function c_name()
+    local sel = c_sel()
+    if sel then
+        print(sel.prefab)
+    end
+end
+```
+
+定义在这里的函数成为**全局函数**，在控制台里直接输入函数名即可调用。
+
+#### 第三步：也可以用脚本预置控制台历史
+
+```lua
+-- 在 customcommands.lua 里：
+ConsoleScreenSettings:AddLastExecutedCommand('c_give("meatballs", 10)', true)
+ConsoleScreenSettings:AddLastExecutedCommand('c_godmode()', true)
+```
+
+这样游戏启动后，控制台历史里就预设了这两条命令，按 ↑ 就能快速调用。
+
+> **进阶记忆**：`customcommands.lua` 是开发者的"个人工具库"——在这里写好常用命令，重启后在任何世界都能用；它不随 mod 分发，是纯本地的快捷键。
+
+---
+
+### 16.9.6 进阶：mod 如何向控制台暴露调试命令
+
+#### 第一步：最简单的方式——在 modmain.lua 定义全局函数
+
+控制台执行的是 Lua 全局环境——**任何在 modmain.lua 里定义的全局函数**，都可以在控制台里调用：
+
+```lua
+-- modmain.lua
+function my_debug_spawn_all()
+    local items = {"my_sword", "my_shield", "my_helmet"}
+    for _, v in ipairs(items) do
+        c_give(v)
+    end
+end
+
+function my_debug_reset_quest()
+    local player = ThePlayer
+    if player and player.components.myquest then
+        player.components.myquest:Reset()
+        print("Quest reset!")
+    end
+end
+```
+
+在控制台输入 `my_debug_spawn_all()` 即可调用。
+
+**命名建议**：用 mod 前缀避免与官方命令冲突，比如 `dm_`（勋章 mod 的做法）、`myth_` 等。
+
+#### 第二步：勋章 mod 的调试命令范式
+
+`mods/联机版mod/勋章/scripts/medal_debugcommands.lua` 展示了一个良好的 mod 调试命令组织方式：
+
+```27:48:mods/联机版mod/勋章/scripts/medal_debugcommands.lua
+--生成所有勋章(isfinal为true则只生成最终形态勋章)
+function dm_allmedal(isfinal)
+	local items = {"large_multivariate_certificate"}
+	if not isfinal then
+		table.insert(items, "medium_multivariate_certificate")
+		table.insert(items, "multivariate_certificate")
+	end
+	for k, v in pairs(require("medal_defs/functional_medal_defs").MEDAL_DEFS) do
+		if (not isfinal or v.isfinal) and not v.nodebug then
+			table.insert(items, v.name)
+		end
+	end
+	_spawn_list(items, 1, ...)
+end
+```
+
+**要点**：
+1. 命令名带 mod 前缀（`dm_`）
+2. 用单独的文件组织调试命令（在 modmain.lua 里 `require`）
+3. 复用 `ConsoleWorldPosition()` 做生成位置
+
+#### 第三步：在 modmain.lua 里引入调试命令文件
+
+```lua
+-- modmain.lua
+if BRANCH == "dev" or true then  -- 生产版也可用（控制台本来就是给开发者的）
+    require("medal_debugcommands")  -- 或者你自己的调试命令文件
+end
+```
+
+> **进阶记忆**：mod 暴露调试命令的最简方式是在 modmain.lua 里定义带前缀的全局函数；独立调试命令文件更整洁；始终复用 `ConsoleCommandPlayer()` 和 `ConsoleWorldPosition()` 来定位目标。
+
+---
+
+### 16.9.7 老手：d_ 命令与 debugkeys.lua
+
+#### `d_` 前缀命令
+
+`d_` 前缀命令定义在 `scripts/debugcommands.lua` 和 `scripts/debugkeys.lua`，比 `c_` 更复杂、更底层：
+
+| 函数 | 作用 |
+|------|------|
+| `d_spawnlist(list, spacing, fn)` | 把一个 prefab 列表展开生成在光标附近（用于批量测试）|
+| `d_playeritems()` | 生成所有有 builder_tag 的玩家专属物品 |
+| `d_createscrapbookdata()` | 生成/更新 `scrapbookdata.lua`（自动化工具）|
+| `d_allcircuits()` | 生成所有 WX-78 模组电路 |
+
+`d_spawnlist` 是 mod 调试的利器——生成一批测试物品：
+
+```3:43:scripts/debugcommands.lua
+function d_spawnlist(list, spacing, fn)
+    local created = {}
+	spacing = spacing or 2
+	local num_wide = math.ceil(math.sqrt(#list))
+
+	local pt = ConsoleWorldPosition()
+	pt.x = pt.x - num_wide * 0.5 * spacing
+	pt.z = pt.z - num_wide * 0.5 * spacing
+
+	for y = 0, num_wide-1 do
+		for x = 0, num_wide-1 do
+			if list[(y*num_wide + x + 1)] then
+				-- ...
+				local inst = SpawnPrefab(prefab)
+				inst.Transform:SetPosition((pt + Vector3(x*spacing, 0, y*spacing)):Get())
+			end
+		end
+	end
+    return created
+end
+```
+
+用法：
+
+```lua
+-- 把 mod 里所有武器排列生成在光标附近
+d_spawnlist({"my_sword", "my_spear", "my_bow"}, 2)
+```
+
+#### `debugkeys.lua` 的快捷键系统
+
+`debugkeys.lua` 注册了一系列**快捷键调试动作**，覆盖了 F1-F12 及其他组合键。它在 `scripts/debugkeys.lua` 里 require 了 `consolecommands` 并使用 `TheInput:AddKeyHandler` 绑定动作。
+
+注意：这个文件只在**本机开启 debug 模式（`BRANCH == "dev"`）**时才完全可用；普通玩家/开发者在发行版里无法使用这些快捷键。
+
+#### `debughelpers.lua` 的实用函数
+
+```lua
+DumpEntity(c_sel())          -- 完整转储实体信息
+DumpComponent(comp)           -- 转储单个组件
+DumpUpvalues(func)            -- 转储函数的 upvalue
+```
+
+这些函数生成的输出会打印到游戏日志（也会出现在控制台窗口）。
+
+> **老手记忆**：`d_spawnlist` 是批量测试的神器；`DumpEntity(c_sel())` 是"看不懂这个实体到底有什么"时的首选；`debugkeys.lua` 的快捷键只在 dev build 下完整可用。
+
+---
+
+### 16.9.8 老手：DebugMenuScreen（F1 调试菜单）
+
+游戏在 **BRANCH == "dev"**（开发版）时，按 **F1** 会弹出 `DebugMenuScreen`：
+
+```14:38:scripts/screens/DebugMenuScreen.lua
+local DebugMenuScreen = Class(Screen, function(self)
+	Screen._ctor(self, "DebugMenuScreen")
+
+   	self.blackoverlay = self:AddChild(Image("images/global.xml", "square.tex"))
+    -- ...
+	self.blackoverlay:SetTint(0,0,0,.75)
+
+	self.text = self:AddChild(Text(BODYTEXTFONT, ... 16 ..., "blah"))
+    -- ...
+	TheFrontEnd:HideConsoleLog()
+end)
+```
+
+```62:80:scripts/screens/DebugMenuScreen.lua
+function DebugMenuScreen:OnBecomeActive()
+	DebugMenuScreen._base.OnBecomeActive(self)
+	SetPause(true,"console")
+
+	self.menu = menus.TextMenu(InGamePlay() and "IN GAME DEBUG MENU" or "FRONT END DEBUG MENU")
+	local main_options = {}
+
+	-- ...
+	local craft_menus = {}
+	for k,v in pairs(AllRecipes) do
+        if IsRecipeValid(v.name) and v.tab then
+    		craft_menus[v.tab] = craft_menus[v.tab] or {}
+    		table.insert(craft_menus[v.tab], menus.DoAction(v.name, function() for kk,vv in pairs(v.ingredients) do ConsoleRemote('c_give("%s", %d)',{vv.type, vv.amount}) end end))
+        end
+	end
+```
+
+`debugmenu.lua` 提供了菜单选项类型：
+
+```3:55:scripts/debugmenu.lua
+local MenuOption = Class(function(self, str)
+	self.str = str
+end)
+-- ...
+local DoAction = Class(MenuOption, function(self, str, fn)
+-- ...
+local Submenu = Class(MenuOption, function(self, str, options, name)
+```
+
+**对 mod 开发者的意义**：
+- 在 dev build 里可以通过 F1 菜单快速给自己物品、切换季节、调整天气——比打控制台命令方便
+- **发行版**（普通玩家的游戏）里 F1 菜单不可用
+
+---
+
+### 16.9.9 老手：五个常见的"命令没有效果"陷阱
+
+#### 陷阱 1：忘记切换远程模式——命令在本地执行
+
+**症状**：`c_spawn("my_creature")` 在本地执行，实体出现了但立刻消失，或者服务器上没有变化。
+
+**原因**：控制台处于**本地模式**，命令运行在客户端——客户端生成的实体不会同步到服务器，游戏下一帧就被清除。
+
+**修复**：在控制台里按 **Ctrl** 切到远程（蓝色），再执行命令。
+
+#### 陷阱 2：`c_spawn` / `c_give` 找不到 mod prefab——prefab 未加载
+
+**症状**：`c_spawn("my_creature")` 执行后 print 显示 prefab 为 nil。
+
+**原因**：`c_spawn` 内部调用 `DebugSpawn(prefab)`，如果这个 prefab 没有被注册（`Prefabs["my_creature"]` 为 nil），会返回 nil。
+
+**修复**：确认 mod 已经正确用 `Prefab("my_creature", fn, assets)` 注册；在控制台用 `print(Prefabs["my_creature"])` 验证是否存在。
+
+#### 陷阱 3：命令自动转发到服务器但参数丢失
+
+**症状**：`c_my_cmd("hello", 42)` 在客户端调用，服务器执行时参数变成了默认值或 nil。
+
+**原因**：mod 写了 `c_remote("c_my_cmd()")` 但没有带上参数——字符串格式化遗漏了。
+
+**修复**：正确地把参数序列化进命令字符串：
+```lua
+function c_my_cmd(name, count)
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+        c_remote(string.format('c_my_cmd(%q, %d)', tostring(name), count))
+        return
+    end
+    -- 服务端逻辑...
+end
+```
+
+#### 陷阱 4：`ConsoleCommandPlayer()` 返回 nil——没有玩家
+
+**症状**：`c_sethealth(1)` 报错 "attempt to index nil (ConsoleCommandPlayer returned nil)"。
+
+**原因**：在**主界面**（非游戏中）打开控制台执行，此时 `ThePlayer` 和 `AllPlayers[1]` 都是 nil，`ConsoleCommandPlayer()` 返回 nil。
+
+**修复**：只在游戏中使用这类命令；如果 mod 需要在主界面做调试，不要依赖 `ConsoleCommandPlayer()`。
+
+#### 陷阱 5：`customcommands.lua` 修改后没生效——忘记重启
+
+**症状**：在 `customcommands.lua` 里加了新函数，控制台里调用报"attempt to call a nil value"。
+
+**原因**：`customcommands.lua` 在**游戏启动时**加载一次，修改后需要**完全重启游戏**（不是重新进存档）才能生效。
+
+**修复**：重启游戏；或者在当前游戏会话里用控制台临时定义函数（只对当前会话有效）：
+```lua
+-- 控制台里直接定义（临时）
+my_temp_fn = function() c_give("meatballs", 10) end
+my_temp_fn()
+```
+
+---
+
+### 16.9 小结
+
+```
+控制台架构：
+  打开：` (反引号) / Ctrl+L
+    ↓
+  ConsoleScreen
+    ├── toggle_remote_execute = true  → TheNet:SendRemoteExecute(fnstr, x, z)
+    │                                     ↓
+    │                           服务器 ExecuteConsoleCommand(fnstr, guid, x, z)
+    │                                     (ThePlayer 临时换成发送者)
+    └── toggle_remote_execute = false → ExecuteConsoleCommand(fnstr)（本机执行）
+
+c_ 命令（consolecommands.lua）：
+  生成：c_spawn / c_give / c_equip / c_giveingredients
+  状态：c_godmode / c_sethealth / c_setsanity / c_sethunger / c_settemperature
+  选中：c_sel / c_select (ConsoleWorldEntityUnderMouse)
+  移动：c_teleport / c_goto / c_gonext / c_find
+  统计：c_list / c_listtag / c_countprefabs
+  服务：c_save / c_reset / c_announce
+
+d_ 命令（debugcommands.lua）：
+  批量：d_spawnlist(list, spacing)
+  特殊：d_playeritems / d_createscrapbookdata / d_allcircuits
+
+mod 扩展控制台：
+  1. modmain.lua 定义全局函数（带前缀）
+  2. 单独的 *_debugcommands.lua 文件（require 进 modmain）
+  3. customcommands.lua 写个人快捷命令（需重启才生效）
+
+安全命令模板：
+  function c_my_cmd(arg)
+    if TheWorld ~= nil and not TheWorld.ismastersim then
+      c_remote(string.format('c_my_cmd(%q)', tostring(arg)))
+      return
+    end
+    -- 服务端逻辑
+  end
+```
+
+**新手核心三句**：控制台有**本地（红）/远程（蓝）**两种模式，按 Ctrl 切换，联机测试必须用远程；`c_give` / `c_spawn` 是最常用的两个命令；`c_select()` + `c_sel().components.xxx` 能实时读写任何实体数据。
+
+**进阶核心三句**：`ConsoleCommandPlayer()` 优先返回选中玩家、其次 ThePlayer、最后 AllPlayers[1]；服务端执行时 `ThePlayer` 临时换成命令发送者；mod 调试命令需要"检查 `ismastersim`，不是则 `c_remote` 转发"的安全模板。
+
+**老手核心三句**：`d_spawnlist` 是批量测试物品的利器；`DumpEntity(c_sel())` 是实体调试的万能工具；`customcommands.lua` 修改后必须重启游戏，临时测试直接在控制台里定义匿名函数。
+
+下一节（16.10）是本章的**实战收尾**——从零开始为 mod 添加一个完整的设置面板，把 16.1-16.9 的所有知识综合运用。
 
 ## 16.10 实战：为 Mod 添加设置面板
 
-（待编写）
+### 本节导读
+
+16.1-16.9 我们把 UI 系统的**所有零件**都讲完了——Widget 树、锚点布局、Screen 栈、HUD 注入、容器控件、滚动列表、焦点系统、调试工具。本节是**装配工厂**：用这些零件，从零开始做一个**完整的 mod 设置面板**。
+
+目标产品：一个带**三个选项的设置面板**——
+
+1. **选项 1（Spinner）**：控制 mod 某个功能的开启/关闭/自动
+2. **选项 2（Spinner）**：一个数值选择（低/中/高）
+3. **关闭按钮**
+
+面板功能需求：
+- 玩家点击 HUD 上的按钮打开面板
+- 设置修改后**自动持久化**到本地，重开游戏不丢失
+- **随 HUD 缩放比例**自动缩放
+- 按 Esc / M 键关闭
+
+整个实现分 5 个文件：
+
+| 文件 | 职责 |
+|------|------|
+| `scripts/screens/mymod_settingsscreen.lua` | 设置面板 Screen |
+| `scripts/mymod_settings.lua` | 存读设置数据 |
+| `scripts/widgets/mymod_hud_button.lua` | HUD 入口按钮 |
+| `scripts/mymod_hud_hook.lua` | 注入 HUD 的胶水代码 |
+| `modmain.lua` | 入口，引入上面的文件 |
+
+> **新手**先看 16.10.1-16.10.3——理解需求结构、看懂最小化 Screen 框架、用 `TEMPLATES.CurlyWindow` + `TEMPLATES.StandardButton` 让一个面板显示出来；**进阶读者**继续看 16.10.4-16.10.7，加入 `TEMPLATES.LabelSpinner` 下拉选项、用 `TheSim:SetPersistentString` 持久化、监听 `refreshhudsize` 事件做 HUD 缩放适配、用 `AddClassPostConstruct` 把面板挂入 HUD；**老手**跳到 16.10.8-16.10.10，了解需要服务器同步时如何用 RPC 传播设置、焦点流与控制器支持、以及五个最常见的"设置面板装上去但不工作"的坑。
+
+读完本节，你能在 **2 小时内**为任何 mod 加上一个规范的、可持久化的、HUD 缩放自适应的设置面板。
+
+---
+
+### 16.10.1 快速入门：需求分析与五个文件的职责
+
+#### 第一步：为什么需要 5 个文件？
+
+一个偷懒的做法是把所有代码都堆在 `modmain.lua` 里。但这样：
+- 模块间耦合高，改一处可能影响全局
+- 代码难以阅读和维护
+- Screen 类通常要 `require`，不能直接在 `modmain.lua` 里写 Class
+
+标准的分层做法：
+
+```
+modmain.lua
+  └─ require "mymod_settings"          ← 启动时加载 & 恢复设置
+  └─ require "mymod_hud_hook"          ← 注入 HUD 按钮 & 打开面板的方法
+       └─ require "widgets/mymod_hud_button"    ← HUD 按钮 Widget
+       └─ require "screens/mymod_settingsscreen" ← 面板 Screen
+            └─ require "mymod_settings"           ← 读写设置
+```
+
+#### 第二步：理清数据流
+
+```
+玩家点击 HUD 按钮
+    ↓
+playerhud.ShowMySettingsScreen()（通过 AddClassPostConstruct 注入）
+    ↓
+创建 MySettingsScreen(owner)
+    ↓
+面板里每个 Spinner 的 onchanged_fn
+    ↓
+修改 MYMOD_SETTINGS[key] = newvalue
+    ↓
+SaveMySettings()  → TheSim:SetPersistentString(...)
+```
+
+#### 第三步：定义设置数据结构
+
+在 `scripts/mymod_settings.lua` 里定义设置的**默认值**和**可选项**：
+
+```lua
+-- scripts/mymod_settings.lua
+
+MYMOD_SETTINGS = {
+    MY_FEATURE = "auto",   -- "off" / "auto" / "on"
+    MY_LEVEL   = "medium", -- "low" / "medium" / "high"
+}
+
+local SETTING_KEYS = {"MY_FEATURE", "MY_LEVEL"}
+```
+
+把设置放到一个全局表里，方便在游戏任何地方访问。
+
+> **新手记忆**：5 个文件各司其职——Screen 只管 UI 显示、settings.lua 只管数据读写、hud_button 只管 HUD 按钮、hud_hook 只管注入 HUD、modmain 只管引导。**不要把 Screen 类代码直接写在 modmain.lua 里**。
+
+---
+
+### 16.10.2 快速入门：最小化 Screen 框架——让面板显示出来
+
+参考 `mods/联机版mod/勋章/scripts/screens/medalsettingsscreen.lua`，一个最小化的设置 Screen 骨架如下：
+
+```lua
+-- scripts/screens/mymod_settingsscreen.lua
+local Screen   = require "widgets/screen"
+local Widget   = require "widgets/widget"
+local Text     = require "widgets/text"
+local Image    = require "widgets/image"
+local TEMPLATES = require "widgets/redux/templates"
+
+local MySettingsScreen = Class(Screen, function(self, owner)
+    Screen._ctor(self, "MySettingsScreen")
+    self.owner = owner
+
+    -- 1. HUD 缩放根节点（所有内容挂在这里）
+    self.scalingroot = self:AddChild(Widget("scaling_root"))
+    self.scalingroot:SetVAnchor(ANCHOR_MIDDLE)
+    self.scalingroot:SetHAnchor(ANCHOR_MIDDLE)
+    self.scalingroot:SetScaleMode(SCALEMODE_PROPORTIONAL)
+    self.scalingroot:SetScale(TheFrontEnd:GetHUDScale())
+
+    -- 2. 全屏透明遮罩：点击遮罩关闭面板
+    self.black = self.scalingroot:AddChild(Image("images/global.xml", "square.tex"))
+    self.black:SetVRegPoint(ANCHOR_MIDDLE)
+    self.black:SetHRegPoint(ANCHOR_MIDDLE)
+    self.black:SetVAnchor(ANCHOR_MIDDLE)
+    self.black:SetHAnchor(ANCHOR_MIDDLE)
+    self.black:SetScaleMode(SCALEMODE_FILLSCREEN)
+    self.black:SetTint(0, 0, 0, 0)
+    self.black.OnMouseButton = function() self:OnCancel() end
+
+    -- 3. 主面板容器
+    local PANEL_W, PANEL_H = 240, 300
+    self.panel = self.scalingroot:AddChild(TEMPLATES.CurlyWindow(PANEL_W, PANEL_H))
+    self.panel:SetPosition(0, 0)
+
+    -- 4. 标题
+    self.title = self.panel:AddChild(Text(HEADERFONT, 30, "Mod 设置"))
+    self.title:SetPosition(0, PANEL_H / 2 - 40)
+    self.title:SetColour(1, 0.8, 0.2, 1)
+
+    SetAutopaused(true)
+end)
+
+function MySettingsScreen:OnCancel()
+    TheFrontEnd:PopScreen(self)
+    SetAutopaused(false)
+end
+
+function MySettingsScreen:OnControl(control, down)
+    if MySettingsScreen._base.OnControl(self, control, down) then return true end
+    if not down and (control == CONTROL_CANCEL or control == CONTROL_MAP) then
+        self:OnCancel()
+        return true
+    end
+end
+
+return MySettingsScreen
+```
+
+**关键设计**：
+1. `scalingroot` 负责跟随 HUD 缩放比例——见下面 16.10.6 的详细说明
+2. 全屏透明 `black`：点击面板外关闭，是"点击遮罩关闭"的标准实现
+3. `TEMPLATES.CurlyWindow` 是官方风格的圆角卷轴窗口——尺寸约束在 190-1000 × 90-500 之间
+
+```1725:1739:scripts/widgets/redux/templates.lua
+function TEMPLATES.CurlyWindow(sizeX, sizeY, title_text, bottom_buttons, button_spacing, body_text)
+    local w = NineSlice("images/dialogcurly_9slice.xml")
+    local top = w:AddCrown("crown-top-fg.tex", ANCHOR_MIDDLE, ANCHOR_TOP, 0, 68)
+    local top_bg = w:AddCrown("crown-top.tex", ANCHOR_MIDDLE, ANCHOR_TOP, 0, 44)
+    top_bg:MoveToBack()
+
+    local bottom = w:AddCrown("crown-bottom-fg.tex", ANCHOR_MIDDLE, ANCHOR_BOTTOM, 0, -14)
+    bottom:MoveToFront()
+
+    -- Ensure we're within the bounds of looking good and fitting on screen.
+    sizeX = math.clamp(sizeX or 200, 190, 1000)
+    sizeY = math.clamp(sizeY or 200, 90, 500)
+    w:SetSize(sizeX, sizeY)
+    w:SetScale(0.7, 0.7)
+```
+
+注意 `CurlyWindow` 内部 `SetScale(0.7, 0.7)`——它的尺寸参数是"逻辑尺寸"，实际渲染时缩小到 70%，所以 `PANEL_H = 300` 实际显示约 210 像素高。
+
+> **新手记忆**：Screen 最小结构 = scalingroot（跟随 HUD 缩放）+ black（全屏点击关闭遮罩）+ panel（TEMPLATES.CurlyWindow 主容器）+ 标题文字。
+
+---
+
+### 16.10.3 快速入门：用 StandardButton 添加关闭按钮
+
+在面板底部加一个关闭按钮：
+
+```lua
+-- 继续在 MySettingsScreen 的构造函数里
+self.close_btn = self.panel:AddChild(
+    TEMPLATES.StandardButton(
+        function() self:OnCancel() end,  -- onclick
+        "关闭",                          -- 按钮文字
+        {160, 40}                        -- {width, height}
+    )
+)
+self.close_btn:SetPosition(0, -PANEL_H / 2 + 40)
+```
+
+`TEMPLATES.StandardButton` 的定义：
+
+```554:599:scripts/widgets/redux/templates.lua
+function TEMPLATES.StandardButton(onclick, txt, size, icon_data)
+    local prefix = "button_carny_long"
+    if size and #size == 2 then
+        local ratio = size[1] / size[2]
+        if ratio > 4 then
+            prefix = "button_carny_xlong"
+        elseif ratio < 1.1 then
+            prefix = "button_carny_square"
+        end
+    end
+    local btn = ImageButton("images/global_redux.xml",
+        prefix.."_normal.tex",
+        prefix.."_hover.tex",
+        prefix.."_disabled.tex",
+        prefix.."_down.tex")
+    btn:SetOnClick(onclick)
+    btn:SetText(txt)
+    btn:SetFont(CHATFONT)
+    -- ...
+    return btn
+```
+
+**宽高比决定按钮外形**：
+- ratio > 4 → `button_carny_xlong`（超宽按钮）
+- ratio ≈ 1 → `button_carny_square`（方形按钮）
+- 其他 → `button_carny_long`（默认长条按钮）
+
+> **新手记忆**：`TEMPLATES.StandardButton(onclick_fn, text, {width, height})` 是官方风格按钮的标准创建方式；宽高比决定外形；用 `SetPosition` 把它放在面板内的合适位置。
+
+---
+
+### 16.10.4 进阶：用 LabelSpinner 添加下拉选择设置项
+
+`TEMPLATES.LabelSpinner` 是"标签 + 下拉选择"的标准控件组合——左边文字说明、右边 Spinner 控件：
+
+```lua
+-- 在构造函数里，添加第一个设置项
+local YSTART = PANEL_H / 2 - 80  -- 从顶部向下偏移 80 开始
+
+self.feature_spinner = self.panel:AddChild(
+    TEMPLATES.LabelSpinner(
+        "功能模式",              -- 标签文字
+        {                        -- spinnerdata: 选项列表
+            {text = "关闭", data = "off"},
+            {text = "自动", data = "auto"},
+            {text = "开启", data = "on"},
+        },
+        120,                     -- width_label
+        110,                     -- width_spinner
+        40,                      -- height（可不传，默认 40）
+        5,                       -- spacing（可不传，默认 5）
+        nil,                     -- font（默认 CHATFONT）
+        22,                      -- font_size
+        nil,                     -- horiz_offset
+        function(new_data)       -- onchanged_fn（选项切换时回调）
+            MYMOD_SETTINGS.MY_FEATURE = new_data
+            SaveMySettings()
+        end
+    )
+)
+self.feature_spinner:SetPosition(0, YSTART)
+-- 初始化时显示当前存档的值
+self.feature_spinner.spinner:SetSelected(MYMOD_SETTINGS.MY_FEATURE)
+```
+
+`TEMPLATES.LabelSpinner` 的函数签名和内部结构：
+
+```1132:1156:scripts/widgets/redux/templates.lua
+function TEMPLATES.LabelSpinner(labeltext, spinnerdata, width_label, width_spinner, height, spacing, font, font_size, horiz_offset, onchanged_fn, colour, tooltip_text)
+    width_label = width_label or 220
+    width_spinner = width_spinner or 150
+    height = height or 40
+    spacing = spacing or 5
+    -- ...
+    local wdg = Widget("labelspinner")
+    wdg.label = wdg:AddChild( Text(font, font_size, labeltext) )
+    -- ...
+    wdg.spinner = wdg:AddChild(TEMPLATES.StandardSpinner(spinnerdata, width_spinner, height, font, font_size, onchanged_fn, colour))
+    -- ...
+    wdg.focus_forward = wdg.spinner   -- 焦点传递给 spinner
+    return wdg
+end
+```
+
+**关键细节**：
+- 返回的是一个 `Widget("labelspinner")`，它包含 `wdg.label`（Text）和 `wdg.spinner`（Spinner）
+- `wdg.focus_forward = wdg.spinner` 已设置好——焦点移到这个 Widget 时自动聚焦 Spinner
+- `spinner:SetSelected(value)` 接受的是 `data` 值，而不是 `text` 值——用来恢复已保存的设置
+
+**添加第二个设置项**（数值选择）：
+
+```lua
+self.level_spinner = self.panel:AddChild(
+    TEMPLATES.LabelSpinner(
+        "品质等级",
+        {
+            {text = "低", data = "low"},
+            {text = "中", data = "medium"},
+            {text = "高", data = "high"},
+        },
+        120, 110, 40, 5, nil, 22, nil,
+        function(new_data)
+            MYMOD_SETTINGS.MY_LEVEL = new_data
+            SaveMySettings()
+        end
+    )
+)
+self.level_spinner:SetPosition(0, YSTART - 50)
+self.level_spinner.spinner:SetSelected(MYMOD_SETTINGS.MY_LEVEL)
+```
+
+> **进阶记忆**：`LabelSpinner` 的 `spinnerdata` 是 `{text, data}` 对的列表；`spinner:SetSelected(data_value)` 用 data 值定位当前选项；`onchanged_fn` 接收的参数是 `data` 值，不是 `text` 值。
+
+---
+
+### 16.10.5 进阶：持久化设置——TheSim:GetPersistentString / SetPersistentString
+
+参照勋章 mod 的 `SaveMedalSettingData` / `LoadMedalSettingData` 实现 mod 设置的存读：
+
+```636:659:mods/联机版mod/勋章/scripts/medal_globalfn.lua
+function SaveMedalSettingData()
+	local setting_data={}
+	for _, v in ipairs(setting_name) do
+		setting_data[v]=TUNING[v]
+	end
+	local str = DataDumper(setting_data, nil, true)
+	TheSim:SetPersistentString("medal_setting_data", str, false)
+end
+--加载勋章设置信息
+function LoadMedalSettingData()
+	TheSim:GetPersistentString("medal_setting_data", function(load_success, data)
+		if load_success and data ~= nil then
+            local success, setting_data = RunInSandbox(data)
+		    if success and setting_data then
+				for _, v in ipairs(setting_name) do
+					if setting_data[v]~=nil then
+						TUNING[v] = setting_data[v]
+					end
+				end
+			end
+		end
+	end)
+end
+LoadMedalSettingData()--游戏开始直接调用一下
+```
+
+为 mod 仿照实现：
+
+```lua
+-- scripts/mymod_settings.lua（完整版）
+
+MYMOD_SETTINGS = {
+    MY_FEATURE = "auto",
+    MY_LEVEL   = "medium",
+}
+
+local SETTING_KEYS = {"MY_FEATURE", "MY_LEVEL"}
+
+function SaveMySettings()
+    local data = {}
+    for _, k in ipairs(SETTING_KEYS) do
+        data[k] = MYMOD_SETTINGS[k]
+    end
+    local str = DataDumper(data, nil, true)
+    TheSim:SetPersistentString("mymod_settings", str, false)
+end
+
+function LoadMySettings()
+    TheSim:GetPersistentString("mymod_settings", function(load_success, data)
+        if load_success and data ~= nil then
+            local success, saved = RunInSandboxSafe(data)
+            if success and type(saved) == "table" then
+                for _, k in ipairs(SETTING_KEYS) do
+                    if saved[k] ~= nil then
+                        MYMOD_SETTINGS[k] = saved[k]
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- 游戏启动时立刻加载
+LoadMySettings()
+```
+
+**几个重要细节**：
+
+| 细节 | 说明 |
+|------|------|
+| `DataDumper(data, nil, true)` | 把 Lua 表序列化成字符串；第三个参数 `true` 开启紧凑格式 |
+| `RunInSandboxSafe(data)` | 安全地把字符串反序列化为 Lua 值；遇到语法错误不崩溃 |
+| `TheSim:SetPersistentString("key", str, false)` | 第三个参数 `encrypt`，通常传 `false` |
+| `TheSim:GetPersistentString("key", callback)` | 回调是**异步**的——代码后面的逻辑不要依赖回调里的结果 |
+| 键名（`"mymod_settings"`）| 用 mod 前缀避免与其他 mod / 官方存档键冲突 |
+
+> **进阶记忆**：持久化用 `TheSim:SetPersistentString` + `DataDumper`；恢复用 `GetPersistentString` + `RunInSandboxSafe`；回调是**异步**的，`LoadMySettings()` 要在模块加载时立刻调用；键名加 mod 前缀防止冲突。
+
+---
+
+### 16.10.6 进阶：HUD 缩放适配——监听 refreshhudsize 事件
+
+玩家修改 HUD 缩放设置时，游戏会推送 `refreshhudsize` 事件。设置面板如果不监听，缩放后看起来会过大或过小。
+
+勋章 mod 的标准做法：
+
+```44:52:mods/联机版mod/勋章/scripts/screens/medalsettingsscreen.lua
+        self.inst:ListenForEvent(
+            "refreshhudsize",
+            function(hud, scale)
+                if self.isopen then
+                    self.scalingroot:SetScale(scale)
+                end
+            end,
+            owner.HUD.inst
+        )
+```
+
+在 `MySettingsScreen` 里加上类似监听：
+
+```lua
+-- 在构造函数里（在 scalingroot 创建之后）
+self.isopen = true
+
+self.inst:ListenForEvent(
+    "refreshhudsize",
+    function(hud, scale)
+        if self.isopen then
+            self.scalingroot:SetScale(scale)
+        end
+    end,
+    owner.HUD.inst  -- 事件由 HUD 实体推送
+)
+```
+
+同时在 `OnCancel` 里标记关闭：
+
+```lua
+function MySettingsScreen:OnCancel()
+    self.isopen = false
+    TheFrontEnd:PopScreen(self)
+    SetAutopaused(false)
+end
+```
+
+`isopen` 标志防止面板已关闭后回调还在调用 `SetScale`（HUD 实体可能还在）。
+
+---
+
+### 16.10.7 进阶：挂载到 HUD——AddClassPostConstruct + OpenScreenUnderPause
+
+面板写好了，但怎么打开它？标准方式是**向 PlayerhHUD 注入打开/关闭方法**，然后在 HUD 按钮里调用。
+
+```1210:1258:mods/联机版mod/勋章/scripts/medal_ui.lua
+AddClassPostConstruct("screens/playerhud",function(self, anim, owner)
+    -- ...
+    self.ShowMedalSettingsScreen = function(_, attach)
+		self.medalsettingsscreen = MedalSettingsScreen(self.owner)
+		self:OpenScreenUnderPause(self.medalsettingsscreen)
+		return self.medalsettingsscreen
+	end
+
+	self.CloseMedalSettingsScreen = function(_)
+		if self.medalsettingsscreen then
+			self.medalsettingsscreen:Close()
+			self.medalsettingsscreen = nil
+		end
+	end
+```
+
+为 MyMod 仿照实现：
+
+```lua
+-- scripts/mymod_hud_hook.lua
+
+local MySettingsScreen = require "screens/mymod_settingsscreen"
+
+AddClassPostConstruct("screens/playerhud", function(self, anim, owner)
+    -- 打开设置面板的方法
+    self.ShowMySettingsScreen = function(_)
+        if self.mysettingsscreen == nil then
+            self.mysettingsscreen = MySettingsScreen(self.owner)
+            self:OpenScreenUnderPause(self.mysettingsscreen)
+        end
+    end
+
+    -- 关闭设置面板的方法
+    self.CloseMySettingsScreen = function(_)
+        if self.mysettingsscreen ~= nil then
+            self.mysettingsscreen:OnCancel()
+            self.mysettingsscreen = nil
+        end
+    end
+end)
+```
+
+**`OpenScreenUnderPause`** 是 PlayerhHUD 的方法，它调用 `TheFrontEnd:PushScreen(screen)`，但会处理好暂停状态（避免重复暂停/取消暂停的冲突）。
+
+在 HUD 按钮的点击回调里调用：
+
+```lua
+-- 在 HUD 按钮的 onclick 里：
+ThePlayer.HUD:ShowMySettingsScreen()
+```
+
+在 modmain.lua 里引入 hook：
+
+```lua
+-- modmain.lua
+require "mymod_settings"       -- 最先加载，立刻 Load 设置
+require "mymod_hud_hook"       -- 注入 HUD 方法
+```
+
+> **进阶记忆**：`AddClassPostConstruct("screens/playerhud", fn)` 注入 HUD 后处理；`OpenScreenUnderPause(screen)` 是标准的"在 HUD 里推 Screen"的安全方式；打开前检查 `mysettingsscreen == nil` 防止重复打开。
+
+---
+
+### 16.10.8 老手：设置需要同步到服务器——使用 mod RPC
+
+有些设置（如"影响所有玩家的游戏行为"）需要服务器知道，**纯本地持久化是不够的**。这时需要用 **Mod RPC** 把设置广播给服务器。
+
+#### 第一步：注册 RPC 处理器
+
+在 modmain.lua 里：
+
+```lua
+-- modmain.lua
+
+-- 定义 RPC ID（用字符串防止 ID 冲突）
+MOD_RPC = MOD_RPC or {}
+MOD_RPC.MyMod = MOD_RPC.MyMod or {}
+MOD_RPC.MyMod.UpdateSetting = GetModRPC("MyMod", "UpdateSetting")
+
+-- 服务器收到 RPC 时的处理函数
+AddModRPCHandler("MyMod", "UpdateSetting", function(player, key, value)
+    -- 注意：这里运行在服务器上
+    -- 可以在这里修改服务器端的全局配置
+    if key == "MY_FEATURE" then
+        TheWorld.mymod_feature = value
+    end
+end)
+```
+
+#### 第二步：在设置变化时发送 RPC
+
+在 `onchanged_fn` 里补充 RPC 发送：
+
+```lua
+onchanged_fn = function(new_data)
+    MYMOD_SETTINGS.MY_FEATURE = new_data
+    SaveMySettings()
+
+    -- 把设置发给服务器（如果需要的话）
+    SendModRPCToServer(MOD_RPC.MyMod.UpdateSetting, "MY_FEATURE", new_data)
+end
+```
+
+**`SendModRPCToServer(rpc_id, ...)` 是 mod 向服务器发数据的标准方式**——参数会被序列化后发送，服务器端的 handler 函数会接收到玩家实例 + 你的参数。
+
+**重要**：只有**需要服务器感知的设置**才用 RPC；纯客户端 UI 偏好（比如"是否显示某个提示"）不需要同步，只存本地即可。
+
+---
+
+### 16.10.9 老手：焦点流与控制器支持
+
+如果 mod 需要支持手柄或键盘导航，必须正确设置焦点流。
+
+#### 第一步：为 Screen 设置 default_focus
+
+```lua
+-- 在构造函数末尾（所有控件都加好之后）
+self.default_focus = self.feature_spinner
+```
+
+`default_focus` 是 Screen 被推入后**第一个获得焦点的 Widget**。详见 16.7.3。
+
+#### 第二步：连接各控件的焦点链
+
+```lua
+-- 上下方向导航：feature → level → close_btn → feature（循环）
+self.feature_spinner.spinner:SetFocusChangeDir(MOVE_DOWN, self.level_spinner.spinner)
+self.level_spinner.spinner:SetFocusChangeDir(MOVE_UP,   self.feature_spinner.spinner)
+self.level_spinner.spinner:SetFocusChangeDir(MOVE_DOWN, self.close_btn)
+self.close_btn:SetFocusChangeDir(MOVE_UP,   self.level_spinner.spinner)
+self.close_btn:SetFocusChangeDir(MOVE_DOWN, self.feature_spinner.spinner)
+self.feature_spinner.spinner:SetFocusChangeDir(MOVE_UP, self.close_btn)
+```
+
+注意：`LabelSpinner` 返回的 wdg 已经设置了 `focus_forward = wdg.spinner`，所以对 `wdg`（LabelSpinner 本体）设置方向时，焦点会**通过 focus_forward 传递到内部的 Spinner**。但直接对 `wdg.spinner` 设方向更明确、不易出错。
+
+#### 第三步：面板本身的 focus_forward
+
+```lua
+self.focus_forward = self.feature_spinner
+```
+
+当面板 Screen 被聚焦时，焦点通过 `focus_forward` 传递给第一个控件。
+
+> **老手记忆**：`default_focus` 控制面板初始焦点；`SetFocusChangeDir` 连接 Spinner 之间的 Up/Down 导航；`focus_forward` 确保 Screen 的焦点能透传到子 Widget。
+
+---
+
+### 16.10.10 老手：五个常见坑
+
+#### 坑 1：面板弹出后 HUD 缩放了但面板没跟着变——忘了监听 refreshhudsize
+
+**症状**：玩家在设置面板打开时调整 HUD 缩放，面板大小不变（显得太大或太小）。
+
+**原因**：没有监听 `"refreshhudsize"` 事件更新 `scalingroot` 的比例。
+
+**修复**：在构造函数里添加事件监听，在回调里调 `self.scalingroot:SetScale(scale)`。注意监听的实体是 `owner.HUD.inst`，而不是 `TheWorld`。
+
+#### 坑 2：`SetSelected` 调了但 Spinner 显示的还是第一个选项——data 类型不匹配
+
+**症状**：`spinner:SetSelected("medium")` 调了，但 UI 显示的是第一个选项"低"。
+
+**原因**：`spinnerdata` 里的 `data` 字段是字符串 `"medium"`，但存档读回来的值因为某种原因变成了 `nil` 或者不同类型。
+
+**调试**：在 `selected_fn` 调用前 `print(type(MYMOD_SETTINGS.MY_LEVEL), MYMOD_SETTINGS.MY_LEVEL)` 确认类型正确。
+
+**修复**：检查 `LoadMySettings` 里是否正确地把字符串/数字类型还原（Lua 的 `DataDumper` + `RunInSandbox` 会保留类型，但 `json.decode` 会把整数变 float）。
+
+#### 坑 3：面板打开了两个——没检查 `mysettingsscreen == nil`
+
+**症状**：快速点击两次 HUD 按钮，弹出两个设置面板叠在一起。
+
+**原因**：`ShowMySettingsScreen` 里没有检查 `self.mysettingsscreen ~= nil`，每次点击都创建新 Screen。
+
+**修复**：
+
+```lua
+self.ShowMySettingsScreen = function(_)
+    if self.mysettingsscreen ~= nil then return end  -- 已经打开了
+    -- ...
+end
+```
+
+#### 坑 4：`OnCancel` 后面板没有真正关闭——忘了 `SetAutopaused(false)`
+
+**症状**：按 Esc 关闭面板后，游戏仍处于暂停状态（菜单灰色，但面板消失了）。
+
+**原因**：`SetAutopaused(true)` 在构造函数里调了，但 `OnCancel` 里忘了调 `SetAutopaused(false)`。
+
+**修复**：确保每条关闭路径（Esc、点击遮罩、点关闭按钮）都调了 `SetAutopaused(false)`。
+
+#### 坑 5：`AddClassPostConstruct` 里引用 `require` 路径错误——找不到 Screen 文件
+
+**症状**：`require "screens/mymod_settingsscreen"` 报错 "module not found"。
+
+**原因**：mod 的 require 路径是相对于 `mods/MyMod/scripts/` 的——`"screens/mymod_settingsscreen"` 对应 `mods/MyMod/scripts/screens/mymod_settingsscreen.lua`。路径拼写错误或文件名大小写不匹配（macOS/Linux 区分大小写）。
+
+**修复**：确认文件实际存在的路径与 require 路径完全一致；在 modmain.lua 顶部先 `print(require("screens/mymod_settingsscreen"))` 验证能否加载。
+
+---
+
+### 16.10 小结——完整文件清单
+
+**`scripts/mymod_settings.lua`**：
+```lua
+MYMOD_SETTINGS = { MY_FEATURE = "auto", MY_LEVEL = "medium" }
+function SaveMySettings() ... TheSim:SetPersistentString("mymod_settings", str, false) end
+function LoadMySettings() ... TheSim:GetPersistentString("mymod_settings", callback) end
+LoadMySettings()
+```
+
+**`scripts/screens/mymod_settingsscreen.lua`**：
+```
+MySettingsScreen = Class(Screen, fn)
+  scalingroot（HUD 缩放根）
+    black（全屏遮罩，点击关闭）
+    panel（TEMPLATES.CurlyWindow）
+      title（Text）
+      feature_spinner（TEMPLATES.LabelSpinner）
+      level_spinner（TEMPLATES.LabelSpinner）
+      close_btn（TEMPLATES.StandardButton）
+  ListenForEvent("refreshhudsize", → scalingroot:SetScale)
+OnCancel → PopScreen + SetAutopaused(false)
+OnControl → Esc/M 键触发 OnCancel
+```
+
+**`scripts/mymod_hud_hook.lua`**：
+```lua
+AddClassPostConstruct("screens/playerhud", function(self)
+    self.ShowMySettingsScreen = function(_) ... OpenScreenUnderPause(...) end
+    self.CloseMySettingsScreen = function(_) ... mysettingsscreen:OnCancel() end
+end)
+```
+
+**`modmain.lua`**：
+```lua
+require "mymod_settings"     -- 优先加载，立刻 LoadMySettings()
+require "mymod_hud_hook"     -- 注入 HUD 方法
+```
+
+---
+
+**新手核心三句**：设置面板 = Screen + scalingroot（缩放）+ black（遮罩）+ CurlyWindow（主体）；`TEMPLATES.StandardButton` 做按钮，`TEMPLATES.LabelSpinner` 做选项；`SetAutopaused(true/false)` 配对调用，不然游戏会一直卡在暂停状态。
+
+**进阶核心三句**：持久化用 `TheSim:SetPersistentString("mymod_settings", DataDumper(data), false)` + `GetPersistentString` + `RunInSandboxSafe`；监听 `refreshhudsize` 在 `owner.HUD.inst` 上更新 `scalingroot` 缩放；`AddClassPostConstruct("screens/playerhud", fn)` 注入 `ShowMySettingsScreen` 是挂入 HUD 的标准方式。
+
+**老手核心三句**：影响全服游戏逻辑的设置用 `SendModRPCToServer` + `AddModRPCHandler` 同步；`SetFocusChangeDir` + `focus_forward` 保证手柄导航；开/关面板的每条路径（Esc、按钮、遮罩）都必须调 `SetAutopaused(false)` 并清空 `self.mysettingsscreen = nil`。
+
+**第 16 章到此收官**——从 Widget 原子（16.1）、布局锚点（16.2）、Screen 弹窗（16.3）、HUD 控件（16.4）、容器界面（16.5）、列表滚动（16.6）、焦点导航（16.7）、数据收集 UI（16.8）、控制台调试（16.9），到本节的设置面板实战（16.10），你已经掌握了饥荒联机版 UI 系统的完整技能树。

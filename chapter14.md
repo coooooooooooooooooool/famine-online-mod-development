@@ -2,7 +2,505 @@
 
 ## 14.1 FX Prefab 的设计模式——SpawnPrefab 生成与自动回收
 
-（待编写）
+### 本节导读
+
+14.1 是 FX 章的"基础理论"——不背 FX 名字，而是理解这 1000+ 个 FX **是如何运转的**。只有先搞清楚骨架，14.2 的复用技巧和 14.3 的自定义 FX prefab 才不会一知半解。
+
+阅读路径：
+
+> **新手**从 14.1.1 开始——只需理解"SpawnPrefab 给你的是什么、怎么设置位置"；**不需要**看懂 proxy 模型；**进阶读者**继续看 14.1.2-14.1.3——理解"双 entity 模型"和 MakeFx 模板的全部字段，能举一反三地定制 FX；**老手**跳到 14.1.4-14.1.5，掌握 FX 生命周期——理解 `animover` 自动回收的时机、为何 proxy 是 1 秒强制销毁、什么情况下 FX 会"泄漏"不销毁，以及 MakeFx 批量注册机制如何工作，并知道 mod 中添加自定义 FX 的两条路径。
+
+读完本节，你能：
+
+- 看懂 `scripts/prefabs/fx.lua` 里的 `MakeFx` 源码，知道每个字段的含义
+- 理解"你调用 `SpawnPrefab` 时到底发生了什么"——proxy entity、`startfx` 延迟、`SetFromProxy`
+- 知道 `animover` 自动回收如何工作，以及何时会出问题
+- 为 14.2 的"直接复用 FX"和后续章节的"自定义 FX prefab"打好基础
+
+---
+
+### 14.1.1 新手入门：SpawnPrefab 的黑盒用法
+
+每次你写下：
+
+```lua
+local fx = SpawnPrefab("small_puff")
+fx.Transform:SetPosition(x, y, z)
+```
+
+表面上是"创建一个特效 entity 并设置位置"——实际上返回给你的是一个 **proxy entity（代理实体）**，真正的渲染实体会在 1 帧后自动创建。
+
+你不需要在乎 proxy 是什么，**只需要知道三件事**：
+
+1. `SpawnPrefab` 返回值是 FX 的"操作句柄"，可以用 `Transform:SetPosition`、`entity:SetParent` 等方法操作位置和父级
+2. **不要手动删它**——FX 会在动画播完后自动销毁（`animover` 事件触发时）
+3. **不要长期持有它的引用**——proxy 在约 1 秒内就会被强制销毁，1 秒后再访问将是悬空引用
+
+#### 最常见的 3 种 SpawnPrefab 模式
+
+**① 固定位置（最简单）**
+
+```lua
+local x, y, z = inst.Transform:GetWorldPosition()
+SpawnPrefab("small_puff").Transform:SetPosition(x, y, z)
+```
+
+这是 `scripts/standardcomponents.lua:1162` 的真实写法（`DoChangePrefab` 函数，entity 变形时遮羞用的烟雾）。
+
+**② 位置 + 高度偏移**
+
+```lua
+local x, y, z = inst.Transform:GetWorldPosition()
+SpawnPrefab("sparks").Transform:SetPosition(x, y + 1 + math.random() * 1.5, z)
+```
+
+这是 `scripts/prefabs/wx78.lua:283` 的真实写法。`y + 1` 让 FX 出现在身体中段而非卡在地面；`math.random() * 1.5` 让多次触发的位置不会完全叠在一起，产生自然的随机感。
+
+**③ 跟随父级**
+
+```lua
+local fx = SpawnPrefab("splash")
+fx.entity:SetParent(inst.entity)
+```
+
+这是 `scripts/stategraphs/SGwilson.lua:14887` 附近的真实写法。调用 `SetParent` 后，FX 会随 `inst` 移动；`inst` 被删除时，FX 也会一并被删除。
+
+> **新手记忆**：`SpawnPrefab` → `SetPosition`（固定位置）或 `SetParent`（跟随）→ 完成。不需要手动 Remove，动画播完自动销毁。
+
+---
+
+### 14.1.2 进阶：双 entity 模型——proxy 与渲染实体
+
+饥荒联机版的 FX 系统核心设计是：**每个 FX prefab 在运行时由两个 entity 组成**，一个负责网络同步，一个负责视觉渲染。理解这个模型，才能真正看懂 FX 系统的各种行为。
+
+#### 两个 entity 是什么？
+
+**entity 1：proxy entity（代理实体）**
+
+这是 `SpawnPrefab` 返回给你的那个 entity，在 `scripts/prefabs/fx.lua:121` 的外层 `fn()` 函数中创建：
+
+```lua
+-- scripts/prefabs/fx.lua:121-159（精简）
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddNetwork()   -- 带网络组件，位置会被广播给所有客户端
+
+    -- 专用服务器不需要渲染 FX
+    if not TheNet:IsDedicated() then
+        -- 延迟 1 帧再创建渲染实体，确保调用方已设好位置
+        inst:DoTaskInTime(0, startfx, inst)
+    end
+
+    inst:AddTag("FX")
+    inst.entity:SetPristine()  -- 广播给所有客户端
+
+    if not TheWorld.ismastersim then
+        return inst   -- 客户端到这里直接返回
+    end
+
+    inst.persists = false
+    inst:DoTaskInTime(1, inst.Remove)  -- 服务端：1 秒后强制销毁 proxy
+
+    return inst
+end
+```
+
+proxy entity 的特征：
+- 有 `Network` 组件，位置/父级会被同步给所有客户端
+- **没有 `AnimState`**——它本身不可见
+- 服务端 1 秒后自动销毁（`DoTaskInTime(1, inst.Remove)`）
+
+**entity 2：渲染实体（visual entity）**
+
+这是真正显示在屏幕上的 entity，在 `scripts/prefabs/fx.lua:18` 的 `startfx(proxy)` 函数中创建：
+
+```lua
+-- scripts/prefabs/fx.lua:18-119（精简）
+local function startfx(proxy)
+    local inst = CreateEntity(t.name)
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()   -- 有动画状态，可见
+
+    -- 继承 proxy 的父级（调用方设置的 SetParent 会传递到这里）
+    local parent = proxy.entity:GetParent()
+    if parent ~= nil then
+        inst.entity:SetParent(parent.entity)
+    end
+
+    if t.nameoverride == nil and t.description == nil then
+        inst:AddTag("FX")
+    end
+    inst.entity:SetCanSleep(false)  -- 不休眠，始终保持活跃
+    inst.persists = false           -- 不持久化到存档
+
+    inst.Transform:SetFromProxy(proxy.GUID)  -- 从 proxy 复制位置/旋转/缩放
+
+    inst.AnimState:SetBank(t.bank)
+    inst.AnimState:SetBuild(t.build)
+    inst.AnimState:PlayAnimation(FunctionOrValue(t.anim))
+
+    -- 动画结束 → 自动删除渲染实体
+    inst:ListenForEvent("animover", inst.Remove)
+    -- ...（省略声音、tint、fn 等）
+end
+```
+
+渲染实体的特征：
+- 有 `AnimState`，是真正的视觉呈现
+- **没有 `Network` 组件**——纯客户端实体，不走网络同步
+- 通过 `SetFromProxy(proxy.GUID)` 从 proxy 复制变换状态（位置/旋转/缩放）
+- `animover` 事件触发后自动删除自己
+
+#### 为什么这样设计？
+
+这种"proxy + 渲染实体"的分离是联机版特有的，有两个核心原因：
+
+1. **联机同步**：服务端只需广播"在 x,y,z 处产生了一个 FX"。proxy 带 `Network`，位置被广播给所有客户端；每个客户端再独立在本地创建自己的渲染实体。服务端根本不在乎渲染。
+
+2. **专用服务器零开销**：`if not TheNet:IsDedicated()` 那行代码保证了没有屏幕的专用服务器**完全不创建渲染实体**——省掉所有动画计算开销。
+
+#### SetFromProxy 的作用
+
+`scripts/prefabs/fx.lua:37`：
+
+```lua
+inst.Transform:SetFromProxy(proxy.GUID)
+```
+
+渲染实体通过这行代码从 proxy 的 GUID **复制 Transform 状态**（位置、旋转、缩放）。这就是为什么调用方只需操作 `SpawnPrefab("xxx").Transform:SetPosition(...)` 就能让 FX 出现在正确位置——你设置的是 proxy 的位置，渲染实体通过 `SetFromProxy` 在创建时一次性复制过来。
+
+同理，调用方 `SetScale` 也会被正确复制：
+
+```lua
+local fx = SpawnPrefab("small_puff")
+fx.Transform:SetScale(2, 2, 2)       -- 设置在 proxy 上
+fx.Transform:SetPosition(x, y, z)   -- 设置在 proxy 上
+-- 1 帧后，渲染实体通过 SetFromProxy 同时获得 scale 和 position
+```
+
+> **进阶记忆**：`SpawnPrefab` 返回 proxy，proxy 位置/缩放被 `SetFromProxy` 复制到渲染实体，两者各司其职——proxy 管网络同步，渲染实体管显示。
+
+---
+
+### 14.1.3 进阶：MakeFx 模板字段全解析
+
+`scripts/fx.lua` 里 1000+ 个 FX 定义，全都是一张"配置表"。以 `die_fx` 为例：
+
+```lua
+-- scripts/fx.lua:56-62
+{
+    name  = "die_fx",
+    bank  = "die_fx",
+    build = "die",
+    anim  = "small",
+    sound = "dontstarve/common/deathpoof",
+    tint  = Vector3(90/255, 66/255, 41/255),
+},
+```
+
+这张表被传入 `MakeFx(t)`，`t` 就是这张配置表。下面按重要性分四组解析所有字段。
+
+#### 必填字段（4 个）
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `name` | string | prefab 名，即 `SpawnPrefab(name)` 的参数 |
+| `bank` | string | 动画库名（决定骨架），对应 `AnimState:SetBank` |
+| `build` | string | 贴图资源包名（不含 `.zip`），对应 `AnimState:SetBuild`；也是资源加载路径 `anim/{build}.zip` |
+| `anim` | string 或 function | 要播放的动画名；为 function 时运行时调用（`FunctionOrValue(t.anim)`） |
+
+> `bank` 与 `build` 的区别：`bank` 是骨架索引（决定有哪些骨骼），`build` 是贴图（决定外观）。同一个 `bank` 可配多种 `build`（换皮肤），这是 14.2.7 讲的复用技巧的核心。
+
+#### 视觉字段（5 个）
+
+| 字段 | 类型 | 默认值 | 含义 |
+|------|------|--------|------|
+| `tint` | Vector3 | nil | RGB 乘法着色，调用 `AnimState:SetMultColour(r, g, b, alpha)` |
+| `tintalpha` | number | nil | 透明度；若只填 `tintalpha` 不填 `tint`，则颜色不变只改透明度 |
+| `transform` | Vector3 | nil | 初始缩放，调用 `AnimState:SetScale(x, y, z)` |
+| `bloom` | bool | nil | 是否使用辉光着色器（`shaders/anim.ksh`） |
+| `build_is_skin` | bool | nil | 资源是否为动态皮肤，改用 `DYNAMIC_ANIM` 加载而非普通 `ANIM` |
+
+`die_fx` 的 `tint = Vector3(90/255, 66/255, 41/255)` 是暗褐色。如果你想做蓝色死亡烟雾，只需复用 `die_fx` 的 bank/build/anim，换一个 `tint`：
+
+```lua
+-- 参考用法（mod 中）
+return MakeFx({
+    name  = "my_shadow_die_fx",
+    bank  = "die_fx",
+    build = "die",
+    anim  = "small",
+    sound = "dontstarve/common/deathpoof",
+    tint  = Vector3(0.2, 0.1, 0.5),  -- 暗紫色
+})
+```
+
+#### 行为字段（8 个）
+
+| 字段 | 类型 | 默认值 | 含义 |
+|------|------|--------|------|
+| `fn` | function | nil | 渲染实体创建后的自定义回调，参数为 `(inst, proxy)` |
+| `fntime` | number | nil | `fn` 的延迟时间（秒）；nil 表示立即调用 |
+| `sound` | string | nil | 创建时播放的音效路径 |
+| `sound2` | string | nil | 第二个音效 |
+| `sounddelay` / `sounddelay2` | number | 0 | 对应音效的延迟时间（秒） |
+| `animqueue` | bool | nil | 用 `animqueueover` 代替 `animover` 触发销毁（适合队列动画） |
+| `update_while_paused` | bool | nil | 游戏暂停时仍更新动画，改用 `DoStaticTaskInTime` |
+| `autorotate` | bool | nil | 渲染实体创建时继承父级的旋转角度 |
+
+`fn` 字段是最重要的扩展点。`scripts/fx.lua` 文件开头定义了几个常用的 `fn` 实现（第 1-32 行）：
+
+```lua
+local function FinalOffset1(inst)
+    inst.AnimState:SetFinalOffset(1)   -- 调整渲染层级，显示在普通地面物体上方
+end
+
+local function GroundOrientation(inst)
+    inst.AnimState:SetOrientation(ANIM_ORIENTATION.OnGround)  -- 贴地朝向
+    inst.AnimState:SetLayer(LAYER_BACKGROUND)
+end
+
+local function Bloom(inst)
+    inst.AnimState:SetBloomEffectHandle("shaders/anim.ksh")  -- 辉光
+    inst.AnimState:SetFinalOffset(1)
+end
+```
+
+调用时机（`scripts/prefabs/fx.lua:104-114`）：
+
+```lua
+if t.fn ~= nil then
+    if t.fntime ~= nil then
+        inst:DoTaskInTime(t.fntime, t.fn, proxy)  -- 延迟调用，参数是 proxy
+    else
+        t.fn(inst, proxy)   -- 立即调用，第一个参数是渲染实体，第二个是 proxy
+    end
+end
+```
+
+注意：`fn` 的第一个参数是**渲染实体**（`inst`），第二个是 proxy。`FinalOffset1` 这类只用第一个参数，而有些 `fn` 会用 proxy 来读取额外信息。
+
+#### 命名字段（2 个）
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `nameoverride` | string | 覆盖检查（inspect）时显示的名称 |
+| `description` | function | 覆盖检查时的描述函数 |
+
+关键：当设置了 `nameoverride` 或 `description` 时，渲染实体**不会添加 `FX` 标签**（`scripts/prefabs/fx.lua:30-32`）：
+
+```lua
+if t.nameoverride == nil and t.description == nil then
+    inst:AddTag("FX")
+end
+```
+
+因为带名字的 FX 通常是可被检查的装饰物（比如战歌 buff 光环显示状态名），不能被 FX 过滤逻辑跳过。
+
+#### 朝向字段（5 个）
+
+| 字段 | 含义 |
+|------|------|
+| 默认（都不填） | `SetFourFaced()`——4 方向朝向（最常见） |
+| `twofaced = true` | `SetTwoFaced()`——2 方向 |
+| `eightfaced = true` | `SetEightFaced()`——8 方向 |
+| `sixfaced = true` | `SetSixFaced()`——6 方向 |
+| `nofaced = true` | 不设朝向（适合地面 FX，如爆炸坑） |
+
+这些设置在 proxy entity 上（`scripts/prefabs/fx.lua:138-146`）。`nofaced` 通常配合 `fn = GroundOrientation` 使用，将 FX 贴在地面上。
+
+> **进阶记忆**：MakeFx 字段 = 必填 4 个（name/bank/build/anim）+ 视觉 5 个（tint/alpha/transform/bloom/skin）+ 行为 8 个（fn/fntime/sound×2/delay×2/animqueue/paused/rotate）+ 命名 2 个（nameoverride/description）+ 朝向 5 个。记住这张表，以后读 `scripts/fx.lua` 里的任意 FX 定义都能一眼看懂。
+
+---
+
+### 14.1.4 老手：animover 自动回收与 FX 生命周期
+
+#### 标准生命周期（MakeFx 模板的默认流程）
+
+从 `SpawnPrefab("small_puff")` 被调用，到 FX 彻底消失的完整时序：
+
+```
+[服务端] SpawnPrefab("small_puff") 被调用
+│
+├── 外层 fn() 执行
+│   ├── CreateEntity()              ← 创建 proxy entity
+│   ├── AddTransform + AddNetwork
+│   ├── DoTaskInTime(0, startfx)    ← 调度：1 帧后创建渲染实体（仅非专用服务器）
+│   ├── SetPristine()               ← 广播给所有客户端
+│   └── DoTaskInTime(1, Remove)     ← 调度：1 秒后销毁 proxy
+│
+[客户端，约 1 帧后] startfx(proxy) 执行
+│   ├── CreateEntity(t.name)        ← 创建渲染实体
+│   ├── SetFromProxy(proxy.GUID)    ← 复制 proxy 的位置/缩放
+│   ├── AddAnimState
+│   ├── PlayAnimation(t.anim)       ← 开始播放
+│   └── ListenForEvent("animover", inst.Remove)  ← 注册：动画结束 → 删除自己
+│
+[动画结束时] animover 事件触发
+└── 渲染实体调用 inst.Remove() 自我销毁
+
+[约 1 秒后] proxy 被 DoTaskInTime 销毁
+```
+
+两个**并行且相互独立**的销毁机制：
+
+1. **渲染实体**：由 `animover` 销毁，时机精确（动画结束即销毁）
+2. **proxy entity**：由 `DoTaskInTime(1, Remove)` 销毁，1 秒是保底——无论动画多长，1 秒后 proxy 一定消失
+
+两者互不阻塞：动画超过 1 秒时，proxy 先消失，渲染实体仍会继续播完再销毁。
+
+#### animqueue：让 FX 播完多个动画再销毁
+
+普通 `animover` 在动画队列中**第一个动画结束时**就触发。如果 FX 需要先播 intro、再播 loop 才消失，使用 `animqueue = true`：
+
+```lua
+-- 在 MakeFx 配置表里设置 animqueue = true
+-- scripts/prefabs/fx.lua:98-102 会监听 animqueueover 而非 animover：
+if t.animqueue then
+    inst:ListenForEvent("animqueueover", inst.Remove)
+else
+    inst:ListenForEvent("animover", inst.Remove)
+end
+```
+
+`animqueueover` 在**整个动画队列播完**后才触发。配合 `fn` 字段设置队列：
+
+```lua
+-- 参考用法（mod 中）
+return MakeFx({
+    name      = "my_burst_fx",
+    bank      = "my_bank",
+    build     = "my_build",
+    anim      = "intro",     -- 先播 intro
+    animqueue = true,
+    fn        = function(inst)
+        inst.AnimState:PushAnimation("burst", false)  -- intro 播完后播 burst，burst 结束触发 animqueueover
+    end,
+})
+```
+
+#### FX 生命周期的常见陷阱
+
+**陷阱 1：proxy 引用超过 1 秒后继续使用**
+
+```lua
+-- ❌ 错误示范
+self.fx = SpawnPrefab("small_puff")
+self.fx.Transform:SetPosition(x, y, z)
+-- ... 2 秒后 ...
+self.fx.Transform:SetPosition(x2, y2, z2)  -- ❌ proxy 已在 1 秒前销毁，self.fx 是悬空引用
+```
+
+MakeFx 模板生成的 FX 是**一次性的**。如果需要持续存在的 FX（比如跟随玩家的 buff 光环），应当写成独立的 prefab（详见第 14.3 章），而不是用 MakeFx 模板。
+
+**陷阱 2：同一帧大量生成 FX 导致性能问题**
+
+```lua
+-- ❌ 谨慎：不要在一帧内生成几十个以上的 FX
+for i = 1, 100 do
+    SpawnPrefab("sparks").Transform:SetPosition(x + i, y, z)
+end
+```
+
+每个 FX 都会产生渲染实体（含 AnimState、SoundEmitter），批量生成会瞬间大量占用客户端 CPU。应当改用 `DoTaskInTime` 分散到多帧，或用单个带粒子系统的 FX 替代。
+
+**陷阱 3：动画名拼写错误导致 animover 不触发**
+
+```lua
+-- ❌ 错误示范：anim 拼错，PlayAnimation 播放失败，animover 永不触发
+{
+    name = "my_fx",
+    bank = "smoke_puff_small",
+    build = "smoke_puff_small",
+    anim = "pufff",   -- ❌ 多了一个 f，动画不存在
+}
+```
+
+播放不存在的动画时，`AnimState:PlayAnimation` 不会报错（只是静默失败），`animover` 也不会触发，渲染实体会永久残留直到地图卸载。调试时可用 `inst.AnimState:IsCurrentAnimation("pufff")` 检查。
+
+> **老手记忆**：`animover` = 动画结束 → 渲染实体销毁；`DoTaskInTime(1, Remove)` = 1 秒保底 → proxy 销毁。两者独立。三个常见陷阱：长期持有 proxy 引用、单帧大量生成、动画名拼错导致泄漏。
+
+---
+
+### 14.1.5 老手：MakeFx 批量注册机制与 mod 开发路径
+
+#### 引擎如何批量注册 1000+ 个 FX prefab
+
+`scripts/fx.lua` 末尾（第 4011-4015 行）将局部辅助函数置 nil 后 `return fx`：
+
+```lua
+-- scripts/fx.lua:4011-4015
+FinalOffset1 = nil
+FinalOffset2 = nil
+FinalOffset3 = nil
+
+return fx
+```
+
+`fx` 是包含了所有配置表的 Lua table。然后 `scripts/prefabs/fx.lua:165-172` 做批量处理：
+
+```lua
+local prefs = {}
+local fx = require("fx")
+
+for k, v in pairs(fx) do
+    table.insert(prefs, MakeFx(v))
+end
+
+return unpack(prefs)
+```
+
+这段代码：
+
+1. `require("fx")` 加载 `scripts/fx.lua`，得到包含 1000+ 个配置表的列表
+2. 对每个配置表调用 `MakeFx(v)`，得到一个 `Prefab` 对象
+3. `return unpack(prefs)` 一次性返回所有 1000+ 个 prefab，由引擎逐一注册
+
+这是饥荒引擎一次性注册所有 FX prefab 的完整流水线：**`fx.lua`（配置表）→ `prefabs/fx.lua`（模板函数）→ 大量 `Prefab` 对象**。
+
+#### mod 中添加自定义 FX 的两条路径
+
+**路径 A：在 mod 中复用 MakeFx 机制（推荐新手/进阶）**
+
+在你的 mod prefab 文件里，复制 `scripts/prefabs/fx.lua` 中的 `MakeFx` 函数，然后用自己的配置表调用它：
+
+```lua
+-- 参考用法（mod 中，文件 scripts/prefabs/myfx.lua）
+local function MakeFx(t)
+    -- 完整复制 scripts/prefabs/fx.lua 里的 MakeFx 实现
+    -- ...
+end
+
+return MakeFx({
+    name  = "my_custom_puff",
+    bank  = "smoke_puff_small",    -- 复用原版美术资源
+    build = "smoke_puff_small",
+    anim  = "puff",
+    tint  = Vector3(0.5, 0.8, 1.0),  -- 蓝色调
+    sound = "dontstarve/common/deathpoof",
+})
+```
+
+然后在 `modmain.lua` 中注册：
+
+```lua
+-- modmain.lua
+PrefabFiles = {
+    "myfx",
+}
+```
+
+**路径 B：手写完整 FX prefab（推荐老手，需要 MakeFx 做不到的功能时）**
+
+当你需要 `Light` 组件（动态光照）、`DoPeriodicTask` 逐帧更新、`SetTarget` 绑定目标等 MakeFx 模板无法提供的功能时，参考 `scripts/prefabs/sparks.lua` 或 `scripts/prefabs/electric_charged_fx.lua`，手写整个 prefab。这部分内容在 14.2.5 有详细分析，在第 15 章有完整示例。
+
+> **老手记忆**：`fx.lua`（配置表）→ `prefabs/fx.lua`（MakeFx 工厂）→ 批量 Prefab——这是官方的流水线。mod 有两条路：借用这条流水线（简单），或者自己手写 prefab（灵活）。两条路没有高下之分，按需求选。
+
+---
+
 
 ## 14.2 常用 FX Prefab 索引与复用（small_puff、sparks、splash、electricchargedfx 等）
 
