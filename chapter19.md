@@ -3660,8 +3660,3005 @@ REVIVE_CORPSE 时长 = 6s × GetReviverSpeedMult × GetReviveSpeedMult
 
 ## 19.7 死亡惩罚与状态重置
 
-（待编写）
+### 本节导读
+
+"死亡 → 复活"看似只是一次画面切换，但其背后**牵动了玩家身上几乎所有的核心组件**。死亡瞬间，`burnable`、`freezable`、`grogginess`、`slipperyfeet`、`propagator` 都会被移除；`hunger`、`temperature`、`moisture` 被强制归零；`debuffable` 被禁用；`age` 被暂停——这是一次彻底的"状态清场"。而复活则要把这些**重新装回去**，并且要承担"血量上限被削减"这种永久惩罚。
+
+理解死亡惩罚和状态重置机制，对 mod 开发非常关键：
+- 你想**让某个 mod 复活道具不扣血量上限**——需要知道 `noreviverhealthpenalty` tag 和 `DeltaPenalty` 调用时机
+- 你想**做一个移除血量惩罚的道具**——需要知道 `maxhealer` 组件
+- 你想**给 mod 角色添加专属的复活后清理**（如 wormwood 重新观察植物）——需要监听 `ms_respawnedfromghost`
+- 你想**让你的 mod 角色完全免疫血量惩罚**——需要知道 `disable_penalty = true` 这个开关
+- 你想**让 mod 在死亡时给玩家加一个永久减 mod 资源的惩罚**——需要在 `ms_becameghost` 或 `death` 事件钩入
+
+> **新手**先看 19.7.1-19.7.3——三类惩罚速览、死亡瞬间清场、复活时还原；**进阶**读者继续看 19.7.4-19.7.7，深入 `Health.penalty` 的工作原理、各复活源的惩罚数值对照表、`maxhealer` 组件实现、`Sanity` 的双轨惩罚系统；**老手**跳到 19.7.8-19.7.11，掌握自定义复活后清理、自定义死亡惩罚、跳过血量惩罚的三种方法，以及五个常见坑。
+
+读完本节，你能**精确把控玩家"死亡 → 复活"两个事件中所有状态字段的变化时序**，并能为你的 mod 自定义任意维度的死亡惩罚或复活恢复逻辑。
+
+---
+
+### 19.7.1 快速入门：死亡惩罚三大类速览
+
+死亡给玩家带来的影响分为**三大类**，理解它们是否"永久"、是否"可逆"、靠什么"消除"，是 mod 开发的基础：
+
+| 类别 | 代表性影响 | 是否可逆 | 消除方式 |
+|------|-----------|---------|----------|
+| **1. 持久属性惩罚** | `health.penalty`（血量上限减少）<br>`sanity.penalty`（精神上限减少）| 可逆 | 专用道具（`lifeinjector` 等）<br>移除惩罚源 |
+| **2. 临时状态重置** | 血量重置为 50<br>精神 → 50% / 饥饿 → 66.7% / 温度 → 35<br>湿度归零 / debuff 全暂停 | 自动恢复 | 复活后正常进食、烤火等 |
+| **3. 数据记录** | Morgue 死亡记录<br>死亡公告（聊天频道）<br>`last_death_position` / `deathcause` | 永久（但会被下次死亡覆盖）| 无（只能避免再次死亡）|
+
+**注意**：第 1 类惩罚里，**只有少数复活源会增加 `health.penalty`**——其他复活源虽然不加惩罚，但通常需要付出"前置代价"（消耗护符、消耗当前血量绑定雕像/坟墓等）。第 2 类的"重置"在 `CommonPlayerDeath` 函数中统一处理；第 3 类则在 `OnMakePlayerGhost` / `OnMakePlayerCorpse` / `OnPlayerDied` 三个分支里分别添加。
+
+> **新手记忆**：死亡掉血量上限的源头只有 3 种——告密的心、沃尔托克斯复活骨头、传送门。**红色护符、肉雕像、触手石、长明灯、怀表复活、WX-78 备份身体——都不加血量上限惩罚**（但它们各自有不同的前置代价）。
+
+---
+
+### 19.7.2 快速入门：死亡瞬间的状态重置——CommonPlayerDeath 全表
+
+**所有死亡分支**（变幽灵 `OnMakePlayerGhost` / 变尸体 `OnMakePlayerCorpse`）的状态清理都走同一个函数 `CommonPlayerDeath`：
+
+```632:671:scripts/prefabs/player_common_extensions.lua
+local function CommonPlayerDeath(inst)
+    inst.player_classified.MapExplorer:EnableUpdate(false)
+
+    inst:RemoveComponent("burnable")
+
+    inst.components.freezable:Reset()
+    inst:RemoveComponent("freezable")
+    inst:RemoveComponent("propagator")
+
+    inst:RemoveComponent("grogginess")
+	inst:RemoveComponent("slipperyfeet")
+
+    inst.components.moisture:ForceDry(true, inst)
+
+    inst.components.sheltered:Stop()
+
+    inst.components.debuffable:Enable(false)
+
+    if inst.components.revivablecorpse == nil then
+        inst.components.age:PauseAging()
+    end
+
+    inst.components.health:SetInvincible(true)
+    inst.components.health.canheal = false
+
+    if not GetGameModeProperty("no_sanity") then
+        inst.components.sanity:SetPercent(.5, true)
+    end
+    inst.components.sanity.ignore = true
+
+    if not GetGameModeProperty("no_hunger") then
+        inst.components.hunger:SetPercent(2 / 3, true)
+    end
+    inst.components.hunger:Pause()
+
+    if not GetGameModeProperty("no_temperature") then
+        inst.components.temperature:SetTemp(TUNING.STARTING_TEMP)
+    end
+    inst.components.frostybreather:Disable()
+end
+```
+
+**死亡时的所有状态变化一览**：
+
+| 操作 | 涉及组件/字段 | 含义 |
+|------|--------------|------|
+| `MapExplorer:EnableUpdate(false)` | player_classified | 暂停地图迷雾更新（幽灵不揭露地图）|
+| `RemoveComponent("burnable")` | burnable | 不再可燃 |
+| `freezable:Reset()` + 移除 | freezable | 解除冰冻、不再可冻 |
+| `RemoveComponent("propagator")` | propagator | 不再传播火焰 |
+| `RemoveComponent("grogginess")` | grogginess | 移除头晕状态、不再可击晕 |
+| `RemoveComponent("slipperyfeet")` | slipperyfeet | 不再有冰滑动效果 |
+| `moisture:ForceDry(true, inst)` | moisture | 湿度强制归零，**silent=true 不通知** |
+| `sheltered:Stop()` | sheltered | 不再受庇护遮挡判定 |
+| `debuffable:Enable(false)` | debuffable | **禁用所有 debuff 更新**（不是清除，是暂停）|
+| `age:PauseAging()` | age（如果不是 corpse 模式）| 年龄停止计数 |
+| `health:SetInvincible(true)`<br>`health.canheal = false` | health | 无敌（防二次伤害）、无法治疗 |
+| `sanity:SetPercent(.5, true)` | sanity | 精神设置为 50% |
+| `sanity.ignore = true` | sanity | 忽略所有精神变化 |
+| `hunger:SetPercent(2/3, true)` | hunger | 饥饿设置为 66.7% |
+| `hunger:Pause()` | hunger | 饥饿停止流失 |
+| `temperature:SetTemp(35)` | temperature | 温度设置为 `TUNING.STARTING_TEMP = 35` |
+| `frostybreather:Disable()` | frostybreather | 关闭呼吸雾气特效 |
+
+紧接着 `OnMakePlayerGhost` 还做了如下"幽灵专用"配置：
+
+```724:728:scripts/prefabs/player_common_extensions.lua
+    inst:AddTag("playerghost")
+    inst.Network:AddUserFlag(USERFLAGS.IS_GHOST)
+
+    inst.components.health:SetCurrentHealth(TUNING.RESURRECT_HEALTH * (inst.resurrect_multiplier or 1))
+    inst.components.health:ForceUpdateHUD(true)
+```
+
+也就是说：变幽灵时**当前血量被设为 `RESURRECT_HEALTH = 50`** （乘以可选倍率 `resurrect_multiplier`，仅 Wanda 用 `OLDAGE_HEALTH_SCALE`）——这是为复活后的"50 血起步"做准备。
+
+> **新手记忆**：变幽灵后**饥饿不再扣**、**温度不变化**、**精神固定 50%**——这是为什么幽灵状态下你不会再因为这些机制再次"死亡"（因为已经死了）。所有 debuff（如毒、燃烧、冰冻、流血等）都被"按暂停键"，但**不会清除**——复活后会重新启用，但绝大多数 debuff 会因为组件被重新添加而失效。
+
+---
+
+### 19.7.3 快速入门：复活后的状态恢复——CommonActualRez 全表
+
+无论从哪种途径复活（护符 / 雕像 / 触手石 / 告密的心 / 传送门 / 怀表 / 长明灯 / WX-78 备份身体），最终都会调用 `CommonActualRez`：
+
+```267:325:scripts/prefabs/player_common_extensions.lua
+local function CommonActualRez(inst)
+    inst.player_classified.MapExplorer:EnableUpdate(true)
+
+    if inst.components.revivablecorpse ~= nil then
+        inst.components.inventory:Show()
+    else
+        inst.components.inventory:Open()
+        inst.components.age:ResumeAging()
+    end
+
+    inst.components.health.canheal = true
+    if not GetGameModeProperty("no_hunger") then
+        inst.components.hunger:Resume()
+    end
+    if not GetGameModeProperty("no_temperature") then
+        inst.components.temperature:SetTemp() --nil param will resume temp
+    end
+    inst.components.frostybreather:Enable()
+
+    MakeMediumBurnableCharacter(inst, "torso")
+    inst.components.burnable:SetBurnTime(TUNING.PLAYER_BURN_TIME)
+    inst.components.burnable.nocharring = true
+
+    MakeLargeFreezableCharacter(inst, "torso")
+    inst.components.freezable:SetResistance(4)
+    inst.components.freezable:SetDefaultWearOffTime(TUNING.PLAYER_FREEZE_WEAR_OFF_TIME)
+
+    inst:AddComponent("grogginess")
+    inst.components.grogginess:SetResistance(3)
+    inst.components.grogginess:SetKnockOutTest(ShouldKnockout)
+
+	inst:AddComponent("slipperyfeet")
+
+    inst.components.moisture:ForceDry(false, inst)
+
+    inst.components.sheltered:Start()
+
+    inst.components.debuffable:Enable(true)
+
+    --don't ignore sanity any more
+    inst.components.sanity.ignore = GetGameModeProperty("no_sanity")
+
+    ConfigurePlayerLocomotor(inst)
+    ConfigurePlayerActions(inst)
+
+    if inst.rezsource ~= nil then
+        local announcement_string = GetNewRezAnnouncementString(inst, inst.rezsource)
+        if announcement_string ~= "" then
+            TheNet:AnnounceResurrect(announcement_string, inst.entity)
+        end
+        inst.rezsource = nil
+    end
+    inst.remoterezsource = nil
+
+	inst.last_death_position = nil
+	inst.last_death_shardid = nil
+
+	inst:RemoveTag("reviving")
+end
+```
+
+**复活时的所有恢复操作一览**：
+
+| 操作 | 涉及组件/字段 | 含义 |
+|------|--------------|------|
+| `MapExplorer:EnableUpdate(true)` | player_classified | 恢复地图迷雾更新 |
+| `inventory:Open()` / `Show()` | inventory | 打开/显示背包（取决于是否 corpse）|
+| `age:ResumeAging()` | age（如果不是 corpse 模式）| 年龄继续计数 |
+| `health.canheal = true` | health | 允许治疗 |
+| `hunger:Resume()` | hunger | 饥饿恢复流失 |
+| `temperature:SetTemp()` | temperature | 恢复温度更新（nil 参数表示恢复）|
+| `frostybreather:Enable()` | frostybreather | 启用呼吸雾气 |
+| `MakeMediumBurnableCharacter` | burnable | **重新添加** 中等可燃组件 |
+| `MakeLargeFreezableCharacter` | freezable | **重新添加** 大型可冻组件 |
+| `AddComponent("grogginess")` | grogginess | **重新添加** 头晕组件 |
+| `AddComponent("slipperyfeet")` | slipperyfeet | **重新添加** 滑倒组件 |
+| `moisture:ForceDry(false, inst)` | moisture | 通知"已干燥"（传 false 即从死亡状态切回）|
+| `sheltered:Start()` | sheltered | 重新启用庇护检测 |
+| `debuffable:Enable(true)` | debuffable | 重新启用 debuff 更新 |
+| `sanity.ignore = no_sanity ?` | sanity | 恢复精神变化监听 |
+| `ConfigurePlayerLocomotor` / `Actions` | locomotor / playercontroller | 切回活人移动/动作配置 |
+| `TheNet:AnnounceResurrect(...)` | TheNet | 广播复活公告 |
+| `last_death_position = nil`<br>`last_death_shardid = nil` | inst | 清除死亡位置记录 |
+| `RemoveTag("reviving")` | inst | 移除"复活中"标记 |
+
+注意 `health:SetInvincible(false)` 并**不在 CommonActualRez 中**——它是在 SGwilson 的 `amulet_rebirth` / `rebirth` / `wakeup` / `rewindtime_rebirth` 等状态退出时统一恢复的。
+
+> **新手记忆**：死亡时是**移除组件**、复活时是**重新添加组件**。所以 mod 如果给玩家添加了"自定义可燃组件配置"或"自定义状态组件配置"，在 `ms_respawnedfromghost` 中需要**重新应用配置**（不能依赖死亡前的状态），这是一个常见坑——见 19.7.11 坑 5。
+
+---
+
+### 19.7.4 进阶：Health.penalty 详解——0~0.75 的可恢复惩罚
+
+`health.penalty` 是 `Health` 组件上的一个浮点字段，表示**当前最大血量被削减的比例**：
+
+```86:88:scripts/components/health.lua
+    self.penalty = 0
+    self.disable_penalty = not TUNING.HEALTH_PENALTY_ENABLED
+```
+
+**有效范围**：`[0, TUNING.MAXIMUM_HEALTH_PENALTY]` = `[0, 0.75]`。也就是说，**最大血量最多只能被削减 75%**（保留 25%）。
+
+**核心 API**：
+
+```460:475:scripts/components/health.lua
+function Health:SetPenalty(penalty)
+    --print("Health:SetPenalty", self.disable_penalty)
+	if not self.disable_penalty then
+		--Penalty should never be less than 0% or ever above 75%.
+		self.penalty = math.clamp(penalty, 0, TUNING.MAXIMUM_HEALTH_PENALTY)
+	end
+end
+
+function Health:DeltaPenalty(delta)
+    self:SetPenalty(self.penalty + delta)
+    self:ForceUpdateHUD(false) --handles capping health at max with penalty
+end
+
+function Health:GetPenaltyPercent()
+    return self.penalty
+end
+```
+
+**有效血量上限**：
+
+```524:526:scripts/components/health.lua
+function Health:GetMaxWithPenalty()
+    return self.maxhealth - self.maxhealth * self.penalty
+end
+```
+
+也就是 `currenthealth` 永远不能超过 `maxhealth × (1 - penalty)`——这就是死亡惩罚最直观的体现。
+
+**几个重要细节**：
+
+1. **`disable_penalty = true` 完全冻结 penalty**：调用 `SetPenalty` / `DeltaPenalty` 都没有效果，但 `GetPenaltyPercent` 仍返回当前 `self.penalty` 值（如果之前曾被设置过）
+2. **`TUNING.HEALTH_PENALTY_ENABLED`**：tuning 表中的全局开关，默认 `true`，关闭后所有玩家初始 `disable_penalty=true`
+3. **`SetPenalty` 不调用 `ForceUpdateHUD`**，只有 `DeltaPenalty` 会调用——所以**单纯 `SetPenalty` 后必须手动调用 `ForceUpdateHUD(false)` 才能让 HUD 正确显示**
+4. **存档读写**：`OnSave` 只保存 `penalty > 0` 时的值；`OnLoad` 仅在 `penalty > 0 and penalty < 1` 时调用 `SetPenalty`
+
+```154:172:scripts/components/health.lua
+function Health:OnSave()
+    return
+    {
+        health = self.currenthealth,
+        penalty = self.penalty > 0 and self.penalty or nil,
+		maxhealth = self.save_maxhealth and self.maxhealth or nil
+    }
+end
+
+function Health:OnLoad(data)
+	if data.maxhealth ~= nil then
+		self.maxhealth = data.maxhealth
+	end
+
+    local haspenalty = data.penalty ~= nil and data.penalty > 0 and data.penalty < 1
+    if haspenalty then
+        self:SetPenalty(data.penalty)
+    end
+```
+
+> **进阶记忆**：`penalty` 是 `[0, 0.75]` 的浮点比例，**不是绝对血量**——`DeltaPenalty(0.25)` 不是"减 25 血"，而是"上限减 25%"。如果你想给 mod 角色添加"绝对血量惩罚"，需要用 `SetMaxHealth(newMax)` 而不是 `penalty`。
+
+---
+
+### 19.7.5 进阶：各复活源的血量惩罚数值表
+
+不同复活源的代价不同。下面是**完整的复活源对照表**：
+
+| 复活源 | 复活时 `penalty` 增量 | 前置代价 | 代码位置 |
+|--------|---------------------|---------|----------|
+| **红色护符 `amulet`** | **0**（无惩罚）| 消耗护符道具（finiteuses）| `DoActualRez` 行 368-370 |
+| **肉雕像 `resurrectionstatue`** | **0**（无惩罚）| **绑定时**消耗 `EFFIGY_HEALTH_PENALTY = 40` 当前血量 | `resurrectionstatue.lua` `onattunecost` |
+| **触手石 `resurrectionstone`** | **0**（无惩罚）| 一次性激活后销毁石头 | `DoActualRez` 行 371-374 |
+| **长明灯 `wendy_resurrectiongrave`** | **0**（无惩罚）| **建造时**消耗 `EFFIGY_HEALTH_PENALTY = 40` 当前血量 | `recipes.lua` 行 155 |
+| **传送门 `multiplayer_portal`** | **+0.25** | 无前置（建图时存在）| `DoActualRez` 行 386 |
+| **告密的心 `reviver`** | **+0.25** | 消耗心、施救者扣精神 | `OnGetItem` 行 357-360 |
+| **沃尔托克斯复活骨头 `wortox_reviver`** | **+0.25**（默认）<br>**0**（有 `wortox_lifebringer_2` 技能时）| 同 `reviver` | `OnGetItem` 行 346-349 |
+| **鬼魂复仇灵药 `ghostlyelixir_retaliation`** | `DeltaPenalty(-0.25)`<br>实际是**减少** 25% 惩罚 | 灵药一次性消耗 | `ghostly_elixirs.lua` 行 312 |
+| **怀表复活 `pocketwatch_revive`** | **0**（无惩罚）| 消耗怀表 | `DoActualRez` 行 392-413 |
+| **WX-78 备份身体 `wx78_backupbody`** | **0**（无惩罚）| 消耗备份身体 | `DoActualRez` 行 383-384 |
+
+**对应的源码片段**：
+
+**传送门复活的 +0.25 惩罚**（在 `DoActualRez` 中）：
+
+```385:390:scripts/prefabs/player_common_extensions.lua
+        elseif source:HasTag("multiplayer_portal") then
+            inst.components.health:DeltaPenalty(TUNING.PORTAL_HEALTH_PENALTY)
+
+            source:PushEvent("rez_player")
+            inst.sg:GoToState("portal_rez")
+        end
+```
+
+**告密的心 / 沃尔托克斯骨头的 +0.25 惩罚**（在 `OnGetItem` 中）：
+
+```341:366:scripts/prefabs/player_common.lua
+local function OnGetItem(inst, giver, item)
+    if item ~= nil and item:HasTag("reviver") and inst:HasTag("playerghost") then
+        if item.skin_sound then
+            item.SoundEmitter:PlaySound(item.skin_sound)
+        end
+        local dohealthpenalty = not item:HasTag("noreviverhealthpenalty")
+        if item.prefab == "wortox_reviver" and giver.components.skilltreeupdater and giver.components.skilltreeupdater:IsActivated("wortox_lifebringer_2") then
+            dohealthpenalty = false
+        end
+
+        item:PushEvent("usereviver", { user = giver })
+        giver.hasRevivedPlayer = true
+        AwardPlayerAchievement("hasrevivedplayer", giver)
+        item:Remove()
+        inst:PushEvent("respawnfromghost", { source = item, user = giver })
+
+        if dohealthpenalty then
+            inst.components.health:DeltaPenalty(TUNING.REVIVE_HEALTH_PENALTY)
+        end
+        giver.components.sanity:DoDelta(TUNING.REVIVE_OTHER_SANITY_BONUS)
+    elseif item ~= nil and giver.components.age ~= nil then
+		if giver.components.age:GetAgeInDays() >= TUNING.ACHIEVEMENT_HELPOUT_GIVER_MIN_AGE and inst.components.age:GetAgeInDays() <= TUNING.ACHIEVEMENT_HELPOUT_RECEIVER_MAX_AGE then
+			AwardPlayerAchievement("helping_hand", giver)
+		end
+    end
+end
+```
+
+**两个跳过血量惩罚的 tag/技能机制**：
+
+1. **`noreviverhealthpenalty` tag**：物品（reviver 类型）带这个 tag 就免疫血量惩罚——mod 自制复活道具时给 prefab 添加 `inst:AddTag("noreviverhealthpenalty")` 即可
+2. **`wortox_lifebringer_2` 技能**：沃尔托克斯专用技能树解锁后，他扔出的 `wortox_reviver` 不再加惩罚
+
+**关键 TUNING 数值**（见 `tuning.lua` 行 2150-2161、2345）：
+
+```lua
+PORTAL_HEALTH_PENALTY = 0.25,                     -- 传送门复活
+HEART_HEALTH_PENALTY = 0.125,                     -- （未使用，保留字段）
+MAXIMUM_HEALTH_PENALTY = 0.75,                    -- penalty 上限
+MAXIMUM_SANITY_PENALTY = 0.9,                     -- （字段保留，实际精神上限由 1-5/max 决定）
+EFFIGY_HEALTH_PENALTY = 40,                       -- 雕像/坟墓绑定消耗的当前血量
+REVIVE_HEALTH_PENALTY_AS_MULTIPLE_OF_EFFIGY = 1,  -- （未实际使用的旧字段）
+REVIVE_SHADOW_SANITY_PENALTY = -40,               -- 复活别人时影子仆人的精神惩罚
+REVIVE_OTHER_SANITY_BONUS = 80,                   -- 复活别人时的精神奖励
+REVIVE_HEALTH_PENALTY = 0.25,                     -- 告密的心、wortox_reviver 复活惩罚
+RESURRECT_HEALTH = 50,                            -- 复活后初始血量
+```
+
+> **进阶记忆**：**复活后初始血量永远是 50**（除非有 `inst.resurrect_multiplier` 倍率，如 Wanda 用 `OLDAGE_HEALTH_SCALE`）。**血量惩罚增量只有 3 种来源**：告密的心、wortox_reviver（无技能时）、传送门。
+
+---
+
+### 19.7.6 进阶：恢复血量惩罚的途径——maxhealer 组件
+
+`Health.penalty` 是可以**主动消除**的——通过 `DeltaPenalty(负数)` 即可。游戏自带一个**专门的组件**叫 `MaxHealer`，专门用于"减少血量惩罚"：
+
+```1:24:scripts/components/maxhealer.lua
+local MaxHealer = Class(function(self, inst)
+    self.inst = inst
+    self.healamount = TUNING.MAX_HEALING_NORMAL
+end)
+
+--NOTE: This is set as a factor of num revives! not an HP amount
+function MaxHealer:SetHealthAmount(health)
+    self.healamount = health
+end
+
+function MaxHealer:Heal(target)
+    if target.components.health ~= nil then
+        target.components.health:DeltaPenalty(self.healamount) --remove x% from the penalty.
+        --print(target.components.health.penalty)
+        if self.inst.components.stackable ~= nil and self.inst.components.stackable:IsStack() then
+            self.inst.components.stackable:Get():Remove()
+        else
+            self.inst:Remove()
+        end
+        return true
+    end
+end
+
+return MaxHealer
+```
+
+注意 `TUNING.MAX_HEALING_NORMAL = -0.25`（行 2002）——**负值**！它会被传给 `DeltaPenalty`，从而**减少** `penalty` 字段。
+
+**生命注射器（lifeinjector）** 是这个组件的典型用例：
+
+```1:42:scripts/prefabs/lifeinjector.lua
+local assets =
+{
+    Asset("ANIM", "anim/lifepen.zip"),
+}
+
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("lifepen")
+    inst.AnimState:SetBuild("lifepen")
+    inst.AnimState:PlayAnimation("idle")
+
+    MakeInventoryFloatable(inst)
+
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("stackable")
+    inst.components.stackable.maxsize = TUNING.STACK_SIZE_SMALLITEM
+
+    inst:AddComponent("inspectable")
+
+    inst:AddComponent("inventoryitem")
+
+    inst:AddComponent("maxhealer")
+
+    MakeHauntableLaunch(inst)
+
+    return inst
+end
+
+return Prefab("lifeinjector", fn, assets)
+```
+
+整个 lifeinjector 的"减惩罚"逻辑就一行：`inst:AddComponent("maxhealer")`——其余的 `Heal` 调用由 Action 系统通过使用动作触发。
+
+**其他可以减少血量惩罚的来源**：
+
+**温蒂的鬼魂复仇灵药 `ghostlyelixir_retaliation`**（施加在玩家身上时）：
+
+```300:315:scripts/prefabs/ghostly_elixirs.lua
+		DURATION_PLAYER = TUNING.GHOSTLYELIXIR_PLAYER_REVIVE_DURATION,
+		ONAPPLY_PLAYER = function(inst, target)
+			target.components.talker:Say(GetString(target, "ANNOUNCE_ELIXIR_BOOSTED"))
+
+			if target.components.sanity then
+				target.components.sanity:DoDelta(TUNING.SANITY_TINY)
+			end
+			if target.components.hunger then
+				target.components.hunger:DoDelta(TUNING.CALORIES_SMALL)
+			end
+
+			if target.components.health ~= nil then
+				target.components.health:DeltaPenalty(TUNING.MAX_HEALING_NORMAL)
+			end
+		end,
+```
+
+施加在玩家身上的"复仇灵药"会自动调用 `DeltaPenalty(-0.25)`，回血量上限 25%。
+
+> **进阶记忆**：**减少 penalty 用的还是 `DeltaPenalty`，只是传负数**。如果你做一个 mod"血量上限恢复药水"，只需要 `target.components.health:DeltaPenalty(-yourAmount)` 即可，等同于"减负"。`DeltaPenalty` 会调用 `SetPenalty`，后者用 `math.clamp` 把结果限制在 `[0, 0.75]`，因此**不可能减成负数**。
+
+---
+
+### 19.7.7 进阶：Sanity 的双轨惩罚系统——penalty 字段 vs sanity_penalties 字典
+
+`Sanity` 组件的惩罚机制比 `Health` 复杂——它有**两套并存**的系统：
+
+```99:104:scripts/components/sanity.lua
+	self.neg_aura_immune_sources = SourceModifierList(inst, false, SourceModifierList.boolean)
+    self.dapperness_mult = 1
+    self.penalty = 0
+
+    self.sanity_penalties = {}
+```
+
+#### 轨道 A：`self.penalty` 字段
+
+- 类型：浮点数，范围 `[0, 1-(5/self.max)]`（保留至少 5 max sanity）
+- 通过 `RecalculatePenalty` 由 `sanity_penalties` 字典累加产生
+- **没有公开的 `SetPenalty` 方法**——外部无法直接设置 `penalty` 字段，只能通过字典 API
+
+#### 轨道 B：`self.sanity_penalties` 字典
+
+外部接入的标准方式：
+
+```189:211:scripts/components/sanity.lua
+function Sanity:AddSanityPenalty(key, mod)
+    self.sanity_penalties[key] = mod
+    self:RecalculatePenalty()
+end
+
+function Sanity:RemoveSanityPenalty(key)
+    self.sanity_penalties[key] = nil
+    self:RecalculatePenalty()
+end
+
+function Sanity:RecalculatePenalty()
+    local penalty = 0
+
+    for k,v in pairs(self.sanity_penalties) do
+        penalty = penalty + v
+    end
+
+    -- players cannot go lower than 5 max sanity. The sanity_penalties penalty will actually go beyond,
+    -- so they will still have to remove enough sanity_penalties to get back above the 5 max sanity cap
+    self.penalty = math.min(penalty, 1-(5/self.max))
+
+    self:DoDelta(0)
+end
+```
+
+**机制特点**：
+
+1. **键 → 值字典**：可以同时存在多个 penalty 来源，每个用唯一的 key 标识
+2. **可叠加**：所有来源的值会**相加**作为最终 penalty 比例
+3. **底线保护**：实际生效的 penalty 不超过 `1 - 5/max`——保证 max sanity 始终 ≥ 5
+4. **`mod` 值**：是 0~1 的浮点比例，如 0.1 表示削减 10%
+
+**最大经典使用案例**——麦斯威尔的影子仆人（`scripts/prefabs/waxwell.lua`）：
+
+```54:64:scripts/prefabs/waxwell.lua
+local function OnSpawnPet(inst, pet)
+    if pet:HasTag("shadowminion") then
+        if not (inst.components.health:IsDead() or inst:HasTag("playerghost")) then
+			--if not inst.components.builder.freebuildmode then
+	            inst.components.sanity:AddSanityPenalty(pet, TUNING.SHADOWWAXWELL_SANITY_PENALTY[string.upper(pet.prefab)])
+			--end
+            inst:ListenForEvent("onremove", inst._onpetlost, pet)
+            pet.components.skinner:CopySkinsFromPlayer(inst)
+        elseif pet._killtask == nil then
+            pet._killtask = pet:DoTaskInTime(math.random(), KillPet)
+        end
+```
+
+每召唤一个影子仆人，就用 `pet`（实体引用）作为 key 添加一份精神惩罚。仆人死亡/被解除时，用 `RemoveSanityPenalty(pet)` 移除。
+
+> **进阶记忆**：mod 给玩家精神加惩罚，**永远用 `AddSanityPenalty(key, mod)`**，不要直接改 `self.penalty`——直接改会被 `RecalculatePenalty` 重置回字典累加值。**`key` 选用一个稳定且唯一的引用**（实体、字符串常量），方便后续 `RemoveSanityPenalty` 移除。
+
+---
+
+### 19.7.8 老手：监听复活事件的正确姿势——ms_becameghost、ms_respawnedfromghost
+
+mod 开发中最常用的"死亡/复活钩子"是这两个事件：
+
+| 事件 | 推送时机 | 推送的 data |
+|------|---------|-----------|
+| `"ms_becameghost"` | `OnMakePlayerGhost` 末尾（成为幽灵后）<br>`OnMakePlayerCorpse` 末尾（成为尸体后）| `nil`（变幽灵时）<br>`{ corpse = true }`（变尸体时）|
+| `"ms_respawnedfromghost"` | `DoActualRez` 末尾（从幽灵复活）<br>`DoActualRezFromCorpse` 末尾（从尸体复活）| `nil`（从幽灵复活）<br>`{ corpse = true, reviver = source }`（从尸体复活）|
+
+**注册方式**：
+
+```lua
+inst:ListenForEvent("ms_becameghost", function(inst, data)
+    if data ~= nil and data.corpse then
+    else
+    end
+end)
+
+inst:ListenForEvent("ms_respawnedfromghost", function(inst, data)
+    if data ~= nil and data.corpse then
+    else
+    end
+end)
+```
+
+**官方案例 1 ——Wormwood 的植物观察**（`prefabs/wormwood.lua` 行 584-599）：
+
+```584:599:scripts/prefabs/wormwood.lua
+local function OnBecameGhost(inst)
+    inst.components.bloomness:SetLevel(0)
+    StopWatchingWorldPlants(inst)
+
+    inst:UpdatePhotosynthesisState(TheWorld.state.isday)
+end
+
+local function OnRespawnedFromGhost(inst)
+    inst.sg.mem.nocorpse = true -- No flesh inside us.
+    if TheWorld.state.isspring then
+        inst.components.bloomness:Fertilize()
+    end
+    WatchWorldPlants(inst)
+
+    inst:UpdatePhotosynthesisState(TheWorld.state.isday)
+end
+```
+
+- 死亡时：清零开花等级、停止监听世界植物
+- 复活时：重新监听植物、春天则触发施肥
+
+**官方案例 2 ——Wolfgang 的力量重置**（`prefabs/wolfgang.lua` 行 112-127）：
+
+```112:127:scripts/prefabs/wolfgang.lua
+local function onbecamehuman(inst, data)
+    inst.components.mightiness:Resume()
+    inst.components.mightiness:SetPercent(0.5, true, true)
+
+    StartPlayerCheck(inst)
+end
+
+local function onbecameghost(inst, data)
+    inst.components.mightiness:Pause()
+	inst.hurtsoundoverride = nil
+
+    if inst.playercheck_task ~= nil then
+        inst.playercheck_task:Cancel()
+        inst.playercheck_task = nil
+    end
+end
+```
+
+- 死亡时：暂停力量、清除受伤声音覆盖
+- 复活时：恢复力量、重置为 50%、重新启动检测任务
+
+**官方案例 3 ——Wickerbottom 的不可击晕**（`prefabs/wickerbottom.lua` 行 62-90）：
+
+```62:90:scripts/prefabs/wickerbottom.lua
+local function OnRespawnedFromGhost(inst)
+    inst.components.grogginess:SetKnockOutTest(KnockOutTest)
+end
+
+local function master_postinit(inst)
+    inst.starting_inventory = start_inv[TheNet:GetServerGameMode()] or start_inv.default
+
+    inst.customidleanim = customidleanimfn
+
+    inst.soundsname = "wickerbottom"
+    --inst.talker_path_override = "dontstarve_DLC001/characters/"
+
+    inst.components.eater:SetDiet({ FOODGROUP.OMNI }, { FOODGROUP.OMNI })
+
+    inst.components.foodaffinity:AddPrefabAffinity("trailmix", TUNING.AFFINITY_15_CALORIES_MEDIUM)
+    inst.components.foodaffinity:AddPrefabAffinity("kabobs", TUNING.AFFINITY_15_CALORIES_HUGE)
+    inst.components.foodaffinity:AddPrefabAffinity("surfnturf", TUNING.AFFINITY_15_CALORIES_LARGE)
+
+    inst.components.health:SetMaxHealth(TUNING.WICKERBOTTOM_HEALTH)
+    inst.components.hunger:SetMax(TUNING.WICKERBOTTOM_HUNGER)
+    inst.components.sanity:SetMax(TUNING.WICKERBOTTOM_SANITY)
+
+    inst.components.builder.science_bonus = 1
+
+    inst:ListenForEvent("ms_respawnedfromghost", OnRespawnedFromGhost)
+    OnRespawnedFromGhost(inst)
+
+    if TheNet:GetServerGameMode() == "lavaarena" then
+        event_server_data("lavaarena", "prefabs/wickerbottom").master_postinit(inst)
+    elseif TheNet:GetServerGameMode() == "quagmire" then
+        event_server_data("quagmire", "prefabs/wickerbottom").master_postinit(inst)
+    end
+end
+```
+
+由于 `grogginess` 组件在死亡时被移除、复活时**重新添加**（CommonActualRez 中），所以薇克巴顿"永不被击晕"的特性必须在每次复活后**重新设置** `SetKnockOutTest`——这就是为什么 `OnRespawnedFromGhost` 不仅在事件中触发，初始化时也立即调用一次。
+
+> **老手记忆**：监听 `ms_respawnedfromghost` 时**必须考虑** "CommonActualRez 刚刚重新添加了 burnable / freezable / grogginess / slipperyfeet 四个组件"——这意味着你之前对它们做的任何自定义配置都会**丢失**。常见做法是把"对这四个组件的配置"封装成一个函数，初始化时调用一次，`ms_respawnedfromghost` 时再调用一次。
+
+---
+
+### 19.7.9 老手：mod 自定义死亡惩罚的三种方式
+
+如果你的 mod 想给玩家死亡添加一个"自定义惩罚"，主要有三种切入点：
+
+#### 方式 1：监听 `"death"` 事件（最早，玩家刚死的那一刻）
+
+```lua
+local function OnMyModDeathPenalty(inst, data)
+    inst.mymod_skillpoints = math.max(0, (inst.mymod_skillpoints or 0) - 1)
+end
+
+inst:ListenForEvent("death", OnMyModDeathPenalty)
+```
+
+**时机**：在 `Health:SetVal` 推送 `death` 事件时（即血量归零后立即）；此时还没进入死亡状态图。
+
+#### 方式 2：监听 `"ms_becameghost"` 事件（已经变成幽灵/尸体）
+
+```lua
+local function OnMyModBecameGhost(inst, data)
+    inst.components.health:DeltaPenalty(0.1)
+    inst.components.sanity:AddSanityPenalty("mymod_death", 0.05)
+end
+
+inst:ListenForEvent("ms_becameghost", OnMyModBecameGhost)
+```
+
+**时机**：在 `OnMakePlayerGhost` / `OnMakePlayerCorpse` 末尾。
+
+#### 方式 3：监听 `"ms_respawnedfromghost"` 事件（复活后）
+
+```lua
+local function OnMyModRespawned(inst, data)
+    inst.components.locomotor:SetExternalSpeedMultiplier(inst, "mymod_rez_slow", 0.5)
+    inst:DoTaskInTime(5, function()
+        inst.components.locomotor:RemoveExternalSpeedMultiplier(inst, "mymod_rez_slow")
+    end)
+end
+
+inst:ListenForEvent("ms_respawnedfromghost", OnMyModRespawned)
+```
+
+**时机**：在 `DoActualRez` / `DoActualRezFromCorpse` 末尾。
+
+**完整 mod 模板**（一个"死亡积分"惩罚 mod）：
+
+```lua
+AddPlayerPostInit(function(inst)
+    if not TheWorld.ismastersim then return end
+
+    inst:ListenForEvent("death", function(inst, data)
+        inst.mymod_deaths = (inst.mymod_deaths or 0) + 1
+
+        if inst.components.health then
+            inst.components.health:DeltaPenalty(0.05)
+        end
+    end)
+
+    inst:ListenForEvent("ms_respawnedfromghost", function(inst, data)
+        if inst.components.talker and inst.mymod_deaths then
+            inst.components.talker:Say(string.format("我已经死了 %d 次了……", inst.mymod_deaths))
+        end
+    end)
+end)
+```
+
+> **老手记忆**：**事件触发顺序是 `death` → `ms_becameghost`（或 `playerdied`）→ `ms_respawnedfromghost`**。如果你想"在 death 事件中扣 penalty"，要注意此时 `Health` 组件的 `disable_penalty` 仍然起作用——更稳妥的做法是用 `inst:DoTaskInTime(0, ...)` 延迟一帧，或直接选择在 `ms_becameghost` 中扣除。
+
+---
+
+### 19.7.10 老手：跳过死亡惩罚的几种姿势
+
+游戏里有三种"跳过血量惩罚"的标准机制，mod 可以借鉴：
+
+#### 姿势 1：`health.disable_penalty = true`（Wanda 的做法）
+
+完全冻结 `penalty` 字段——任何 `SetPenalty` / `DeltaPenalty` 都不生效：
+
+```412:415:scripts/prefabs/wanda.lua
+    inst.components.health.redirect = redirect_to_oldager
+	inst.components.health.canheal = false
+	inst.components.health.disable_penalty = true
+    inst.resurrect_multiplier = TUNING.OLDAGE_HEALTH_SCALE
+```
+
+Wanda 用此机制，因为她的"血量"实际上是"年龄"——传统的血量惩罚机制对她没有意义。注意还设置了 `resurrect_multiplier = OLDAGE_HEALTH_SCALE`——这会让 `RESURRECT_HEALTH × resurrect_multiplier` 成为她的复活初始血量（不是 50）。
+
+#### 姿势 2：物品 tag `"noreviverhealthpenalty"`
+
+让一个 `reviver` 类型的复活道具**不扣血量上限**：
+
+```346:359:scripts/prefabs/player_common.lua
+        local dohealthpenalty = not item:HasTag("noreviverhealthpenalty")
+        if item.prefab == "wortox_reviver" and giver.components.skilltreeupdater and giver.components.skilltreeupdater:IsActivated("wortox_lifebringer_2") then
+            dohealthpenalty = false
+        end
+
+        item:PushEvent("usereviver", { user = giver })
+        giver.hasRevivedPlayer = true
+        AwardPlayerAchievement("hasrevivedplayer", giver)
+        item:Remove()
+        inst:PushEvent("respawnfromghost", { source = item, user = giver })
+
+        if dohealthpenalty then
+            inst.components.health:DeltaPenalty(TUNING.REVIVE_HEALTH_PENALTY)
+        end
+```
+
+**mod 用法**：自制一个"友好的复活道具"，在 `master_postinit` 中给 prefab 添加该 tag：
+
+```lua
+inst:AddTag("reviver")
+inst:AddTag("noreviverhealthpenalty")
+```
+
+#### 姿势 3：技能树解锁（沃尔托克斯专属）
+
+```346:349:scripts/prefabs/player_common.lua
+        local dohealthpenalty = not item:HasTag("noreviverhealthpenalty")
+        if item.prefab == "wortox_reviver" and giver.components.skilltreeupdater and giver.components.skilltreeupdater:IsActivated("wortox_lifebringer_2") then
+            dohealthpenalty = false
+        end
+```
+
+`wortox_lifebringer_2` 是沃尔托克斯的"生命使者 II"技能；解锁后他的 `wortox_reviver`（白色骨头）不再扣血量惩罚。
+
+**mod 类似实现**：
+
+```lua
+inst:ListenForEvent("death", function(inst, data)
+    if inst.components.skilltreeupdater and inst.components.skilltreeupdater:IsActivated("mymod_immortal_skill") then
+        inst.mymod_skip_next_penalty = true
+    end
+end)
+
+inst:ListenForEvent("ms_becameghost", function(inst, data)
+    if inst.mymod_skip_next_penalty then
+        inst.mymod_skip_next_penalty = nil
+        return
+    end
+    inst.components.health:DeltaPenalty(0.1)
+end)
+```
+
+> **老手记忆**：**`disable_penalty` 是最彻底的"免疫"**——既不能加也不能减（包括 lifeinjector 也无效）。**`noreviverhealthpenalty` 只针对 reviver 类型道具**——传送门复活仍会扣。**技能树**最灵活但只对特定 prefab 生效。
+
+---
+
+### 19.7.11 老手：五个常见坑
+
+#### 坑 1：在 `death` 事件中直接修改组件，可能被后续 CommonPlayerDeath 覆盖
+
+```lua
+-- 错误示范
+inst:ListenForEvent("death", function(inst, data)
+    inst.components.hunger:SetPercent(0.1)
+end)
+```
+
+`death` 事件发生在 `Health:SetVal` 推送的时刻，紧接着 SGwilson `death` 状态触发 `OnMakePlayerGhost` / `OnMakePlayerCorpse`，其中调用 `CommonPlayerDeath` 把饥饿设回 66.7%——你的修改无效。
+
+**正确做法**：在 `ms_becameghost` 事件中修改（此时 `CommonPlayerDeath` 已经执行完毕）：
+
+```lua
+inst:ListenForEvent("ms_becameghost", function(inst, data)
+    inst.components.hunger:SetPercent(0.1)
+end)
+```
+
+#### 坑 2：在 `ms_respawnedfromghost` 中重复调用 Resume
+
+```lua
+-- 错误示范——多此一举
+inst:ListenForEvent("ms_respawnedfromghost", function(inst, data)
+    inst.components.hunger:Resume()
+    inst.components.hunger:SetPercent(0.8)
+end)
+```
+
+`CommonActualRez` 已经调用过 `hunger:Resume()`（行 279）、`temperature:SetTemp()`（行 282）、`debuffable:Enable(true)`（行 304）等等。可以直接 `SetPercent`，不需要再 Resume。
+
+#### 坑 3：`disable_penalty=true` 时，`DeltaPenalty` 静默失败
+
+```lua
+inst.components.health.disable_penalty = true
+inst.components.health:DeltaPenalty(0.25)
+print(inst.components.health:GetPenaltyPercent())  -- 依然是 0
+```
+
+**调试建议**：在 mod 添加自定义惩罚前，先 `print(inst.components.health.disable_penalty)` 检查。也要注意：如果世界设置了 `TUNING.HEALTH_PENALTY_ENABLED = false`，所有玩家默认 `disable_penalty=true`。
+
+#### 坑 4：`AddSanityPenalty(key, mod)` 使用相同 key 会覆盖前值
+
+```lua
+-- 错误示范
+inst.components.sanity:AddSanityPenalty("mymod", 0.1)
+inst.components.sanity:AddSanityPenalty("mymod", 0.05)  -- 覆盖了 0.1，最终只剩 0.05
+```
+
+`AddSanityPenalty` 内部是 `self.sanity_penalties[key] = mod`——同 key 就是覆盖。
+
+**正确做法**：每次累加都用唯一 key：
+
+```lua
+inst.components.sanity:AddSanityPenalty("mymod_death_1", 0.1)
+inst.components.sanity:AddSanityPenalty("mymod_death_2", 0.05)
+-- 现在最终 penalty = 0.15
+```
+
+或者**自己维护累加逻辑**，每次只用一个 key 但传新累计值：
+
+```lua
+inst.mymod_total = (inst.mymod_total or 0) + 0.05
+inst.components.sanity:AddSanityPenalty("mymod", inst.mymod_total)
+```
+
+#### 坑 5：`CommonActualRez` 重新添加 `burnable` 等组件后，mod 配置丢失
+
+```lua
+-- 错误示范
+local function masterpostinit(inst)
+    MakeLargeBurnableCharacter(inst, "torso")
+    inst.components.burnable:SetBurnTime(100)
+end
+```
+
+**后果**：第一次死亡复活后，`CommonActualRez` 用 `MakeMediumBurnableCharacter` 重置了 burnable 组件，自定义的 100 秒燃烧时间没了。
+
+**正确做法**：把配置封装成函数，并在 `ms_respawnedfromghost` 时**再次调用**：
+
+```lua
+local function ConfigureMyBurnable(inst)
+    inst.components.burnable:SetBurnTime(100)
+end
+
+local function masterpostinit(inst)
+    MakeMediumBurnableCharacter(inst, "torso")
+    ConfigureMyBurnable(inst)
+    inst:ListenForEvent("ms_respawnedfromghost", ConfigureMyBurnable)
+end
+```
+
+同样的注意事项也适用于 `freezable`、`grogginess`、`slipperyfeet` 三个组件。
+
+---
+
+### 19.7 小结
+
+```
+死亡 → 复活 状态变化时序：
+
+[活]                            [死]                              [活]
+                死亡瞬间          幽灵/尸体期             复活瞬间
+                ↓                                       ↓
+        CommonPlayerDeath                       CommonActualRez
+        -------------------                     -------------------
+        ① 移除组件:                              ① 重新添加组件:
+           burnable/freezable                      burnable/freezable
+           propagator/grogginess                   grogginess/slipperyfeet
+           slipperyfeet
+        ② 强制干燥(moisture)                     ② 切回干燥（湿度刷新）
+        ③ 暂停 debuffable                        ③ 启用 debuffable
+        ④ 暂停 age (非 corpse)                    ④ 恢复 age
+        ⑤ SetInvincible(true)                    ⑤（在 SG 中)解除无敌
+        ⑥ canheal=false                          ⑥ canheal=true
+        ⑦ sanity → 50%, ignore=true              ⑦ sanity.ignore = no_sanity 设置
+        ⑧ hunger → 66.7%, Pause                  ⑧ hunger:Resume()
+        ⑨ temp → STARTING_TEMP=35                ⑨ temp:SetTemp() 恢复
+        ⑩ frostybreather:Disable                 ⑩ frostybreather:Enable
+
+血量惩罚 (health.penalty)：
+  范围 [0, 0.75]                       由 SetPenalty/DeltaPenalty 操作
+  GetMaxWithPenalty() = max × (1-p)    复活后初始血量 = RESURRECT_HEALTH = 50
+
+精神惩罚 (双轨)：
+  sanity.penalty 字段                   私有，外部不可直接设置
+  sanity.sanity_penalties 字典          AddSanityPenalty(key, mod) 累加
+  RecalculatePenalty() 重新计算          上限 = 1 - 5/max（保留最少 5）
+
+复活源 → penalty 增量：
+  红色护符 / 触手石 / 肉雕像 / 长明灯 / 怀表 / WX 备份身体 → 0（无惩罚）
+  传送门                                                 → +0.25
+  告密的心 / wortox_reviver(默认)                          → +0.25
+  wortox_reviver + 沃尔托克斯生命使者 II 技能                → 0
+  鬼魂复仇灵药                                            → -0.25（减惩罚）
+
+恢复 penalty：
+  maxhealer 组件: DeltaPenalty(MAX_HEALING_NORMAL=-0.25)
+  lifeinjector 道具: 内置 maxhealer 组件
+  ghostlyelixir_retaliation: ONAPPLY_PLAYER 中 DeltaPenalty(-0.25)
+```
+
+**新手核心三句**：死亡时几乎所有状态都被"清场"（移除组件、归零计数、暂停）；复活后这些状态被"重新装回"（多数组件是新实例）；只有 3 种复活源会扣血量上限——告密的心、wortox_reviver、传送门。
+
+**进阶核心三句**：`health.penalty` 范围 `[0, 0.75]`，用 `DeltaPenalty`（含负数）调整，`GetMaxWithPenalty` 是真正的有效血量上限；`sanity` 走双轨——直接 `self.penalty` 字段（私有）和 `sanity_penalties` 字典（公开 API），永远通过字典 API 操作；`MaxHealer` 组件就是用 `DeltaPenalty(负数)` 减惩罚。
+
+**老手核心三句**：自定义死亡逻辑监听 `"ms_becameghost"`（设置）和 `"ms_respawnedfromghost"`（重置）两个事件配对使用；`CommonActualRez` 会"重新创建" `burnable / freezable / grogginess / slipperyfeet` 四个组件，所以对它们的 mod 配置必须在 `ms_respawnedfromghost` 中重新应用；`disable_penalty=true`（Wanda）、`"noreviverhealthpenalty"` tag（针对 reviver 物品）、技能树（沃尔托克斯）是三种跳过血量惩罚的官方姿势。
+
 
 ## 19.8 实战：自定义复活道具与死亡效果
 
-（待编写）
+### 本节导读
+
+19.1 到 19.7 把"死亡—幽灵—复活"这条链路完整拆开了：从 `Health:DoDelta` 触发 `entity_death` 事件，到 SGwilson 的 `death` 状态掉物品，再到 `OnMakePlayerGhost` 生成骨架并切换幽灵状态，再到 `respawnfromghost` → `DoActualRez` → `CommonActualRez` 还原生存状态——每一步对应哪些代码、哪些事件、哪些字段，前几节都讲清楚了。
+
+**本节不再讲机制**，而是把这些零件**拼回成 mod**。我会给出 9 个可以直接复制到自己 mod 工程里的实战案例，从"5 行代码的复活药水"到"自定义复活动画分支"，每一个都标注它**复用了 19.1-19.7 的哪一段官方代码**，让你清楚地看到：教程拆出来的不只是理论，而是可以立即落地的工程模块。
+
+**本节的 9 个实战目标**：
+
+| 难度 | 编号 | 实战目标 | 复用机制 |
+|------|------|---------|----------|
+| 新手 | 19.8.2 | 5 行核心代码：能被队友"喂"给幽灵的复活药 | `reviver` tag + `MakeHauntableLaunch` |
+| 新手 | 19.8.3 | 骚扰即复活的"灵魂符石" | `hauntable:SetHauntValue(HAUNT_INSTANT_REZ)` |
+| 进阶 | 19.8.4 | 多次使用的复活罐——耐久 + 不消耗 hauntvalue | `finiteuses` + `no_wipe_value = true` |
+| 进阶 | 19.8.5 | 绑定式复活神龛——绑定花精神而不是血 | `attunable` + 自定义 `OnAttuneCostFn` |
+| 进阶 | 19.8.6 | 复活后给玩家 5 秒无敌 + 满血回归 buff | 监听 `ms_respawnedfromghost` |
+| 进阶 | 19.8.7 | 死亡时永久扣除一个 mod 货币 | 监听 `ms_becameghost` / `death` |
+| 老手 | 19.8.8 | 替换骨架 prefab + 自定义掉落 | `inst.skeleton_prefab` + `master_postinit` |
+| 老手 | 19.8.9 | 给 `DoActualRez` 加分支：自定义复活动画 | `AddClassPostConstruct` + `respawnfromghost` |
+| 老手 | 19.8.10 | 网络同步：复活道具的客户端表现 | `net_*` 网络变量 + `OnUpdate` |
+
+读完本节，你**应该能独立做出一套完整的死亡—复活相关 mod**：自定义道具、自定义建筑、自定义动画、自定义惩罚——所有官方功能能做的，你都能做。
+
+> **新手**先看 19.8.1-19.8.3——理清 mod 工程目录结构、用 5 行代码复刻告密的心、用 5 行代码做一块骚扰即复活的符石；**进阶读者**继续看 19.8.4-19.8.7，给道具加耐久和"不消耗 hauntvalue"、复用 `attunable` 系统、用 `ms_respawnedfromghost` 给复活后挂 buff、用 `ms_becameghost` 加自定义惩罚；**老手**跳到 19.8.8-19.8.10 + 19.8.11，自定义骨架 prefab、用 `AddClassPostConstruct` 给 `DoActualRez` 加分支以实现专属复活动画、做服务端/客户端网络同步、以及五个最容易栽跟头的陷阱。
+
+---
+
+### 19.8.1 实战准备：mod 工程结构与必备文件
+
+在开始写代码前，先确认你的 mod 工程**至少**有这些文件（饥荒联机版 mod 的最简结构）：
+
+```
+mymod/
+├── modinfo.lua           （mod 元信息：名称、版本、配置）
+├── modmain.lua           （mod 主入口：AddPrefab、PrefabPostInit 等）
+└── scripts/
+    └── prefabs/
+        └── myreviver.lua  （你自定义的 prefab）
+```
+
+#### modinfo.lua 最小模板
+
+```lua
+name = "我的复活 mod"
+description = "教程实战 19.8"
+author = "your_name"
+version = "1.0.0"
+
+forumthread = ""
+
+api_version = 10
+dst_compatible = true
+all_clients_require_mod = true   -- 涉及新 prefab，所有客户端都要加载
+client_only_mod = false
+server_only_mod = false
+
+icon_atlas = "modicon.xml"
+icon = "modicon.tex"
+
+priority = 0
+
+configuration_options = {}
+```
+
+**关键点**：
+- `api_version = 10`：联机版当前 mod API 版本，单机版是 6
+- `dst_compatible = true`：联机版兼容标志
+- `all_clients_require_mod = true`：因为我们会添加新 prefab（带动画/物理），所有客户端必须加载
+
+#### modmain.lua 最小模板
+
+```lua
+PrefabFiles =
+{
+    "myreviver",   -- 对应 scripts/prefabs/myreviver.lua
+}
+
+Assets =
+{
+    -- 如果有自定义贴图/动画再加
+    -- Asset("ANIM", "anim/myreviver.zip"),
+}
+
+-- 注册到 STRINGS（让游戏能显示物品名称和描述）
+STRINGS.NAMES.MYREVIVER = "灵魂之心"
+STRINGS.CHARACTERS.GENERIC.DESCRIBE.MYREVIVER = "或许能让朋友再回来一次。"
+
+-- 注册配方（让玩家能合成它）
+local Recipe = GLOBAL.Recipe2
+local TECH = GLOBAL.TECH
+local Ingredient = GLOBAL.Ingredient
+
+AddRecipe2("myreviver",
+    { Ingredient("redgem", 1), Ingredient("nightmarefuel", 4), Ingredient("ghostflower", 1) },
+    TECH.MAGIC_TWO,
+    { atlas = "images/inventoryimages/myreviver.xml" }
+)
+```
+
+#### scripts/prefabs/myreviver.lua 最小骨架（占位）
+
+```lua
+local assets =
+{
+    Asset("ANIM", "anim/bloodpump.zip"),  -- 暂时借用告密的心的动画
+}
+
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("bloodpump")
+    inst.AnimState:SetBuild("bloodpump")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("inspectable")
+
+    return inst
+end
+
+return Prefab("myreviver", fn, assets)
+```
+
+#### 服务端/客户端代码分离——`TheWorld.ismastersim`
+
+仔细看上面骨架里的这一行：
+
+```lua
+inst.entity:SetPristine()
+if not TheWorld.ismastersim then
+    return inst
+end
+```
+
+这是**饥荒联机版 prefab 最关键的"客户端早返回"模式**：
+
+| 阶段 | 谁执行 |
+|------|--------|
+| `entity:AddXxx()`（Transform/AnimState/Network 等）| 服务端 + 客户端**都执行** |
+| `AnimState:SetBank/SetBuild/PlayAnimation` | 服务端 + 客户端**都执行**（客户端要画图）|
+| `MakeInventoryPhysics`（物理）| 服务端 + 客户端**都执行**（客户端要碰撞）|
+| `entity:SetPristine()` | 标记"以上是 pristine 状态"，**网络变量基础值在此固定** |
+| `if not TheWorld.ismastersim then return inst end` | 客户端到此结束 |
+| `AddComponent("inventoryitem")` 等组件 | **只在服务端执行**——组件大都是纯服务端逻辑 |
+
+> **新手记忆**：`SetPristine()` 之前的代码是"客户端也要跑的"（视觉/物理/网络变量声明），之后的代码是"只有服务端要跑的"（组件、tag、监听器）。**不分离会导致客户端崩溃或表现异常**。
+
+完成 mod 工程准备后，下面 19.8.2 开始写真正的实战代码。
+
+---
+
+### 19.8.2 实战 1：5 行核心代码做"复活药水"——reviver tag
+
+**目标**：做一个可以被**活着的玩家拿在手里、对幽灵使用**就让他复活的物品（功能等同于告密的心）。
+
+#### 核心原理回顾
+
+19.4.6 已经讲过，告密的心的"被识别为复活道具"是靠**一个 tag**——`"reviver"`：
+
+```48:79:scripts/prefabs/reviver.lua
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("bloodpump")
+    inst.AnimState:SetBuild("bloodpump")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst:AddTag("reviver")
+```
+
+注意第 62 行 `inst:AddTag("reviver")`——这个 tag 是**在 `SetPristine` 之前添加**的，也就是说 tag 是 pristine 状态的一部分，客户端也能看到。
+
+为什么必须客户端也能看到？因为**给幽灵选择"使用此物"动作的判断在客户端先做一次**（`componentactions.lua` 里检查），如果 tag 在客户端不可见，就无法弹出动作菜单。
+
+而真正的"被使用后让幽灵复活"，则发生在服务端 `OnRespawnFromGhost`：
+
+```593:594:scripts/prefabs/player_common_extensions.lua
+    elseif data.source:HasTag("reviver") then
+        inst:DoTaskInTime(0, DoActualRez, nil, data.source)
+```
+
+只要 source 有 `"reviver"` tag，就走"道具复活"分支，最终进入 `reviver_rebirth` 状态：
+
+```410:412:scripts/prefabs/player_common_extensions.lua
+		else -- Telltale Heart
+	        inst.sg:GoToState("reviver_rebirth", item)
+		end
+```
+
+#### 完整 prefab 代码
+
+把 `scripts/prefabs/myreviver.lua` 改成下面这样：
+
+```lua
+local assets =
+{
+    Asset("ANIM", "anim/bloodpump.zip"),
+}
+
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("bloodpump")
+    inst.AnimState:SetBuild("bloodpump")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst:AddTag("reviver")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("inspectable")
+    inst:AddComponent("tradable")
+
+    MakeHauntableLaunch(inst)
+
+    return inst
+end
+
+return Prefab("myreviver", fn, assets)
+```
+
+整段代码**实质上的 mod 逻辑只有 1 行**：`inst:AddTag("reviver")`。其他都是任何 inventoryitem 都需要的标准模板代码。
+
+#### 为什么不需要"使用"组件？
+
+你可能困惑：游戏里好像没有一个 `useableitem` 之类的组件被加到道具上，那玩家怎么"使用"它对幽灵复活？
+
+答案在游戏引擎层面——**`reviver` tag 的存在让幽灵的 BufferedAction 系统自动识别它**。具体的"对幽灵使用"逻辑封装在 SGwilsonghost 状态图里以及 `playercontroller` 的右键 / 长按动作处理里，**只要你的物品有 `reviver` tag，游戏会自动把它当成"可以喂幽灵"的物品**。
+
+#### `MakeHauntableLaunch(inst)` 的意义
+
+```77:77:scripts/prefabs/reviver.lua
+    MakeHauntableLaunch(inst)
+```
+
+`MakeHauntableLaunch` 是 `scripts/prefabs/winter_ornaments.lua` 之外更常见的 `scripts/components/hauntable.lua` 工厂函数（见 `scripts/components/hauntable.lua` 末尾）。它的效果是：**当幽灵骚扰你这个掉在地上的物品时，物品会被弹飞一段距离**（而不是触发复活——因为我们没加 HAUNT_INSTANT_REZ）。
+
+这是一个"幽灵能玩弄它一下"的视觉趣味，不是必须的——但加了能让你的复活道具掉在地上时不那么呆板。
+
+#### 完整流程
+
+1. 玩家 A 用 `myreviver` 配方合成出一个"灵魂之心"
+2. 玩家 B 死亡，变成幽灵
+3. 玩家 A 拿着"灵魂之心"靠近幽灵 B，右键/长按目标
+4. A 的客户端 → 服务端发起 `ACTIONS.GIVE`（或类似）行动 → 物品被给到 B（幽灵）
+5. B 的 `OnRespawnFromGhost` 检测 `data.source:HasTag("reviver")` → 调 `DoActualRez(B, nil, source)`
+6. DoActualRez → `inst.sg:GoToState("reviver_rebirth", item)` → 播放复活动画 → B 恢复人形
+
+#### 三种身份核心提示
+
+> **新手**：要做"队友能喂给幽灵复活"的道具，**只需要 1 个 tag**：`inst:AddTag("reviver")`。这个 tag 必须在 `SetPristine()` 之前添加。
+> 
+> **进阶**：`reviver` tag 是 `OnRespawnFromGhost`（`player_common_extensions.lua:593`）里检查的，命中后调 `DoActualRez(inst, nil, source)`——`source` 作为 `item` 参数传入。最终复活状态是 `reviver_rebirth`。
+> 
+> **老手**：这种 tag 驱动的设计意味着**它会自动消失（被消耗）**——因为 `reviver_rebirth` 状态会调用 `item:Remove()`（见 SGwilson.lua 中 `reviver_rebirth` 状态的 onexit）；如果想做"耐久版"复活心，需要在 `respawnfromghost` 事件中拦截、消耗 finiteuses 后阻止移除。
+
+---
+
+### 19.8.3 实战 2：骚扰即复活的"灵魂符石"——hauntable + HAUNT_INSTANT_REZ
+
+**目标**：做一块**幽灵自己骚扰就能立即复活**的建筑/物品（功能等同于红色护符 + 触手石的复活路径）。
+
+#### 核心原理回顾
+
+19.3.2 和 19.4.4 都讲过，幽灵骚扰带 `hauntable` 组件、并且 `hauntvalue == TUNING.HAUNT_INSTANT_REZ` 的物体时，会触发 `respawnfromghost` 事件：
+
+```82:97:scripts/components/hauntable.lua
+function Hauntable:DoHaunt(doer)
+    if self.onhaunt ~= nil then
+        if self.inst.components.itemmimic then
+            self.inst.components.itemmimic:TurnEvil(doer)
+            return
+        end
+        self.haunted = self.onhaunt(self.inst, doer)
+        if self.haunted then
+            if doer ~= nil then
+                if self.hauntvalue == TUNING.HAUNT_INSTANT_REZ and doer:HasTag("playerghost") then
+                    doer:PushEvent("respawnfromghost", { source = self.inst })
+                end
+                if not self.no_wipe_value then
+                    self.hauntvalue = nil
+                end
+            end
+```
+
+注意两个关键细节：
+
+1. **必须 `onhaunt` 回调返回 true**——`hauntable` 组件初始化时默认 `self.onhaunt = DefaultOnHauntFn`（直接返回 true），所以**只要不主动 `SetOnHauntFn(nil)`，默认就是返回 true 的**：
+
+```1:3:scripts/components/hauntable.lua
+local function DefaultOnHauntFn(inst, haunter)
+    return true
+end
+```
+
+2. **`SetHauntValue` 自动设 `no_wipe_value = true`**——意味着调一次 `SetHauntValue(HAUNT_INSTANT_REZ)`，物品**可以被反复骚扰复活**（除非用 `finiteuses` 限制次数或 mod 自己拦截）：
+
+```46:50:scripts/components/hauntable.lua
+function Hauntable:SetHauntValue(val)
+    if not val then return end
+    self.hauntvalue = val
+    self.no_wipe_value = true
+end
+```
+
+> **注意点**：直接给 `hauntvalue` 字段赋值（如 `inst.components.hauntable.hauntvalue = X`）**不会**自动设置 `no_wipe_value`——只有走 `SetHauntValue` 的封装才会自动开启。这是新手最容易踩的坑（详见 19.8.11）。
+
+#### 完整 prefab 代码
+
+把 `scripts/prefabs/myreviver.lua` 改成下面这样（也可以再开一个 `mysoulstone.lua`）：
+
+```lua
+local assets =
+{
+    Asset("ANIM", "anim/orangestaff.zip"),
+}
+
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("orangestaff")
+    inst.AnimState:SetBuild("orangestaff")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("inspectable")
+
+    inst:AddComponent("hauntable")
+    inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+
+    return inst
+end
+
+return Prefab("mysoulstone", fn, assets)
+```
+
+整段代码**实质上的 mod 逻辑只有 2 行**：
+
+```lua
+inst:AddComponent("hauntable")
+inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+```
+
+#### 工作流程
+
+1. 玩家 A 制作"灵魂符石"，把它丢在地上
+2. 玩家 B 死亡 → 变成幽灵
+3. 幽灵 B 飘到地上的符石旁，发起 HAUNT 动作（左键点击）
+4. `Hauntable:DoHaunt(B)` 触发 → `onhaunt` 默认返回 true → `haunted = true`
+5. 检测 `hauntvalue == HAUNT_INSTANT_REZ` 且 `doer:HasTag("playerghost")` → `B:PushEvent("respawnfromghost", { source = self.inst })`
+6. B 的 `OnRespawnFromGhost` 检测 `data.source` 不是 reviver、不是雕像、不是石头…… → 走 unsupported rez source 分支 `inst:DoTaskInTime(0, DoActualRez)`（source=nil, item=nil）
+
+**等等！**这意味着用上面的代码 mod，玩家会"瞬间变回来但没有任何复活动画"！
+
+因为 `DoActualRez` 在 source=nil 且 item=nil 的情况下，**不会进入任何 `source:HasTag("xxx")` 分支**，导致 `inst.sg` 不会切到任何 `*_rebirth` 状态，玩家就直接变回来了——很突兀。
+
+#### 修正：让 source 进入兼容的分支
+
+最简单的修正办法：**在 source 进入 OnRespawnFromGhost 之前，先把它伪造成"触手石"或"传送门"的 tag**。但更优雅的做法是看看现成分支的具体条件：
+
+```607:611:scripts/prefabs/player_common_extensions.lua
+    elseif data.source.prefab == "amulet"
+        or data.source.prefab == "resurrectionstone"
+        or data.source.prefab == "resurrectionstatue"
+        or data.source:HasTag("multiplayer_portal") then
+        inst:DoTaskInTime(9 * FRAMES, DoMoveToRezSource, data.source, --[[60-9]] 51 * FRAMES)
+```
+
+可以看到，**`HasTag("multiplayer_portal")` 是 tag 判断**——只要我们给自己的 prefab 加上 `"multiplayer_portal"` tag，OnRespawnFromGhost 就会进入"传送门复活"分支（有 9 帧延迟移动到符石的动画过渡）。
+
+但这样有副作用：进入了传送门分支后，`DoActualRez` 会执行：
+
+```385:389:scripts/prefabs/player_common_extensions.lua
+        elseif source:HasTag("multiplayer_portal") then
+            inst.components.health:DeltaPenalty(TUNING.PORTAL_HEALTH_PENALTY)
+
+            source:PushEvent("rez_player")
+            inst.sg:GoToState("portal_rez")
+```
+
+**会扣 25% 最大血量惩罚 + 进入 `portal_rez` 状态**。如果你不希望有惩罚——参考 19.4.10 给玩家加 `"noreviverhealthpenalty"` tag 是无效的（这个 tag 只对 reviver 物品分支有效）；正确做法是改 mod 配方/价格平衡设计，或者用 19.8.9 的 `AddClassPostConstruct` 注入自定义分支。
+
+##### 简版折中：补一个 onhaunt 弹起特效，绕过"无动画"问题
+
+如果 mod 设计上不在乎"复活动画"这一点视觉差异，可以**自己在 `SetOnHauntFn` 里加一个特效**，至少让骚扰那一刻有反馈：
+
+```lua
+inst:AddComponent("hauntable")
+inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+inst.components.hauntable:SetOnHauntFn(function(inst, haunter)
+    local x, y, z = inst.Transform:GetWorldPosition()
+    SpawnPrefab("statue_transition").Transform:SetPosition(x, y, z)
+    inst.SoundEmitter:PlaySound("dontstarve/common/touchstone_activate")
+    inst:Remove()  -- 用完即销毁，免得 no_wipe_value 让它可以无限用
+    return true     -- 必须返回 true，否则后续 HAUNT_INSTANT_REZ 不会触发
+end)
+```
+
+**`return true` 极为关键**——如果忘了，`Hauntable:DoHaunt` 第 88 行的 `self.haunted = self.onhaunt(...)` 会得到 nil/false，**整段 if self.haunted then 跳过**，最终 respawnfromghost 不会推送。
+
+#### 三种身份核心提示
+
+> **新手**：要做"幽灵骚扰即复活"的物品，最少 2 行代码：`inst:AddComponent("hauntable")` + `inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)`。
+> 
+> **进阶**：`SetHauntValue(...)` 自动把 `no_wipe_value` 设为 true（可重复使用）；如果想用一次后消失，应该在 `SetOnHauntFn` 里手动 `inst:Remove()`，且回调必须 `return true` 才能让 hauntvalue 触发复活。
+> 
+> **老手**：源码里 `OnRespawnFromGhost` 没有针对自定义 prefab 的分支，因此自定义 mod 道具会走 "unsupported rez source"——玩家无复活动画瞬间复活。要解决这点，要么加 `"multiplayer_portal"` tag（有 25% 血量惩罚副作用），要么走 19.8.9 的 `AddClassPostConstruct` 注入自定义分支。
+
+---
+
+### 19.8.4 实战 3：多次使用的复活罐——finiteuses + no_wipe_value
+
+**目标**：做一个有 5 次复活耐久的复活罐——可以被幽灵骚扰复活 5 次，第 6 次时罐子会消失。
+
+#### 核心原理回顾
+
+红色护符的设计就是"多次使用"的样板。看下它的核心代码：
+
+```424:450:scripts/prefabs/amulet.lua
+local function red()
+    local inst = commonfn("redamulet", "resurrector", true)
+
+    inst.scrapbook_specialinfo = "REDAMULET"
+
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    -- red amulet now falls off on death, so you HAVE to haunt it
+    -- This is more straightforward for prototype purposes, but has side effect of allowing amulet steals
+    -- inst.components.inventoryitem.keepondeath = true
+
+    inst.components.equippable:SetOnEquip(onequip_red)
+    inst.components.equippable:SetOnUnequip(onunequip_red)
+    inst.components.equippable:SetOnEquipToModel(onequiptomodel_red)
+
+    inst:AddComponent("finiteuses")
+    inst.components.finiteuses:SetOnFinished(inst.Remove)
+    inst.components.finiteuses:SetMaxUses(TUNING.REDAMULET_USES)
+    inst.components.finiteuses:SetUses(TUNING.REDAMULET_USES)
+
+    inst:AddComponent("hauntable")
+    inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+
+    return inst
+end
+```
+
+**几个关键设计**：
+
+1. **`finiteuses` 组件**——给道具加耐久值
+2. **`SetOnFinished(inst.Remove)`**——耐久归零时自动销毁
+3. **`SetHauntValue(HAUNT_INSTANT_REZ)`**——隐含 `no_wipe_value = true`，骚扰复活后 hauntvalue 不会消失
+
+#### 一个关键陷阱：finiteuses 不会自动随复活消耗
+
+仔细看护符的代码，**`finiteuses` 实际上不是在骚扰复活时被消耗的**——它是在**装备状态下，每隔 `REDAMULET_CONVERSION_TIME` 秒回血时消耗 1 次**：
+
+```11:18:scripts/prefabs/amulet.lua
+local function healowner(inst, owner)
+    if (owner.components.health and owner.components.health:IsHurt() and not owner.components.oldager)
+    and (owner.components.hunger and owner.components.hunger.current > 5 )then
+        owner.components.health:DoDelta(TUNING.REDAMULET_CONVERSION,false,"redamulet")
+        owner.components.hunger:DoDelta(-TUNING.REDAMULET_CONVERSION)
+        inst.components.finiteuses:Use(1)
+    end
+end
+```
+
+所以护符的"5 次复活"其实是因为**复活后会自动穿上一个新的全新护符**（DoActualRez 里 `inventory:Equip(source)`），穿上后这个新护符开始持续消耗——只要伤害足够它每秒都在被消耗，最终自然耗尽。
+
+但**如果你只是骚扰复活、立即把护符再脱下来**，护符不会消耗任何耐久——这是红色护符的一个细节"BUG"或者说"特性"。
+
+#### mod 实战：在骚扰回调中手动消耗 finiteuses
+
+我们要做一个真正"每复活一次扣 1 点耐久"的道具，需要**自己在 onhaunt 回调里调 `finiteuses:Use(1)`**：
+
+```lua
+local assets =
+{
+    Asset("ANIM", "anim/feather_yellow.zip"),
+}
+
+local function OnHaunt(inst, haunter)
+    if inst.components.finiteuses ~= nil and inst.components.finiteuses:GetUses() > 0 then
+        local x, y, z = inst.Transform:GetWorldPosition()
+        SpawnPrefab("statue_transition_2").Transform:SetPosition(x, y, z)
+        inst.SoundEmitter:PlaySound("dontstarve/common/touchstone_activate")
+        inst.components.finiteuses:Use(1)
+        return true  -- 关键：必须返回 true，触发 HAUNT_INSTANT_REZ 分支
+    end
+    return false     -- 耐久用完不让复活
+end
+
+local function fn()
+    local inst = CreateEntity()
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+
+    inst.AnimState:SetBank("feather_yellow")
+    inst.AnimState:SetBuild("feather_yellow")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("inspectable")
+    inst:AddComponent("tradable")
+
+    inst:AddComponent("finiteuses")
+    inst.components.finiteuses:SetMaxUses(5)
+    inst.components.finiteuses:SetUses(5)
+    inst.components.finiteuses:SetOnFinished(inst.Remove)
+
+    inst:AddComponent("hauntable")
+    inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+    inst.components.hauntable:SetOnHauntFn(OnHaunt)
+
+    return inst
+end
+
+return Prefab("myrevivejar", fn, assets)
+```
+
+#### 验证一遍 hauntable 调用流程
+
+回到 `Hauntable:DoHaunt`（19.3.4 详解过）：
+
+```82:97:scripts/components/hauntable.lua
+function Hauntable:DoHaunt(doer)
+    if self.onhaunt ~= nil then
+        if self.inst.components.itemmimic then
+            self.inst.components.itemmimic:TurnEvil(doer)
+            return
+        end
+        self.haunted = self.onhaunt(self.inst, doer)
+        if self.haunted then
+            if doer ~= nil then
+                if self.hauntvalue == TUNING.HAUNT_INSTANT_REZ and doer:HasTag("playerghost") then
+                    doer:PushEvent("respawnfromghost", { source = self.inst })
+                end
+                if not self.no_wipe_value then
+                    self.hauntvalue = nil
+                end
+            end
+```
+
+- 第 7 行：`self.haunted = self.onhaunt(self.inst, doer)`——我们的 `OnHaunt` 返回 true，所以 `self.haunted = true`
+- 第 9 行：进入 if 块
+- 第 11 行：`hauntvalue == HAUNT_INSTANT_REZ` 且 doer 是 playerghost——推送 `respawnfromghost`
+- 第 14 行：`if not self.no_wipe_value then` ——因为我们调了 `SetHauntValue`，`no_wipe_value = true`，所以**这里不会清空 hauntvalue**——下次还能复活
+
+#### 三种身份核心提示
+
+> **新手**：要做"多次复活"的道具，组合 `finiteuses` + `hauntable:SetHauntValue(HAUNT_INSTANT_REZ)`，并把"消耗耐久"逻辑写到 `SetOnHauntFn` 的回调里。
+> 
+> **进阶**：`SetHauntValue` 自动开 `no_wipe_value = true`，所以 hauntvalue 不会因为一次骚扰就被清空；但红色护符的 finiteuses 不是骚扰时消耗的，而是装备后持续消耗，要做真正的"骚扰一次扣 1 耐久"必须在 `SetOnHauntFn` 里手动 `finiteuses:Use(1)`。
+> 
+> **老手**：要在耐久归零时阻止复活，让 `SetOnHauntFn` 在 `GetUses() <= 0` 时 return false——这样 `DoHaunt` 里的 if self.haunted 整块被跳过，respawnfromghost 不会推送，符合"耐久没了就不能复活"的逻辑。
+
+---
+
+### 19.8.5 实战 4：绑定式复活神龛——attunable 系统
+
+**目标**：做一个仿肉雕像的复活建筑，但**绑定代价是消耗精神（sanity）而不是血量**——既能展示 `attunable` 系统的使用、又能体现"自定义绑定代价"。
+
+#### 核心原理回顾
+
+肉雕像的实现已经在 19.4.5 拆过了。看下完整的 attunable 注册部分：
+
+```168:172:scripts/prefabs/resurrectionstatue.lua
+    inst:AddComponent("attunable")
+    inst.components.attunable:SetAttunableTag("remoteresurrector")
+    inst.components.attunable:SetOnAttuneCostFn(onattunecost)
+    inst.components.attunable:SetOnLinkFn(onlink)
+    inst.components.attunable:SetOnUnlinkFn(onunlink)
+```
+
+四个回调分别是：
+- `SetAttunableTag("remoteresurrector")`：**复用 vanilla 的 tag**——这样幽灵的 `REMOTERESURRECT` 动作能找到它
+- `SetOnAttuneCostFn`：玩家请求绑定时的代价计算（可拒绝）
+- `SetOnLinkFn`：绑定成功的回调（视觉效果等）
+- `SetOnUnlinkFn`：解除绑定的回调
+
+#### 关键代码片段：肉雕像的血量代价
+
+```61:73:scripts/prefabs/resurrectionstatue.lua
+local function onattunecost(inst, player)
+    --round up health to match UI display
+    local amount_required = player:HasTag("health_as_oldage") and math.ceil(TUNING.EFFIGY_HEALTH_PENALTY * TUNING.OLDAGE_HEALTH_SCALE) or TUNING.EFFIGY_HEALTH_PENALTY
+
+    if player.components.health == nil or math.ceil(player.components.health.currenthealth) <= amount_required then
+        --Don't die from attunement!
+        return false, "NOHEALTH"
+    end
+
+    player:PushEvent("consumehealthcost")
+    player.components.health:DoDelta(-TUNING.EFFIGY_HEALTH_PENALTY, false, "statue_attune", true, inst, true)
+    return true
+end
+```
+
+**两个返回值**：
+- `return true` 表示"代价已扣，可以绑定"
+- `return false, reason` 表示"代价不够，不能绑定"——`reason` 通常是字符串如 `"NOHEALTH"`，用于显示提示语
+
+#### 完整 mod 代码：精神代价的复活神龛
+
+`scripts/prefabs/myshrine.lua`：
+
+```lua
+require "prefabutil"
+
+local assets =
+{
+    Asset("ANIM", "anim/wilsonstatue.zip"),  -- 暂时借用肉雕像的动画
+    Asset("MINIMAP_IMAGE", "resurrect"),
+}
+
+local prefabs =
+{
+    "collapse_small",
+    "collapse_big",
+}
+
+local SANITY_COST = 80  -- 绑定代价：80 点精神
+
+local function onhammered(inst, worker)
+    if inst.components.lootdropper ~= nil then
+        inst.components.lootdropper:DropLoot()
+    end
+    local fx = SpawnPrefab("collapse_big")
+    fx.Transform:SetPosition(inst.Transform:GetWorldPosition())
+    fx:SetMaterial("wood")
+    inst:Remove()
+end
+
+local function onattunecost(inst, player)
+    if player.components.sanity == nil then
+        return false, "NOSANITY"
+    end
+    -- 精神不足以支付时拒绝
+    if player.components.sanity.current <= SANITY_COST then
+        return false, "NOSANITY"
+    end
+    player.components.sanity:DoDelta(-SANITY_COST, false)
+    return true
+end
+
+local function onlink(inst, player, isloading)
+    if not isloading then
+        inst.SoundEmitter:PlaySound("dontstarve/common/together/meat_effigy_attune/on")
+        inst.AnimState:PlayAnimation("attune_on")
+        inst.AnimState:PushAnimation("idle", false)
+    end
+end
+
+local function onunlink(inst, player, isloading)
+    if not (isloading or inst.AnimState:IsCurrentAnimation("attune_on")) then
+        inst.SoundEmitter:PlaySound("dontstarve/common/together/meat_effigy_attune/off")
+        inst.AnimState:PlayAnimation("attune_off")
+        inst.AnimState:PushAnimation("idle", false)
+    end
+end
+
+local function onbuilt(inst, data)
+    -- 复用肉雕像的"建造时自动绑定不收费"hack
+    inst.components.attunable:SetOnAttuneCostFn(nil)
+    inst.components.attunable:SetOnLinkFn(nil)
+    inst.components.attunable:SetOnUnlinkFn(nil)
+
+    inst.AnimState:PlayAnimation("place")
+    if inst.components.attunable:LinkToPlayer(data.builder) then
+        inst.AnimState:PushAnimation("attune_on")
+    end
+    inst.AnimState:PushAnimation("idle", false)
+
+    inst.components.attunable:SetOnAttuneCostFn(onattunecost)
+    inst.components.attunable:SetOnLinkFn(onlink)
+    inst.components.attunable:SetOnUnlinkFn(onunlink)
+end
+
+local function fn()
+    local inst = CreateEntity()
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddMiniMapEntity()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    inst:SetDeploySmartRadius(1)
+    MakeObstaclePhysics(inst, .3)
+    inst.MiniMapEntity:SetIcon("resurrect.png")
+
+    inst:AddTag("structure")
+    inst:AddTag("resurrector")
+
+    inst.AnimState:SetBank("wilsonstatue")
+    inst.AnimState:SetBuild("wilsonstatue")
+    inst.AnimState:PlayAnimation("idle")
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inspectable")
+    inst:AddComponent("lootdropper")
+
+    inst:AddComponent("workable")
+    inst.components.workable:SetWorkAction(ACTIONS.HAMMER)
+    inst.components.workable:SetWorkLeft(4)
+    inst.components.workable:SetOnFinishCallback(onhammered)
+    inst:ListenForEvent("onbuilt", onbuilt)
+
+    -- attunable 配置——核心
+    inst:AddComponent("attunable")
+    inst.components.attunable:SetAttunableTag("remoteresurrector")  -- 复用 vanilla tag
+    inst.components.attunable:SetOnAttuneCostFn(onattunecost)
+    inst.components.attunable:SetOnLinkFn(onlink)
+    inst.components.attunable:SetOnUnlinkFn(onunlink)
+
+    -- 用过即销毁
+    inst:ListenForEvent("activateresurrection", inst.Remove)
+
+    return inst
+end
+
+return Prefab("myshrine", fn, assets, prefabs),
+    MakePlacer("myshrine_placer", "wilsonstatue", "wilsonstatue", "idle")
+```
+
+#### 工作流程
+
+1. 玩家 A 建造 `myshrine`，建造时**不扣精神**（建造材料本身已经是代价）
+   - `onbuilt` 临时把 `OnAttuneCostFn` 设为 nil，调 `LinkToPlayer(builder)` → 不进入 `onattunecost` 分支
+2. 玩家 B 想绑定同一座神龛 → 走 `LinkToPlayer(B)` → 触发 `onattunecost(inst, B)`
+   - 检查 B 的精神 > 80 → 扣 80 精神 → return true → 绑定成功
+   - 否则 return false, "NOSANITY" → 弹提示"精神不足"
+3. 玩家 A 死亡变幽灵 → 在 HUD 看到 `REMOTERESURRECT` 选项（因为他绑定过这个 `"remoteresurrector"` tag 的实体）
+4. A 选择 REMOTERESURRECT → `ACTIONS.REMOTERESURRECT.fn` → `attuner:GetAttunedTarget("remoteresurrector")` → 找到 myshrine
+5. PushEvent `respawnfromghost`，source = myshrine → `OnRespawnFromGhost` 走 `data.source.prefab == "resurrectionstatue"` 吗？**NO！**——这里 source 的 prefab 是 `"myshrine"`，不匹配任何分支
+6. 进入 unsupported rez source 分支，瞬间复活无动画
+7. `DoActualRez(inst)` 内 `source` 参数没传（nil），但又因为 `data.source.components.attunable:GetAttunableTag() == "remoteresurrector"` → **设置 `inst.remoterezsource = true`**
+
+如何修复"无动画"？两条路：
+- 改 `SetAttunableTag` 用一个新 tag（如 `"my_shrine_resurrector"`），然后 mod 自己实现一个新的 REMOTERESURRECT action？太复杂。
+- 或者**就用现有 vanilla tag `"remoteresurrector"`**，让玩家自然能用 REMOTERESURRECT 动作；只是没有 `rebirth` 动画——可以接受。
+- 又或者用 19.8.9 的 `AddClassPostConstruct` 给 `DoActualRez` 加自定义分支。
+
+#### attunable 系统的几个隐含规则
+
+| 规则 | 来源 |
+|------|------|
+| 同一玩家在同一 tag 下**只能绑定一个**实体——绑定新的会自动解除旧的 | `attunable.lua:20-30` `onplayerattuned` |
+| 玩家离线时绑定信息保存为 `attuned_userids[userid]`，玩家上线时自动重连 | `attunable.lua:38-43` `onplayerjoined` |
+| 实体销毁（Remove）时，所有绑定它的玩家会自动 UnlinkFromPlayer | `attunable.lua:48-58` `OnRemoveEntity` |
+| 玩家移除（Remove）时（如重连断线），绑定信息从 `attuned_players` 转入 `attuned_userids` | `attunable.lua:33-36` `onplayerremoved` |
+| 客户端通过 `attunable_classified` 代理实体看到绑定关系，**不直接访问实体** | `attunable.lua:105` `SpawnPrefab("attunable_classified")` |
+| 一次性使用：监听 `activateresurrection` 事件自动 Remove | `resurrectionstatue.lua:176` |
+
+#### 三种身份核心提示
+
+> **新手**：用 `attunable` 系统的 5 行核心代码：`AddComponent` + `SetAttunableTag("remoteresurrector")` + `SetOnAttuneCostFn` + `SetOnLinkFn` + `SetOnUnlinkFn`。再加上 `ListenForEvent("activateresurrection", inst.Remove)` 让它"用过即销毁"。
+> 
+> **进阶**：`SetOnAttuneCostFn` 必须返回 `true` 或 `false, reason`；reason 是字符串，用来显示"代价不足"提示语。建造时通过临时清除 `OnAttuneCostFn` 实现"建造者免费自动绑定"。
+> 
+> **老手**：`attunable` 的网络同步靠 `attunable_classified` 代理实体——客户端通过 `attuner.attuned[guid]` 拿到的是代理而不是实际实体；离线玩家的绑定靠 `attuned_userids` 字典保存 userid，登录时 `onplayerjoined` 自动重链；`UnlinkFromPlayer(p, true)` 第二个参数 isloading 用于区分"加载存档触发的解链"和"主动解链"——后者会播音效，前者不会。
+
+---
+
+### 19.8.6 实战 5：复活后给玩家 5 秒无敌 + 满血——监听 ms_respawnedfromghost
+
+**目标**：做一个**全局生效的"复活保护"系统**——不论玩家用什么方式复活，复活完成后给他 5 秒无敌 + 满血。
+
+#### 核心原理回顾
+
+19.7.8 讲过，复活完成后会推送 `ms_respawnedfromghost` 事件——这是给 mod 挂"复活后清理/初始化"的标准钩子：
+
+```424:430:scripts/prefabs/player_common_extensions.lua
+    CommonActualRez(inst)
+
+    inst:RemoveTag("playerghost")
+    inst.Network:RemoveUserFlag(USERFLAGS.IS_GHOST)
+
+    inst:PushEvent("ms_respawnedfromghost")
+```
+
+事件推送在 `DoActualRez` 的最末尾——`CommonActualRez` 已经跑完、所有组件已经恢复、`playerghost` tag 已经移除——这时挂上的 buff 不会被"二次清理"。
+
+#### 写在 modmain.lua 的两种实现
+
+**方案 1：用 `PrefabPostInit("player_common", ...)`**——给所有玩家 prefab 都注入
+
+```lua
+-- 在 modmain.lua 里
+local INVINCIBLE_TIME = 5
+
+local function OnRespawnedFromGhost(inst)
+    inst.components.health:SetInvincible(true)
+    inst.components.health:DoDelta(inst.components.health.maxhealth, true, "myreviveprotection", true)
+    
+    -- 5 秒后取消无敌
+    inst:DoTaskInTime(INVINCIBLE_TIME, function()
+        if inst:IsValid() and inst.components.health then
+            inst.components.health:SetInvincible(false)
+        end
+    end)
+end
+
+AddPrefabPostInit("player_common", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then
+        return
+    end
+    -- 仅在服务端添加监听器（这是 player 通用 prefab 后处理）
+    inst:ListenForEvent("ms_respawnedfromghost", OnRespawnedFromGhost)
+end)
+```
+
+**为什么用 `AddPrefabPostInit("player_common", ...)` 而不是 `PrefabPostInit` 各角色？**
+
+因为 `player_common.lua` 是**所有角色的共通构造**——`wilson.lua`、`wendy.lua`、`willow.lua` 等都是基于它扩展。在 `player_common` 上挂监听，所有玩家角色都能继承。
+
+**方案 2：监听 `ms_playerjoined`（更精确）**
+
+```lua
+local function OnPlayerJoined(world, player)
+    player:ListenForEvent("ms_respawnedfromghost", OnRespawnedFromGhost)
+end
+
+AddPrefabPostInit("world", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then
+        return
+    end
+    inst:ListenForEvent("ms_playerjoined", OnPlayerJoined)
+end)
+```
+
+每当玩家加入（包括首次连接、断线重连）就给他挂监听——比 PrefabPostInit 更稳定，因为后者偶尔会在某些 mod 顺序下不触发。
+
+#### 详细 API 解释
+
+| API 调用 | 作用 |
+|---------|------|
+| `health:SetInvincible(true)` | 把 `health.invincible` 设为 true——所有 `health:DoDelta` 调用如果 `ignore_invincible` 不为 true，都会被无视 |
+| `health:DoDelta(maxhealth, true, "myreviveprotection", true)` | 第 1 参数：变化量（满血量）；第 2 参数：overtime（瞬间生效）；第 3 参数：cause（用于 entity_death 事件）；第 4 参数：ignore_invincible（**必须 true**，否则上一行 SetInvincible 会让本次 DoDelta 静默失败）|
+| `DoTaskInTime(time, fn)` | 注册一次性延时任务——5 秒后再调 SetInvincible(false) |
+
+**关键陷阱**：`DoDelta` 第 4 个参数 ignore_invincible 必须 true，否则"先 SetInvincible(true) 再 DoDelta(maxhealth)"的"满血"会失败——`DoDelta` 内部检查 `if not ignore_invincible and self.invincible then return end`。这也是 19.6.5 `OnRespawnFromPlayerCorpse` 里所有 DoDelta 都带 `ignore_invincible=true` 的原因。
+
+#### 完整 modmain.lua 示例
+
+```lua
+PrefabFiles = {
+    -- 你的 prefab 文件
+}
+
+Assets = {}
+
+local INVINCIBLE_TIME = 5
+
+local function OnRespawnedFromGhost(inst)
+    if inst.components.health == nil then return end
+
+    inst.components.health:SetInvincible(true)
+    inst.components.health:DoDelta(
+        inst.components.health.maxhealth,
+        true,                       -- overtime
+        "myreviveprotection",       -- cause
+        true,                       -- ignore_invincible（必须为 true）
+        nil,                        -- afflicter
+        true                        -- silent（不弹"挨打"数字）
+    )
+
+    -- 视觉效果：闪烁防止队友打你
+    if inst.AnimState then
+        inst.AnimState:SetMultColour(1, 1, 1, 0.6)
+    end
+
+    inst:DoTaskInTime(INVINCIBLE_TIME, function()
+        if inst:IsValid() and inst.components.health then
+            inst.components.health:SetInvincible(false)
+            if inst.AnimState then
+                inst.AnimState:SetMultColour(1, 1, 1, 1)
+            end
+        end
+    end)
+end
+
+local function OnPlayerJoined(world, player)
+    player:ListenForEvent("ms_respawnedfromghost", OnRespawnedFromGhost)
+end
+
+AddPrefabPostInit("world", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then
+        return
+    end
+    inst:ListenForEvent("ms_playerjoined", OnPlayerJoined)
+end)
+```
+
+#### 配对使用：监听 `ms_becameghost` 添加复活前 buff
+
+实战中，"复活无敌 + 满血"通常和"死亡时记录什么状态"配对——比如**死亡时记录玩家死前的 buff**，复活时**自动复原**：
+
+```lua
+local function OnBecameGhost(inst)
+    -- 记录死亡时的关键状态（mod 自定义字段）
+    inst._mybuffsnapshot = {
+        was_buffed = inst:HasTag("my_super_buff"),
+        last_resource = inst.my_mod_resource,
+    }
+end
+
+local function OnRespawnedFromGhost(inst)
+    -- 还原快照
+    if inst._mybuffsnapshot ~= nil then
+        if inst._mybuffsnapshot.was_buffed then
+            inst:AddTag("my_super_buff")
+        end
+        inst.my_mod_resource = inst._mybuffsnapshot.last_resource
+        inst._mybuffsnapshot = nil
+    end
+    -- ... 上面的无敌 + 满血代码 ...
+end
+
+local function OnPlayerJoined(world, player)
+    player:ListenForEvent("ms_becameghost", OnBecameGhost)
+    player:ListenForEvent("ms_respawnedfromghost", OnRespawnedFromGhost)
+end
+```
+
+`ms_becameghost` 推送时机比 `CommonPlayerDeath` 略晚——它在 `OnMakePlayerGhost` 最后推送，此时玩家已经是幽灵了，但所有 mod-state 还在。
+
+#### 三种身份核心提示
+
+> **新手**：复活后挂 buff 用 `inst:ListenForEvent("ms_respawnedfromghost", fn)`；事件在 `DoActualRez` 末尾推送，所有组件都已恢复。
+> 
+> **进阶**：用 `AddPrefabPostInit("world", ...)` 监听 `ms_playerjoined` 是最稳定的挂监听姿势——比直接 `AddPrefabPostInit("player_common", ...)` 更不容易被其他 mod 干扰。`DoDelta(maxhealth, true, cause, true)` 第 4 参数 `ignore_invincible` 必须 true，否则 SetInvincible(true) 后的 DoDelta 会被静默吃掉。
+> 
+> **老手**：`ms_becameghost` 和 `ms_respawnedfromghost` 必须配对使用——任何"死亡时记录"和"复活时还原"的 mod 状态都靠这一对事件。监听器记得做 `nil` 防御：玩家在事件触发时刚刚 RemoveTag("playerghost") 还没退出 `respawnedfromghost` 处理流程，组件理论上都在；但 DoTaskInTime 延时回调可能跨多次实体生命周期，所以 5 秒后回调里**必须 `IsValid` + 组件存在性检查**。
+
+---
+
+### 19.8.7 实战 6：死亡时永久扣 mod 货币——监听 ms_becameghost
+
+**目标**：做一个"死亡惩罚"系统——玩家死亡后，永久扣除 50 点 mod 自定义货币（如果不够则归零）。
+
+#### 核心原理回顾
+
+19.7.8 讲过两个事件的精确触发时机：
+
+| 事件 | 推送时机 | 状态 |
+|------|---------|------|
+| `"death"` | `Health:SetVal` 内血量降到 0 | inst 还是活的，组件全在 |
+| `"ms_becameghost"` | `OnMakePlayerGhost` 末尾 | inst 已变成幽灵，部分组件已被 CommonPlayerDeath 移除 |
+| `"playerdied"` | `OnPlayerDied`（ghost_enabled=false 时）| 玩家即将 fadeout 然后被删 |
+| `"ms_respawnedfromghost"` | `DoActualRez` 末尾 | 玩家已经复活、playerghost tag 已 RemoveTag |
+
+**选哪个？**
+
+- 如果是"幽灵期间也要扣"——用 `"ms_becameghost"`（保证只在变幽灵时扣一次）
+- 如果是"无论变幽灵还是直接消失都要扣"——用 `"death"`（更通用）
+- 如果只想在"真正复活时扣"——用 `"ms_respawnedfromghost"`（玩家可能死了再也不上线，这种情况不扣）
+
+下面用 `"death"` 实现，这是最通用的选择。
+
+#### 完整 modmain.lua 示例
+
+```lua
+PrefabFiles = {}
+Assets = {}
+
+local PENALTY_AMOUNT = 50
+
+local function OnDeath(inst, data)
+    -- data.cause: 死因（字符串，如 "spider" 或 "starve"）
+    -- data.afflicter: 凶手实体（可能是 nil）
+    -- data.corpsing: bool，如果走 corpse 模式则为 true
+
+    if inst.my_mod_currency == nil then
+        inst.my_mod_currency = 0
+    end
+
+    inst.my_mod_currency = math.max(0, inst.my_mod_currency - PENALTY_AMOUNT)
+
+    -- 即时显示提示
+    if inst.components.talker then
+        inst.components.talker:Say("我失去了 "..PENALTY_AMOUNT.." 灵魂币……")
+    end
+end
+
+local function OnSaveCurrency(inst, data)
+    data.my_mod_currency = inst.my_mod_currency or 0
+end
+
+local function OnLoadCurrency(inst, data)
+    if data ~= nil and data.my_mod_currency ~= nil then
+        inst.my_mod_currency = data.my_mod_currency
+    else
+        inst.my_mod_currency = 100  -- 初始值
+    end
+end
+
+local function OnPlayerJoined(world, player)
+    player:ListenForEvent("death", OnDeath)
+    -- 也可以监听 ms_becameghost 实现"变幽灵才扣"的语义
+    -- player:ListenForEvent("ms_becameghost", OnDeath)
+end
+
+AddPrefabPostInit("world", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then
+        return
+    end
+    inst:ListenForEvent("ms_playerjoined", OnPlayerJoined)
+end)
+
+-- 给玩家 prefab 注入存档/读档逻辑
+AddPlayerPostInit(function(inst)
+    if not GLOBAL.TheWorld.ismastersim then
+        return
+    end
+    -- 用 AddComponentPostInit 或直接挂 OnSave / OnLoad 钩子
+    local oldOnSave = inst.OnSave
+    inst.OnSave = function(self, data)
+        if oldOnSave then oldOnSave(self, data) end
+        OnSaveCurrency(self, data)
+    end
+    local oldOnLoad = inst.OnLoad
+    inst.OnLoad = function(self, data)
+        if oldOnLoad then oldOnLoad(self, data) end
+        OnLoadCurrency(self, data)
+    end
+end)
+```
+
+#### "data" 字段说明（`death` 事件）
+
+从 19.1.5 我们知道，`death` 事件的 data 是这样推送的：
+
+```scripts/components/health.lua
+self.inst:PushEvent("death", { cause = cause, afflicter = afflicter, corpsing = corpsing })
+```
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `cause` | string | 死因字符串，比如 `"spider"`、`"hunger"`、`"redamulet"`（最近一次伤害的 cause 参数）|
+| `afflicter` | Entity \| nil | 最后一击的攻击者（可能是 nil，比如饥饿死亡）|
+| `corpsing` | bool | 是否走 corpse 模式——通常用 `revivable_corpse` 游戏模式时为 true |
+
+**`cause` 字段可以用于差异化惩罚**：
+
+```lua
+local function OnDeath(inst, data)
+    local cause = data and data.cause or "unknown"
+
+    local penalty = 50
+    if cause == "drowning" then
+        penalty = 100   -- 淹死惩罚加倍
+    elseif cause == "hunger" then
+        penalty = 30    -- 饿死惩罚减少
+    elseif cause == "boss_kill" then
+        penalty = 0     -- 自定义 cause："被 boss 杀死不算"
+    end
+
+    inst.my_mod_currency = math.max(0, (inst.my_mod_currency or 0) - penalty)
+end
+```
+
+#### 注意点：玩家网络变量同步
+
+如果 `my_mod_currency` 需要在客户端 UI 显示，**不能直接挂在 `inst.my_mod_currency`** 上——这只在服务端有效。需要用 `net_int`：
+
+```lua
+-- 在 PrefabPostInit 或者一个 PlayerPostInit 里
+local function OnCurrencyDirty(inst)
+    -- 客户端：从网络变量读取并更新 UI
+    inst:PushEvent("my_currency_changed", { value = inst._my_mod_currency:value() })
+end
+
+AddPlayerPostInit(function(inst)
+    inst._my_mod_currency = net_int(inst.GUID, "my_mod_currency", "my_currency_dirty")
+    inst:ListenForEvent("my_currency_dirty", OnCurrencyDirty)
+    
+    if GLOBAL.TheWorld.ismastersim then
+        -- 服务端：监听字段变化，自动同步网络变量
+        inst._my_mod_currency:set(0)
+    end
+end)
+```
+
+然后服务端的 OnDeath 改成：
+
+```lua
+local function OnDeath(inst, data)
+    if inst._my_mod_currency == nil then return end
+    local current = inst._my_mod_currency:value()
+    local new_value = math.max(0, current - PENALTY_AMOUNT)
+    inst._my_mod_currency:set(new_value)  -- 自动 dirty，客户端会收到事件
+end
+```
+
+详细的网络变量用法见 19.8.10（实战 9）。
+
+#### 三种身份核心提示
+
+> **新手**：用 `inst:ListenForEvent("death", fn)` 监听玩家死亡——data 字段含 `cause`、`afflicter`、`corpsing`。在回调里改 inst 上的自定义字段，OnSave / OnLoad 负责持久化。
+> 
+> **进阶**：选事件要看语义——`death` 是"血量归零的瞬间"（最通用，含变幽灵和直接消失两种情况），`ms_becameghost` 是"成功变幽灵后"（不含 ghost_enabled=false 的情况）；用 `data.cause` 字段可以差异化处理不同死因。
+> 
+> **老手**：mod 状态字段如果要客户端可见（UI 显示等），必须用 `net_int / net_string / net_uint / net_byte / net_bool` 网络变量同步——直接 `inst.my_field` 只在服务端可见。OnSave/OnLoad 需要钩在 inst 的 OnSave/OnLoad 上（包装旧函数），或者把字段交给一个组件管理（更工程化）。
+
+---
+
+### 19.8.8 实战 7：自定义骨架 prefab——替换 mod 角色的死亡遗体
+
+**目标**：给一个 mod 角色配置专属骨架——死亡后掉的不是普通的 `skeleton_player`，而是 mod 自定义的 `myhero_skeleton`，可以有不同的外观、特殊掉落或彩蛋。
+
+#### 核心原理回顾
+
+19.1.3 讲过，`OnMakePlayerGhost` 里两个条件都满足才会生成骨架：
+
+```104:145:scripts/prefabs/player_common_extensions.lua
+local function SpawnDeathProduct(inst)
+    -- ...
+    if can_corpse then
+        local corpse = SpawnPrefab("playercorpse")
+        -- ...
+        return DEATH_PRODUCTS.CORPSE
+    else
+        local has_skeletons = TheSim:HasPlayerSkeletons()
+        local skel = SpawnPrefab(has_skeletons and inst.skeleton_prefab or "shallow_grave_player")
+```
+
+关键字段是 **`inst.skeleton_prefab`**——`player_common.lua:2910` 默认设为 `"skeleton_player"`：
+
+```2910:2910:scripts/prefabs/player_common.lua
+		inst.skeleton_prefab = "skeleton_player"
+```
+
+如果 mod 角色想要专属骨架，**在 `master_postinit` 里把 `inst.skeleton_prefab` 重新赋值**即可：
+
+```scripts/prefabs/wanda.lua:434
+inst.skeleton_prefab = nil
+```
+
+例如 Wanda 设为 `nil`——意味着 Wanda 死后不留骨架（因为她有 `wanda_diary` 机制）。
+
+#### 完整实战代码
+
+**步骤 1：定义 mod 角色的 `skeleton_prefab`**
+
+`scripts/prefabs/myhero.lua`（角色 prefab）：
+
+```lua
+local MakePlayerCharacter = require "prefabs/player_common"
+
+local prefabs = { "myhero_skeleton" }  -- 注册依赖关系，让游戏知道有这个prefab
+
+local function master_postinit(inst)
+    inst.skeleton_prefab = "myhero_skeleton"  -- 关键：替换骨架 prefab
+
+    -- 其他角色逻辑（属性、皮肤等）
+    inst.components.health:SetMaxHealth(150)
+    -- ...
+end
+
+return MakePlayerCharacter("myhero",
+    prefabs,                   -- prefabs
+    {},                        -- assets
+    common_postinit,           -- 客户端初始化（可省略）
+    master_postinit)           -- 服务端初始化
+```
+
+**步骤 2：实现自定义骨架 prefab**
+
+`scripts/prefabs/myhero_skeleton.lua`：
+
+```lua
+local assets =
+{
+    Asset("ANIM", "anim/skeletons.zip"),
+}
+
+local prefabs =
+{
+    "boneshard",
+    "redgem",          -- 自定义掉落：红宝石
+    "collapse_small",
+}
+
+-- 复用普通骨架的掉落表格式
+SetSharedLootTable('myhero_skeleton',
+{
+    { 'boneshard', 1.00 },
+    { 'boneshard', 1.00 },
+    { 'redgem',    0.30 },  -- 30% 概率掉红宝石（"心碎了"的彩蛋）
+})
+
+local function Player_SetSkeletonDescription(inst, char, playername, cause, pkname, userid)
+    inst.char = char
+    inst.playername = playername
+    inst.userid = userid
+    inst.pkname = pkname
+    inst.cause = pkname == nil and cause:lower() or nil
+    inst.components.inspectable.getspecialdescription = GetPlayerDeathDescription
+end
+
+local function OnHammered(inst)
+    inst.components.lootdropper:DropLoot()
+    local fx = SpawnPrefab("collapse_small")
+    fx.Transform:SetPosition(inst.Transform:GetWorldPosition())
+    fx:SetMaterial("rock")
+    inst:Remove()
+end
+
+local function Player_OnSave(inst, data)
+    data.char = inst.char
+    data.playername = inst.playername
+    data.userid = inst.userid
+    data.pkname = inst.pkname
+    data.cause = inst.cause
+end
+
+local function Player_OnLoad(inst, data)
+    if not data or not data.char then
+        return
+    end
+    Player_SetSkeletonDescription(inst, data.char, data.playername, data.cause, data.pkname, data.userid)
+end
+
+local function fn()
+    local inst = CreateEntity()
+
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddSoundEmitter()
+    inst.entity:AddNetwork()
+
+    MakeObstaclePhysics(inst, .25)
+
+    inst:AddTag("skeleton")
+    inst:AddTag("playerskeleton")  -- 关键：让幽灵能交互
+    inst:AddTag("scarytoprey")      -- 兔子等怕骷髅
+    inst:AddTag("structure")
+
+    inst.AnimState:SetBank("skeletons")
+    inst.AnimState:SetBuild("skeletons")
+    inst.AnimState:PlayAnimation("player1")
+
+    -- 自定义颜色让它显眼一点
+    inst.AnimState:SetMultColour(1, 0.7, 0.7, 1)
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddComponent("inspectable")
+
+    inst:AddComponent("lootdropper")
+    inst.components.lootdropper:SetChanceLootTable('myhero_skeleton')
+
+    inst:AddComponent("workable")
+    inst.components.workable:SetWorkAction(ACTIONS.HAMMER)
+    inst.components.workable:SetWorkLeft(3)
+    inst.components.workable:SetOnFinishCallback(OnHammered)
+
+    -- 幽灵可以骚扰骨架（标准玩家骨架行为）
+    MakeHauntable(inst, 6, TUNING.HAUNT_COOLDOWN_TINY)
+
+    -- 提供"设置死亡描述"的方法供 player_common_extensions 调用
+    inst.SetSkeletonDescription = Player_SetSkeletonDescription
+
+    -- 提供"设置头像数据"的方法（可选）
+    inst:AddComponent("playeravatardata")
+    inst.SetSkeletonAvatarData = function(inst, client_obj)
+        inst.components.playeravatardata:SetData(client_obj)
+    end
+
+    inst.OnSave = Player_OnSave
+    inst.OnLoad = Player_OnLoad
+
+    return inst
+end
+
+return Prefab("myhero_skeleton", fn, assets, prefabs)
+```
+
+**步骤 3：在 modmain.lua 注册**
+
+```lua
+PrefabFiles = {
+    "myhero",
+    "myhero_skeleton",
+}
+```
+
+#### 验证：SpawnDeathProduct 如何使用这个 prefab？
+
+回到 `player_common_extensions.lua`：
+
+```135:144:scripts/prefabs/player_common_extensions.lua
+    else
+        local has_skeletons = TheSim:HasPlayerSkeletons()
+        local skel = SpawnPrefab(has_skeletons and inst.skeleton_prefab or "shallow_grave_player")
+        if skel ~= nil then
+            skel.Transform:SetPosition(x, y, z)
+            -- Set the description
+            skel:SetSkeletonDescription(inst.prefab, inst:GetDisplayName(), inst.deathcause, inst.deathpkname, inst.userid)
+            skel:SetSkeletonAvatarData(inst.deathclientobj)
+        end
+        return has_skeletons and DEATH_PRODUCTS.SKELETON or DEATH_PRODUCTS.SHALLOW_GRAVE
+    end
+```
+
+游戏会**直接调用** `skel:SetSkeletonDescription(...)` 和 `skel:SetSkeletonAvatarData(...)`——注意源码**没有任何 nil 检查**！如果你的自定义骨架 prefab 没实现这两个方法，游戏会直接抛出 `attempt to call method 'SetSkeletonDescription' (a nil value)`。
+
+这就是为什么前面的实战代码里**必须**写：
+
+```lua
+inst.SetSkeletonDescription = Player_SetSkeletonDescription
+inst.SetSkeletonAvatarData = function(inst, client_obj)
+    inst.components.playeravatardata:SetData(client_obj)
+end
+```
+
+#### 进阶：自定义骨架的额外效果
+
+如果你想让骨架有更多 mod 特性——比如"骚扰它发光 5 秒"或"死亡 7 天后自动消散"——可以在 fn() 里加更多组件：
+
+```lua
+-- 让骨架在 7 天（默认游戏内 7 天 = 7 * TUNING.TOTAL_DAY_TIME 秒）后自动消失
+inst:DoTaskInTime(7 * TUNING.TOTAL_DAY_TIME, function(inst)
+    if inst:IsValid() then
+        local x, y, z = inst.Transform:GetWorldPosition()
+        SpawnPrefab("ash").Transform:SetPosition(x, y, z)
+        SpawnPrefab("collapse_small").Transform:SetPosition(x, y, z)
+        inst:Remove()
+    end
+end)
+```
+
+参考 `scripts/prefabs/skeleton.lua` 的 `Player_Decay` 实现。
+
+#### 关键 tag 总结
+
+| tag | 作用 | 必须 |
+|-----|------|------|
+| `"skeleton"` | 标记为骨架类型 | 强烈推荐 |
+| `"playerskeleton"` | 玩家骨架——某些 mod 和 AI 会区分 | 强烈推荐 |
+| `"scarytoprey"` | 让兔子、海狸等怕它逃跑 | 看 mod 需要 |
+| `"structure"` | 标记为建筑类（不被推动、可铺路）| 看 mod 需要 |
+| `"haunted"` | 由 hauntable 组件自动管理 | 不要手动加 |
+
+#### 三种身份核心提示
+
+> **新手**：替换 mod 角色的骨架只需 1 行：`inst.skeleton_prefab = "myhero_skeleton"`（在 `master_postinit` 里）。然后实现这个 prefab。
+> 
+> **进阶**：自定义骨架 prefab 必须实现 `SetSkeletonDescription(inst, char, playername, cause, pkname, userid)` 和 `SetSkeletonAvatarData(inst, client_obj)` 两个方法——游戏会主动调用它们。
+> 
+> **老手**：设 `inst.skeleton_prefab = nil` 表示"死亡不留骨架"（Wanda 的设计）；移动端没有玩家骨架（`TheSim:HasPlayerSkeletons() == false`），此时 fallback 到 `"shallow_grave_player"`——如果想让移动端也用自定义浅坑，需要再做一个 `myhero_shallow_grave` prefab 并替换 fallback（但 fallback 在 vanilla 是硬编码的，要 mod 进 player_common_extensions 较复杂，不推荐）。
+
+---
+
+### 19.8.9 实战 8：监听 `respawnfromghost` 给玩家加自定义后处理
+
+**目标**：在玩家用自定义复活道具复活后，**抢在 `DoActualRez` 之前/之后**做一些特殊事情——比如**给玩家挂一个 mod buff、改变复活位置、强制切换角色形态**。
+
+#### 为什么不能直接用 `AddClassPostConstruct`？
+
+19.8.6 已经讲了 `ms_respawnedfromghost` 监听——但它在 `DoActualRez` 末尾才触发，**复活动画已经结束、所有组件已经恢复**——晚了。
+
+`DoActualRez` 本身是 `player_common_extensions.lua` 里的 **local function**：
+
+```327:431:scripts/prefabs/player_common_extensions.lua
+local function DoActualRez(inst, source, item)
+    -- ...
+```
+
+`local function` **不能被 `AddClassPostConstruct` 修改**——它是模块作用域的私有函数，外部完全访问不到。
+
+如果你硬要"插队"到 DoActualRez 中间，**只能监听 `respawnfromghost` 事件本身**：
+
+```569:594:scripts/prefabs/player_common_extensions.lua
+local function OnRespawnFromGhost(inst, data) -- from ListenForEvent "respawnfromghost"
+    if not inst:HasTag("playerghost") then
+        return
+    end
+
+	inst:AddTag("reviving")
+
+    inst.deathclientobj = nil
+    inst.deathcause = nil
+    inst.deathpkname = nil
+    inst.deathbypet = nil
+    inst:ShowHUD(false)
+    -- ...
+    if data == nil or data.source == nil then
+        inst:DoTaskInTime(0, DoActualRez)
+    elseif inst.sg.currentstate.name == "remoteresurrect" then
+        inst:DoTaskInTime(0, DoMoveToRezSource, data.source, 24 * FRAMES)
+    elseif data.source:HasTag("reviver") then
+        inst:DoTaskInTime(0, DoActualRez, nil, data.source)
+```
+
+`OnRespawnFromGhost` 在 `player_common.lua` 里通过 `inst:ListenForEvent("respawnfromghost", OnRespawnFromGhost)` 挂上。注意 `DoTaskInTime(0, DoActualRez)` ——延后到下一帧执行，给了 mod **同一帧"早一步处理"**的窗口。
+
+#### 实战方案：在 `respawnfromghost` 监听里抢先做事
+
+```lua
+-- modmain.lua
+
+local function OnRespawnFromGhostPre(inst, data)
+    -- 因为 vanilla 是 inst:DoTaskInTime(0, DoActualRez)
+    -- mod 的监听器和 vanilla 的监听器都立即执行
+    -- vanilla 的 DoActualRez 被延迟到下一帧
+    -- 因此 mod 可以在同一帧抢先改变 data 或者添加效果
+
+    if data == nil or data.source == nil then
+        return
+    end
+
+    -- 例 1：自定义 prefab 的复活道具——给玩家保留 50% 饥饿（默认是 66.7%）
+    if data.source.prefab == "myreviver" then
+        inst._mod_post_resurrect_hunger = 0.5
+    end
+
+    -- 例 2：在自定义条件下，让玩家在固定坐标复活（无视 source 位置）
+    if data.source:HasTag("homebound_reviver") and inst._mod_home_position ~= nil then
+        -- 直接传送（DoActualRez 内的 Physics:Teleport 会在下一帧覆盖这个位置——参见 line 354）
+        -- 所以这里改 source 的位置或者改 data.source 引用
+        -- 更可靠的办法：把 source 替换为一个临时 prefab，位于 home 位置
+    end
+end
+
+local function OnRespawnedFromGhost(inst, data)
+    -- 这是 ms_respawnedfromghost 事件——DoActualRez 末尾推送
+    -- 此时 inst 已经复活、所有组件恢复
+    if inst._mod_post_resurrect_hunger ~= nil and inst.components.hunger ~= nil then
+        inst.components.hunger:SetPercent(inst._mod_post_resurrect_hunger)
+        inst._mod_post_resurrect_hunger = nil
+    end
+end
+
+local function OnPlayerJoined(world, player)
+    player:ListenForEvent("respawnfromghost", OnRespawnFromGhostPre)
+    player:ListenForEvent("ms_respawnedfromghost", OnRespawnedFromGhost)
+end
+
+AddPrefabPostInit("world", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then
+        return
+    end
+    inst:ListenForEvent("ms_playerjoined", OnPlayerJoined)
+end)
+```
+
+#### 监听器的执行顺序——为什么 mod 监听能"先"于 DoActualRez？
+
+`ListenForEvent` 注册的所有回调，**在事件推送时按注册顺序执行**——但都在**同一帧**完成。
+
+vanilla 的 `OnRespawnFromGhost` 在 `player_common.lua` 里通过 `inst:ListenForEvent("respawnfromghost", OnRespawnFromGhost)` 注册——注册时机是**玩家 prefab 构造时**。
+
+mod 的监听器在 `ms_playerjoined` 时注册——**晚于** vanilla。
+
+按 ListenForEvent 顺序，**vanilla 的回调先执行**——但是它内部用 `DoTaskInTime(0, DoActualRez)` **延迟一帧**——所以 mod 监听器实际上**在同一帧执行**完，然后**下一帧** DoActualRez 才执行。
+
+这给 mod 一个抢跑窗口：
+
+```
+帧 N：
+  respawnfromghost 事件推送
+    ├─ vanilla OnRespawnFromGhost 执行（设 inst.rezsource、DoTaskInTime(0, DoActualRez)）
+    └─ mod 监听器执行（设 inst._mod_post_resurrect_hunger = 0.5）
+
+帧 N+1：
+  DoActualRez 执行（CommonActualRez 把 hunger 设为 66.7%）
+  事件 ms_respawnedfromghost 推送
+    ├─ vanilla 监听器（如有）
+    └─ mod 监听器 OnRespawnedFromGhost
+         └─ 把 hunger 改回 50%（盖掉 CommonActualRez 的 66.7%）
+```
+
+#### 复活源限定：判断 source 类型
+
+回顾下 OnRespawnFromGhost 里对 source 的判断：
+
+```607:614:scripts/prefabs/player_common_extensions.lua
+    elseif data.source.prefab == "amulet"
+        or data.source.prefab == "resurrectionstone"
+        or data.source.prefab == "resurrectionstatue"
+        or data.source:HasTag("multiplayer_portal") then
+        inst:DoTaskInTime(9 * FRAMES, DoMoveToRezSource, data.source, --[[60-9]] 51 * FRAMES)
+    else
+        --unsupported rez source...
+        inst:DoTaskInTime(0, DoActualRez)
+    end
+```
+
+vanilla 的"已知 source"判断完全靠 **`prefab == "xxx"`** 或 **`HasTag("xxx")`**。
+
+**自定义 mod prefab 不会出现在这个列表里**——所以会走 `unsupported rez source` 分支，无动画瞬间复活。
+
+如果你想让自定义 prefab 也有"幽灵移动到 source 位置 + 等 51 帧再复活"的过渡，**最简单的方法**是让你的 prefab 加上 `"multiplayer_portal"` tag（隐含 25% 血量惩罚，已在 19.8.3 讨论）；**完美的方法**是用监听器拦截：
+
+```lua
+local function OnRespawnFromGhostPre(inst, data)
+    if data and data.source and data.source.prefab == "myreviver_building" then
+        -- 模拟传送门的 9-frame 延迟 + 51-frame 移动
+        -- 但要避免真正进入 DoActualRez 的 multiplayer_portal 分支（不想要 DeltaPenalty）
+        -- ……非常麻烦，需要 Hook
+    end
+end
+```
+
+不幸的是，因为 `DoActualRez` 是 local function，**不存在干净的拦截办法**。三种"够用"的折中：
+
+1. **接受 vanilla 的 unsupported 分支**——玩家瞬间复活无动画，但代码简单可控
+2. **加 `"multiplayer_portal"` tag**——有动画但有血量惩罚，再用 mod 监听 `ms_respawnedfromghost` 调 `health:DeltaPenalty(-0.25)` **抵消**
+3. **mod 内重新实现 DoActualRez**——监听到 `respawnfromghost` 后，**自己接管**整个复活流程（不靠 vanilla）
+
+#### 方案 2 的"抵消传送门惩罚"实现
+
+```lua
+local function OnRespawnedFromGhost(inst, data)
+    -- 如果上一次复活源是我们的自定义建筑（mod 自己记录），抵消传送门惩罚
+    if inst._mod_no_penalty_pending then
+        if inst.components.health and inst.components.health.penalty > 0 then
+            inst.components.health:DeltaPenalty(-TUNING.PORTAL_HEALTH_PENALTY)
+        end
+        inst._mod_no_penalty_pending = nil
+    end
+end
+
+local function OnRespawnFromGhostPre(inst, data)
+    if data and data.source and data.source.prefab == "myreviver_building" then
+        -- prefab 添加 "multiplayer_portal" tag——见你的 myreviver_building.lua
+        inst._mod_no_penalty_pending = true
+    end
+end
+```
+
+然后在 `myreviver_building.lua` 里加：
+
+```lua
+inst:AddTag("multiplayer_portal")
+```
+
+这样玩家会走 vanilla 的传送门动画分支（`portal_rez` 状态），但 mod 监听器抵消掉 25% 惩罚——视觉上美观、玩法上无副作用。
+
+#### 三种身份核心提示
+
+> **新手**：`respawnfromghost` 事件可以监听——它在 vanilla `OnRespawnFromGhost` 之前/同时触发；mod 监听器抢在 `DoActualRez` 之前修改 inst 字段，再在 `ms_respawnedfromghost` 监听里"补打"逻辑。
+> 
+> **进阶**：vanilla 的 `OnRespawnFromGhost` 用 `DoTaskInTime(0, DoActualRez)` 延迟一帧——这给了 mod 监听器同一帧抢跑的窗口。利用这个窗口设置 mod 字段，DoActualRez 跑完后用 `ms_respawnedfromghost` 监听器读取这些字段做最终修正。
+> 
+> **老手**：`DoActualRez` 是 local function 无法 hook；想让自定义 prefab 有复活动画的最简洁姿势是加 `"multiplayer_portal"` tag（走 portal_rez 动画）+ mod 监听器抵消血量惩罚。`prefab == "xxx"` 和 `HasTag("xxx")` 是 vanilla 唯二判断复活源类型的方式，没有官方扩展点。
+
+---
+
+### 19.8.10 实战 9：客户端网络同步——让复活道具的 UI 表现一致
+
+**目标**：让自定义复活道具的耐久/状态在**客户端 UI** 上能正确显示——通过 `net_*` 网络变量同步。
+
+#### 为什么需要网络同步？
+
+19.8.1 已经讲过服务端/客户端代码分离。一个常见误区是：**`inst:AddComponent("finiteuses")` 是服务端的**——所以客户端访问 `inst.components.finiteuses` 是 `nil`。
+
+但是 `finiteuses` 是**特殊的**：它通过 `inventoryitem_classified` 中的网络变量 `percentused` 同步耐久百分比到客户端：
+
+```163:165:scripts/prefabs/inventoryitem_classified.lua
+    inst.percentused = net_byte(inst.GUID, "inventoryitem.percentused", "percentuseddirty")
+    inst.recharge = net_byte(inst.GUID, "inventoryitem.recharge", "rechargedirty")
+```
+
+`net_byte`：占 1 字节，值范围 0~255，自动同步到所有客户端，**变化时推送 `percentuseddirty` 事件**。
+
+#### 实战目标：自定义"灵魂能量"状态显示
+
+我们希望做一个**复活之刃**——它有一个 mod 独有的"灵魂能量"字段（0~100），需要在客户端 UI 上显示。
+
+**步骤 1：定义网络变量（prefab 内）**
+
+```lua
+local function OnSoulEnergyDirty(inst)
+    -- 客户端：从网络变量读取并触发自定义事件
+    inst:PushEvent("soulenergy_changed", { value = inst._soulenergy:value() })
+end
+
+local function fn()
+    local inst = CreateEntity()
+    inst.entity:AddTransform()
+    inst.entity:AddAnimState()
+    inst.entity:AddNetwork()
+
+    MakeInventoryPhysics(inst)
+    inst.AnimState:SetBank("nightsword")
+    inst.AnimState:SetBuild("nightsword")
+    inst.AnimState:PlayAnimation("idle")
+
+    -- 关键：网络变量必须在 SetPristine 之前定义
+    inst._soulenergy = net_byte(inst.GUID, "myrevivalsword.soulenergy", "soulenergydirty")
+    inst._soulenergy:set(100)  -- 默认满能量
+
+    inst:ListenForEvent("soulenergydirty", OnSoulEnergyDirty)
+
+    inst.entity:SetPristine()
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    -- 服务端逻辑
+    inst:AddComponent("inventoryitem")
+    inst:AddComponent("inspectable")
+
+    -- 模拟服务端不断消耗
+    inst:DoPeriodicTask(1, function(inst)
+        local cur = inst._soulenergy:value()
+        if cur > 0 then
+            inst._soulenergy:set(cur - 1)  -- 自动 dirty，客户端收到事件
+        end
+    end)
+
+    return inst
+end
+
+return Prefab("myrevivalsword", fn, assets)
+```
+
+#### 网络变量的几个关键规则
+
+```lua
+inst._soulenergy = net_byte(inst.GUID, "myrevivalsword.soulenergy", "soulenergydirty")
+```
+
+| 参数 | 含义 |
+|------|------|
+| `inst.GUID` | 实体的唯一 ID，让网络变量绑定到这个实体 |
+| `"myrevivalsword.soulenergy"` | 字段名（必须**全局唯一**——所有 prefab 不能重名）|
+| `"soulenergydirty"` | 当服务端调用 `set` 改变值时，**客户端**收到的事件名 |
+
+**网络变量类型对照**：
+
+| 类型 | 范围 | 字节数 |
+|------|------|--------|
+| `net_bool` | true / false | < 1 字节 |
+| `net_byte` | 0~255 | 1 字节 |
+| `net_tinybyte` | 0~7 | 3 bit |
+| `net_smallbyte` | 0~63 | 6 bit |
+| `net_shortint` | -32768~32767 | 2 字节 |
+| `net_ushortint` | 0~65535 | 2 字节 |
+| `net_int` | int32 范围 | 4 字节 |
+| `net_uint` | uint32 范围 | 4 字节 |
+| `net_float` | float32 | 4 字节 |
+| `net_string` | 字符串（注意有最大长度）| 变长 |
+| `net_hash` | 字符串 hash（更省带宽）| 4 字节 |
+| `net_entity` | 引用另一个实体 | 4 字节（GUID）|
+
+> **优化提示**：能用 `net_byte` 别用 `net_int`——带宽差 4 倍；能用 `net_hash` 别用 `net_string`——字符串同步开销大。
+
+#### 客户端读取方式
+
+```lua
+-- 客户端任意时机：
+local energy = inst._soulenergy:value()  -- 返回当前同步过来的值
+
+-- 监听变化（在 ListenForEvent 中订阅 dirty 事件）：
+inst:ListenForEvent("soulenergydirty", function(inst)
+    local new_energy = inst._soulenergy:value()
+    print("能量变了：", new_energy)
+end)
+```
+
+#### UI 显示——基于网络变量驱动
+
+对于 inventoryitem 上的 mod 数值显示，一个常见做法是**用 `inst.components.inventoryitem.getstatusoverride`**（在客户端的 inventoryitem_replica 上）或者**自定义 widget**。
+
+简单方案：用 `inst.components.inspectable.getspecialdescription`：
+
+```lua
+-- 服务端 fn 里：
+inst.components.inspectable.getspecialdescription = function(inst, viewer)
+    return "灵魂能量: "..tostring(inst._soulenergy:value()).."/100"
+end
+```
+
+这样玩家"检查"道具时会显示当前能量。
+
+#### 用 `replica` 同步复杂数据
+
+如果要同步**结构化数据**（如一个表 `{ users_revived = {…}, last_used_time = … }`），不能用网络变量——需要用 **`replica` 系统**或者把数据序列化为 string。
+
+最简单的方式：
+
+```lua
+-- 序列化字典为字符串
+local data_str = string.format("%d|%d", users_revived_count, last_used_time)
+inst._mod_data:set(data_str)
+```
+
+注意 `net_string` 有长度限制（具体值随版本不同，一般是 200 字符以内）。
+
+#### 三种身份核心提示
+
+> **新手**：要让 mod 字段在客户端可见，用 `net_byte/net_int/net_string` 网络变量；网络变量必须在 `SetPristine()` **之前**定义，否则客户端拿不到初始值。
+> 
+> **进阶**：网络变量字段名（第 2 个参数）必须**全局唯一**——所有 prefab 不能重名，否则 dirty 事件会串。建议加 prefab 前缀避免冲突，如 `"myrevivalsword.soulenergy"`。
+> 
+> **老手**：能用 `net_byte` 不要用 `net_int`——带宽差 4 倍；能用 `net_hash` 不要用 `net_string`——字符串同步开销大；变化频繁的字段考虑用 `replica` 代理对象（如 `inventoryitem_classified`）做缓存而不是每个变化都同步；做"结构化数据"的同步，要么序列化为字符串，要么用多个网络变量分散同步。
+
+---
+
+### 19.8.11 老手：五个最常见的实战陷阱
+
+#### 坑 1：忘记 `inst:AddTag("reviver")` 必须在 `SetPristine()` 之前
+
+```lua
+-- 错误示范
+local function fn()
+    local inst = CreateEntity()
+    -- ... transform / animstate / network ...
+    inst.entity:SetPristine()
+
+    if not TheWorld.ismastersim then
+        return inst
+    end
+
+    inst:AddTag("reviver")  -- ❌ 这一行只在服务端生效
+end
+```
+
+**症状**：服务端能 `inst:HasTag("reviver")` 检查到，但客户端 `HasTag` 返回 false——结果**幽灵看不到"使用此道具"的右键菜单**（因为客户端 componentactions 校验失败）。
+
+**修复**：
+
+```lua
+inst:AddTag("reviver")    -- ✅ 在 SetPristine 之前
+inst.entity:SetPristine()
+if not TheWorld.ismastersim then
+    return inst
+end
+```
+
+> **规则**：**所有需要客户端能 HasTag 到的 tag** 都必须在 `SetPristine()` 之前添加；只在服务端逻辑里检查的 tag 可以放后面（但通常没必要）。
+
+#### 坑 2：`SetOnHauntFn` 没有返回 true，导致 HAUNT_INSTANT_REZ 不生效
+
+```lua
+-- 错误示范
+inst:AddComponent("hauntable")
+inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)
+inst.components.hauntable:SetOnHauntFn(function(inst, haunter)
+    inst.SoundEmitter:PlaySound("dontstarve/common/touchstone_activate")
+    -- ❌ 忘了 return true
+end)
+```
+
+**症状**：幽灵骚扰道具，能听到音效，但**玩家没有复活**——hauntvalue 检查整段被跳过。
+
+**修复**：
+
+```lua
+inst.components.hauntable:SetOnHauntFn(function(inst, haunter)
+    inst.SoundEmitter:PlaySound("dontstarve/common/touchstone_activate")
+    return true   -- ✅ 必须显式返回 true
+end)
+```
+
+回顾 `Hauntable:DoHaunt`：
+
+```scripts/components/hauntable.lua
+self.haunted = self.onhaunt(self.inst, doer)
+if self.haunted then
+    if doer ~= nil then
+        if self.hauntvalue == TUNING.HAUNT_INSTANT_REZ and doer:HasTag("playerghost") then
+            doer:PushEvent("respawnfromghost", { source = self.inst })
+        end
+```
+
+`self.haunted` 是 onhaunt 的返回值——为 false 时整段被跳过。
+
+> **规则**：自定义 `SetOnHauntFn` 回调**必须显式 `return true`**——Lua 函数无 return 等价于 `return nil`，等价于 false。
+
+#### 坑 3：直接给 `hauntvalue` 字段赋值，导致 `no_wipe_value` 没有被设置
+
+```lua
+-- 错误示范
+inst:AddComponent("hauntable")
+inst.components.hauntable.hauntvalue = TUNING.HAUNT_INSTANT_REZ  -- ❌
+```
+
+**症状**：第一次骚扰复活成功，第二次骚扰**hauntvalue 已经被清空**，无法复活。
+
+**原因**：直接赋值不会设置 `no_wipe_value = true`。`Hauntable:DoHaunt` 在成功 onhaunt 之后：
+
+```scripts/components/hauntable.lua
+if not self.no_wipe_value then
+    self.hauntvalue = nil
+end
+```
+
+如果 `no_wipe_value = false`（默认），hauntvalue 会被一次性清空。
+
+**修复**：
+
+```lua
+inst.components.hauntable:SetHauntValue(TUNING.HAUNT_INSTANT_REZ)  -- ✅ 调用 setter
+```
+
+回顾 `SetHauntValue`：
+
+```46:50:scripts/components/hauntable.lua
+function Hauntable:SetHauntValue(val)
+    if not val then return end
+    self.hauntvalue = val
+    self.no_wipe_value = true
+end
+```
+
+**只有走 setter 才会自动设置 `no_wipe_value`**。直接给字段赋值漏掉了这一关键步骤。
+
+> **规则**：**永远用 setter API**——`SetHauntValue`、`SetOnHauntFn`、`SetOnUnHauntFn`。直接字段赋值会跳过组件的封装逻辑。
+
+#### 坑 4：`attunable` 系统的 `LinkToPlayer` 在 master_postinit 里调用，玩家还没加载完
+
+```lua
+-- 错误示范（modmain.lua）
+AddPrefabPostInit("myshrine", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then return end
+    -- 想让某个固定 player_id 自动绑定
+    local player = GLOBAL.LookupPlayerInstByUserID("KU_xxx")
+    if player and inst.components.attunable then
+        inst.components.attunable:LinkToPlayer(player)  -- ❌ 可能 player 是 nil
+    end
+end)
+```
+
+**症状**：服务器启动时，建筑 prefab post init 时玩家还没加入，`LookupPlayerInstByUserID` 返回 nil，绑定失败。
+
+**修复**：在 `ms_playerjoined` 事件里再尝试：
+
+```lua
+-- ✅ 正确做法
+AddPrefabPostInit("myshrine", function(inst)
+    if not GLOBAL.TheWorld.ismastersim then return end
+
+    local function TryLinkToTargetPlayer(world, player)
+        if player.userid == "KU_xxx" and inst.components.attunable then
+            inst.components.attunable:LinkToPlayer(player)
+            GLOBAL.TheWorld:RemoveEventCallback("ms_playerjoined", TryLinkToTargetPlayer)
+        end
+    end
+
+    -- 已在线的玩家？
+    for _, p in ipairs(GLOBAL.AllPlayers) do
+        if p.userid == "KU_xxx" then
+            inst.components.attunable:LinkToPlayer(p)
+            return
+        end
+    end
+
+    -- 没在线就等 ms_playerjoined
+    GLOBAL.TheWorld:ListenForEvent("ms_playerjoined", TryLinkToTargetPlayer)
+end)
+```
+
+> **规则**：涉及"按玩家 userid 操作"的代码，必须考虑 **玩家不在线** 的情况——监听 `ms_playerjoined` 是最稳健的兜底；或者用 `attuned_userids` 字段（attunable 系统已经替你做了离线/在线的过渡，见 `attunable.lua:38-43`）。
+
+#### 坑 5：复活后 mod 重新加 burnable / freezable，配置在第二次死亡复活时丢失
+
+```lua
+-- 错误示范
+local function masterpostinit(inst)
+    GLOBAL.MakeLargeBurnableCharacter(inst, "torso")
+    inst.components.burnable:SetBurnTime(100)   -- 自定义 100 秒烧时间
+end
+```
+
+**症状**：玩家第一次出生时燃烧时间 100 秒；死亡复活后变回 10 秒（vanilla 默认）。
+
+**原因**：19.7 已经详细讲过——`CommonActualRez` 会**重新创建** `burnable / freezable / grogginess / slipperyfeet` 四个组件：
+
+```scripts/prefabs/player_common_extensions.lua
+-- CommonActualRez 内部
+MakeMediumBurnableCharacter(inst, "torso")  -- 这一行会覆盖 mod 配置
+MakeLargeFreezableCharacter(inst, "torso")
+inst:AddComponent("grogginess")
+inst:AddComponent("slipperyfeet")
+```
+
+**修复**：把 mod 配置封装为函数，在 `ms_respawnedfromghost` 中重新调用：
+
+```lua
+local function ConfigureMyBurnable(inst)
+    if inst.components.burnable then
+        inst.components.burnable:SetBurnTime(100)
+    end
+end
+
+local function masterpostinit(inst)
+    GLOBAL.MakeLargeBurnableCharacter(inst, "torso")
+    ConfigureMyBurnable(inst)
+    inst:ListenForEvent("ms_respawnedfromghost", ConfigureMyBurnable)
+end
+```
+
+> **规则**：对 vanilla 的 `burnable/freezable/grogginess/slipperyfeet` 四个组件做 mod 配置，**必须在 `ms_respawnedfromghost` 里再来一遍**——这四个是死亡时移除、复活时重新创建的特殊组件。
+
+---
+
+### 19.8 小结
+
+```
+本节实战回顾：
+
+┌────────────────────────────────────────────────────────────────┐
+│ 9 个实战的"最小化代码量"对照表                                 │
+├────────────────────────────────────────────────────────────────┤
+│ 19.8.2 reviver tag 复活药：    inst:AddTag("reviver")           │
+│ 19.8.3 骚扰即复活灵符：        hauntable:SetHauntValue(...)     │
+│ 19.8.4 5 次耐久复活罐：        + finiteuses + 自定义 OnHauntFn  │
+│ 19.8.5 attunable 神龛：        attunable + Set 4 个回调          │
+│ 19.8.6 复活后无敌+满血：       监听 ms_respawnedfromghost       │
+│ 19.8.7 死亡扣 mod 货币：       监听 death / ms_becameghost      │
+│ 19.8.8 自定义骨架 prefab：     inst.skeleton_prefab = "xxx"    │
+│ 19.8.9 监听 respawnfromghost： 在 DoActualRez 之前抢跑          │
+│ 19.8.10 客户端 UI 网络同步：   net_byte/int/hash + dirty event │
+└────────────────────────────────────────────────────────────────┘
+
+复活道具的"识别机制"汇总：
+  reviver tag                → OnRespawnFromGhost 走 reviver 分支
+  hauntable + HAUNT_INSTANT_REZ → 骚扰时 PushEvent("respawnfromghost")
+  attunable("remoteresurrector") → REMOTERESURRECT 动作 + attuner 查找
+  multiplayer_portal tag     → DoActualRez 走 portal_rez 动画（+25% penalty）
+
+复活道具的"动画分支"对照：
+  prefab == "amulet"            → amulet_rebirth + Equip
+  prefab == "resurrectionstone" → wakeup + Hide(inventory)
+  prefab == "resurrectionstatue" → rebirth(source)
+  HasTag("multiplayer_portal")  → portal_rez + DeltaPenalty(0.25)
+  HasTag("reviver")             → reviver_rebirth(item)
+  pocketwatch_revive             → rewindtime_rebirth
+  其他自定义 prefab              → 无动画瞬间复活
+
+事件钩子的标准用法：
+  PrefabPostInit("world") + ms_playerjoined → 给每个玩家挂监听
+    ├─ death (玩家挂掉瞬间)
+    ├─ ms_becameghost (变幽灵完成)
+    ├─ respawnfromghost (复活流程开始，可抢跑)
+    └─ ms_respawnedfromghost (复活流程结束，最稳定的"复活后"挂载点)
+
+服务端/客户端代码分离：
+  inst.entity:SetPristine()
+  if not TheWorld.ismastersim then return inst end
+    ↑ 之前：transform / animstate / physics / network / tag / 网络变量
+    ↓ 之后：组件 / OnSave / OnLoad / 监听器
+
+网络变量速选：
+  bool          → net_bool
+  小整数 0-255  → net_byte
+  整数 ±32k     → net_shortint
+  整数更大      → net_int / net_uint
+  字符串 hash   → net_hash（首选）
+  字符串原文    → net_string
+  实体引用      → net_entity
+```
+
+**新手核心三句**：要做"队友能用"的复活道具就加 `inst:AddTag("reviver")`，要做"幽灵自己用"的就加 `hauntable:SetHauntValue(HAUNT_INSTANT_REZ)`，要在复活后加 buff 就监听 `ms_respawnedfromghost`——三种最常用 mod 复活模式都只需 1-2 行核心代码。
+
+**进阶核心三句**：`finiteuses` 不会自动随骚扰复活消耗，必须在 `SetOnHauntFn` 里手动 `Use(1)` 并显式 `return true`；`attunable` 系统通过 `SetAttunableTag` 把建筑加入玩家 `attuner` 的"绑定池"，复用 `"remoteresurrector"` tag 能直接让幽灵的 REMOTERESURRECT 动作识别它；mod 的 `respawnfromghost` 监听利用 vanilla 的 `DoTaskInTime(0, DoActualRez)` 一帧延迟做抢跑——同一帧改 inst 字段、下一帧 DoActualRez 跑完后 `ms_respawnedfromghost` 监听器做最后修正。
+
+**老手核心三句**：自定义骨架 prefab 必须实现 `SetSkeletonDescription` 和 `SetSkeletonAvatarData` 两个函数，否则 `SpawnDeathProduct` 调用时报 nil；`DoActualRez` 是 local function 无法 hook，"完美的"自定义复活动画只能通过加 `"multiplayer_portal"` tag 走 portal_rez + mod 监听抵消惩罚的方式实现；客户端 UI 显示 mod 字段必须用 `net_*` 网络变量同步——字段名要全局唯一，能用 `net_byte` 不用 `net_int`，能用 `net_hash` 不用 `net_string`。
+
+---
+
+
